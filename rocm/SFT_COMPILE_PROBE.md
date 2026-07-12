@@ -46,6 +46,17 @@ The isolated 2,048-token Pallas path passed the hardware safety gate, but its
 threshold. A successful compile therefore proves capacity only, not numerical
 promotion for training.
 
+The attention integration now installs a narrow, fail-closed JAX 0.10.2 patch
+that casts only the Pallas backward delta preprocess's loaded `O` and `dO`
+tiles to FP32 before their product and reduction. In CPU interpret mode at the
+exact Qwen3.5 geometry `T=64, Hq=16, Hkv=4, D=256`, seed 0 `dq`/`dk`
+relative L2 improved from `0.00763/0.00782` to `0.00317/0.00420`; forward,
+`dV`, and the bounded FP32 reference were unchanged. Both patched gradients
+pass the existing 1% gate without relaxing it. This is a deterministic CPU
+regression result, not hardware promotion: the isolated 512/1,024/2,048-token
+ROCm accuracy ladder must be repeated with the patched preprocess before the
+long-context training block is removed.
+
 ## ROCm 7.2.4 hardware results
 
 The post-upgrade qualification advanced one fresh guarded process at a time.
