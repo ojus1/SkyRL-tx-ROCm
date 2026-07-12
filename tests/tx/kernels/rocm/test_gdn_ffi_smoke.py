@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import fcntl
+import hashlib
 import os
 import stat
 from pathlib import Path
@@ -29,6 +31,14 @@ _BUILD_SCRIPT = (
 def _reset_registration(monkeypatch):
     monkeypatch.setattr(smoke, "_registration_state", None)
     monkeypatch.setattr(smoke, "_library_lifetime_handles", [])
+    retained_fds: list[int] = []
+    monkeypatch.setattr(smoke, "_library_lifetime_fds", retained_fds)
+    yield
+    for descriptor in retained_fds:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 class _FakeSymbol:
@@ -82,12 +92,12 @@ def _fake_dependencies(monkeypatch):
     jax = _FakeJax()
     jnp = SimpleNamespace(bfloat16="bf16")
     library = _FakeLibrary()
-    loads: list[Path] = []
+    loads: list[smoke._SealedLibrarySnapshot] = []
 
     monkeypatch.setattr(smoke, "_import_jax", lambda: (jax, jnp))
 
-    def load(path):
-        loads.append(path)
+    def load(snapshot):
+        loads.append(snapshot)
         return library
 
     monkeypatch.setattr(smoke, "_load_cdll", load)
@@ -101,6 +111,10 @@ def _library_file(
     path.write_bytes(b"mock shared object")
     path.chmod(0o600)
     return path.resolve()
+
+
+def _library_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_import_and_default_fallback_do_not_import_jax_or_load_a_library(monkeypatch):
@@ -119,6 +133,8 @@ def test_import_and_default_fallback_do_not_import_jax_or_load_a_library(monkeyp
     assert smoke.gdn_ffi_smoke_copy(sentinel) is sentinel
     with pytest.raises(ValueError, match="invalid while.*disabled"):
         smoke.gdn_ffi_smoke_copy(sentinel, library_path="/private/not-loaded.so")
+    with pytest.raises(ValueError, match="invalid while.*disabled"):
+        smoke.gdn_ffi_smoke_copy(sentinel, library_sha256="0" * 64)
 
 
 def test_registration_is_default_off_before_path_jax_or_loader(monkeypatch):
@@ -145,27 +161,199 @@ def test_opt_in_must_be_an_exact_bool(value):
         smoke.gdn_ffi_smoke_copy(object(), enabled=value)
 
 
+@pytest.mark.parametrize(
+    "library_sha256",
+    [None, "", "0" * 63, "0" * 65, "G" * 64, b"0" * 64],
+)
+def test_enabled_public_paths_require_exact_lowercase_sha_before_jax_or_snapshot(
+    monkeypatch, tmp_path, library_sha256
+):
+    path = _library_file(tmp_path)
+    monkeypatch.setattr(
+        smoke,
+        "_import_jax",
+        lambda: (_ for _ in ()).throw(AssertionError("JAX must not be imported")),
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_snapshot_library",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not snapshot")),
+    )
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        smoke.register_gdn_ffi_smoke(path, library_sha256=library_sha256, enabled=True)
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        smoke.gdn_ffi_smoke_copy(
+            object(),
+            library_path=path,
+            library_sha256=library_sha256,
+            enabled=True,
+        )
+
+
+def test_unapproved_hash_never_reaches_cdll_and_rejected_snapshot_is_sealed_retained(
+    monkeypatch, tmp_path
+):
+    path = _library_file(tmp_path)
+    jax = _FakeJax()
+    monkeypatch.setattr(
+        smoke, "_import_jax", lambda: (jax, SimpleNamespace(bfloat16="bf16"))
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_load_cdll",
+        lambda _snapshot: (_ for _ in ()).throw(
+            AssertionError("unapproved bytes must never reach CDLL")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match library_sha256"):
+        smoke.register_gdn_ffi_smoke(path, library_sha256="0" * 64, enabled=True)
+
+    assert len(smoke._library_lifetime_fds) == 1
+    descriptor = smoke._library_lifetime_fds[0]
+    observed_seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+    assert observed_seals & smoke._REQUIRED_SEALS == smoke._REQUIRED_SEALS
+    assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o600
+    assert smoke._library_lifetime_handles == []
+
+
+def test_dlopen_reads_approved_sealed_snapshot_despite_path_replacement(
+    monkeypatch, tmp_path
+):
+    approved = b"approved exact shared object bytes"
+    unapproved = b"replacement bytes must not load"
+    path = _library_file(tmp_path)
+    path.write_bytes(approved)
+    path.chmod(0o600)
+    digest = hashlib.sha256(approved).hexdigest()
+    jax = _FakeJax()
+    library = _FakeLibrary()
+    loaded: list[bytes] = []
+    monkeypatch.setattr(
+        smoke, "_import_jax", lambda: (jax, SimpleNamespace(bfloat16="bf16"))
+    )
+
+    def replace_then_load(snapshot):
+        replacement = path.with_name("replacement.so")
+        replacement.write_bytes(unapproved)
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+        loaded.append(Path(snapshot.proc_path).read_bytes())
+        assert (
+            fcntl.fcntl(snapshot.fd, fcntl.F_GET_SEALS) & smoke._REQUIRED_SEALS
+            == smoke._REQUIRED_SEALS
+        )
+        return library
+
+    monkeypatch.setattr(smoke, "_load_cdll", replace_then_load)
+    registration = smoke.register_gdn_ffi_smoke(
+        path, library_sha256=digest, enabled=True
+    )
+
+    assert path.read_bytes() == unapproved
+    assert loaded == [approved]
+    assert registration.snapshot_sha256 == digest
+    assert smoke._registration_state is not None
+    assert smoke._registration_state.snapshot.fd in smoke._library_lifetime_fds
+
+
+def test_missing_required_seal_fails_before_cdll_and_retains_fd(monkeypatch, tmp_path):
+    path = _library_file(tmp_path)
+    digest = _library_sha256(path)
+    real_fcntl = fcntl.fcntl
+    monkeypatch.setattr(
+        smoke,
+        "_load_cdll",
+        lambda _snapshot: (_ for _ in ()).throw(
+            AssertionError("unsealed snapshot must never reach CDLL")
+        ),
+    )
+
+    def omit_write_seal(descriptor, command, argument=0):
+        if command == fcntl.F_GET_SEALS:
+            return smoke._REQUIRED_SEALS & ~fcntl.F_SEAL_WRITE
+        return real_fcntl(descriptor, command, argument)
+
+    monkeypatch.setattr(smoke.fcntl, "fcntl", omit_write_seal)
+    with pytest.raises(RuntimeError, match="every required seal"):
+        smoke.register_gdn_ffi_smoke(path, library_sha256=digest, enabled=True)
+    assert len(smoke._library_lifetime_fds) == 1
+
+
+def test_source_fd_identity_mutation_is_rejected_before_cdll(monkeypatch, tmp_path):
+    path = _library_file(tmp_path)
+    digest = _library_sha256(path)
+    real_read = os.read
+    mutated = False
+    monkeypatch.setattr(
+        smoke,
+        "_load_cdll",
+        lambda _snapshot: (_ for _ in ()).throw(
+            AssertionError("unstable source must never reach CDLL")
+        ),
+    )
+
+    def mutate_after_first_read(descriptor, count):
+        nonlocal mutated
+        chunk = real_read(descriptor, count)
+        if chunk and not mutated:
+            mutated = True
+            path.write_bytes(b"changed source identity")
+            path.chmod(0o600)
+        return chunk
+
+    monkeypatch.setattr(smoke.os, "read", mutate_after_first_read)
+    with pytest.raises(RuntimeError, match="changed while being snapshotted"):
+        smoke.register_gdn_ffi_smoke(path, library_sha256=digest, enabled=True)
+    assert mutated is True
+    assert len(smoke._library_lifetime_fds) == 1
+
+
+def test_snapshot_fd_survives_cdll_failure(monkeypatch, tmp_path):
+    path = _library_file(tmp_path)
+    digest = _library_sha256(path)
+    monkeypatch.setattr(
+        smoke,
+        "_load_cdll",
+        lambda _snapshot: (_ for _ in ()).throw(OSError("private loader failure")),
+    )
+    with pytest.raises(RuntimeError, match="sealed.*snapshot"):
+        smoke.register_gdn_ffi_smoke(path, library_sha256=digest, enabled=True)
+    assert len(smoke._library_lifetime_fds) == 1
+    assert os.fstat(smoke._library_lifetime_fds[0]).st_size == path.stat().st_size
+
+
 def test_enabled_path_requires_exact_absolute_owned_private_regular_library(tmp_path):
-    with pytest.raises(ValueError, match="explicit"):
+    with pytest.raises(ValueError, match="library_sha256"):
         smoke.register_gdn_ffi_smoke(enabled=True)
     with pytest.raises(ValueError, match="absolute"):
-        smoke.register_gdn_ffi_smoke("libskyrl_gdn_ffi_smoke_gfx1100.so", enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            "libskyrl_gdn_ffi_smoke_gfx1100.so",
+            library_sha256="0" * 64,
+            enabled=True,
+        )
 
     wrong_name = _library_file(tmp_path, "wrong.so")
     with pytest.raises(ValueError, match="exact name"):
-        smoke.register_gdn_ffi_smoke(wrong_name, enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            wrong_name, library_sha256=_library_sha256(wrong_name), enabled=True
+        )
 
     directory = tmp_path / "libskyrl_gdn_ffi_smoke_gfx1100.so"
     directory.mkdir()
     with pytest.raises(ValueError, match="regular file"):
-        smoke.register_gdn_ffi_smoke(directory.resolve(), enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            directory.resolve(), library_sha256="0" * 64, enabled=True
+        )
 
 
 def test_group_or_world_writable_and_symlink_libraries_are_rejected(tmp_path):
     writable = _library_file(tmp_path)
     writable.chmod(0o620)
     with pytest.raises(ValueError, match="group- or world-writable"):
-        smoke.register_gdn_ffi_smoke(writable, enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            writable, library_sha256=_library_sha256(writable), enabled=True
+        )
 
     writable.unlink()
     target = tmp_path / "private-target.so"
@@ -174,17 +362,34 @@ def test_group_or_world_writable_and_symlink_libraries_are_rejected(tmp_path):
     link = tmp_path / "libskyrl_gdn_ffi_smoke_gfx1100.so"
     link.symlink_to(target)
     with pytest.raises(ValueError, match="symbolic link"):
-        smoke.register_gdn_ffi_smoke(link.absolute(), enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            link.absolute(),
+            library_sha256=hashlib.sha256(b"mock").hexdigest(),
+            enabled=True,
+        )
 
 
 def test_registration_is_rocm_api_v1_and_retains_cdll(monkeypatch, tmp_path):
     path = _library_file(tmp_path)
+    digest = _library_sha256(path)
     jax, _jnp, library, loads = _fake_dependencies(monkeypatch)
 
-    registration = smoke.register_gdn_ffi_smoke(path, enabled=True)
+    registration = smoke.register_gdn_ffi_smoke(
+        path, library_sha256=digest, enabled=True
+    )
 
-    assert registration == smoke.GdnFfiSmokeRegistration(library_path=path)
-    assert loads == [path]
+    assert registration.library_path == path
+    assert registration.library_sha256 == digest
+    assert registration.snapshot_sha256 == digest
+    assert registration.snapshot_size_bytes == path.stat().st_size
+    assert registration.snapshot_mode == 0o600
+    assert registration.snapshot_seals & smoke._REQUIRED_SEALS == smoke._REQUIRED_SEALS
+    assert registration.sealed_snapshot is True
+    assert registration.snapshot_fd_retained is True
+    assert len(loads) == 1
+    assert loads[0].original_path == path
+    assert loads[0].sha256 == digest
+    assert loads[0].fd in smoke._library_lifetime_fds
     assert jax.ffi.capsule_calls == [library.symbol]
     assert len(jax.ffi.registration_calls) == 1
     args, kwargs = jax.ffi.registration_calls[0]
@@ -194,24 +399,31 @@ def test_registration_is_rocm_api_v1_and_retains_cdll(monkeypatch, tmp_path):
     assert library.symbol.argtypes is not None
     assert smoke._registration_state is not None
     assert smoke._registration_state.library is library
+    assert smoke._registration_state.snapshot is loads[0]
     assert smoke._library_lifetime_handles == [library]
 
 
 def test_registration_is_idempotent_only_for_same_canonical_path(monkeypatch, tmp_path):
     first = _library_file(tmp_path)
+    first_digest = _library_sha256(first)
     jax, _jnp, _library, loads = _fake_dependencies(monkeypatch)
 
-    one = smoke.register_gdn_ffi_smoke(first, enabled=True)
-    two = smoke.register_gdn_ffi_smoke(first, enabled=True)
+    one = smoke.register_gdn_ffi_smoke(first, library_sha256=first_digest, enabled=True)
+    two = smoke.register_gdn_ffi_smoke(first, library_sha256=first_digest, enabled=True)
     assert one is two
-    assert loads == [first]
+    assert len(loads) == 1
     assert len(jax.ffi.registration_calls) == 1
 
     second_dir = tmp_path / "second"
     second_dir.mkdir()
     second = _library_file(second_dir)
     with pytest.raises(RuntimeError, match="different library"):
-        smoke.register_gdn_ffi_smoke(second, enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            second, library_sha256=_library_sha256(second), enabled=True
+        )
+
+    with pytest.raises(RuntimeError, match="different library"):
+        smoke.register_gdn_ffi_smoke(first, library_sha256="0" * 64, enabled=True)
 
 
 def test_missing_exact_handler_symbol_fails_without_registration(monkeypatch, tmp_path):
@@ -225,9 +437,33 @@ def test_missing_exact_handler_symbol_fails_without_registration(monkeypatch, tm
     )
 
     with pytest.raises(RuntimeError, match="missing its exact handler symbol"):
-        smoke.register_gdn_ffi_smoke(path, enabled=True)
+        smoke.register_gdn_ffi_smoke(
+            path, library_sha256=_library_sha256(path), enabled=True
+        )
     assert jax.ffi.registration_calls == []
     assert smoke._registration_state is None
+    assert len(smoke._library_lifetime_fds) == 1
+    assert len(smoke._library_lifetime_handles) == 1
+
+
+def test_fd_and_cdll_survive_partial_target_registration_failure(monkeypatch, tmp_path):
+    path = _library_file(tmp_path)
+    jax, _jnp, library, loads = _fake_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        jax.ffi,
+        "register_ffi_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private registry failure")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="private registry failure"):
+        smoke.register_gdn_ffi_smoke(
+            path, library_sha256=_library_sha256(path), enabled=True
+        )
+    assert smoke._registration_state is None
+    assert len(loads) == 1
+    assert loads[0].fd in smoke._library_lifetime_fds
+    assert smoke._library_lifetime_handles == [library]
 
 
 @pytest.mark.parametrize(
@@ -246,7 +482,12 @@ def test_enabled_copy_rejects_every_shape_drift_before_library_load(
     _jax, _jnp, _library, loads = _fake_dependencies(monkeypatch)
 
     with pytest.raises(ValueError, match="shape must be exactly"):
-        smoke.gdn_ffi_smoke_copy(value, enabled=True, library_path=path)
+        smoke.gdn_ffi_smoke_copy(
+            value,
+            enabled=True,
+            library_path=path,
+            library_sha256=_library_sha256(path),
+        )
     assert loads == []
 
 
@@ -256,7 +497,12 @@ def test_enabled_copy_rejects_non_bf16_before_library_load(monkeypatch, tmp_path
     value = SimpleNamespace(shape=smoke.GDN_FFI_SMOKE_SHAPE, dtype="float16")
 
     with pytest.raises(TypeError, match="dtype must be exactly bfloat16"):
-        smoke.gdn_ffi_smoke_copy(value, enabled=True, library_path=path)
+        smoke.gdn_ffi_smoke_copy(
+            value,
+            enabled=True,
+            library_path=path,
+            library_sha256=_library_sha256(path),
+        )
     assert loads == []
 
 
@@ -265,10 +511,18 @@ def test_enabled_copy_builds_exact_abstract_typed_ffi_call(monkeypatch, tmp_path
     jax, _jnp, _library, loads = _fake_dependencies(monkeypatch)
     value = SimpleNamespace(shape=smoke.GDN_FFI_SMOKE_SHAPE, dtype="bf16")
 
-    result = smoke.gdn_ffi_smoke_copy(value, enabled=True, library_path=path)
+    digest = _library_sha256(path)
+    result = smoke.gdn_ffi_smoke_copy(
+        value,
+        enabled=True,
+        library_path=path,
+        library_sha256=digest,
+    )
 
     assert result == ("ffi-result", value)
-    assert loads == [path]
+    assert len(loads) == 1
+    assert loads[0].original_path == path
+    assert loads[0].sha256 == digest
     assert jax.shape_specs == [(smoke.GDN_FFI_SMOKE_SHAPE, "bf16")]
     assert len(jax.ffi.ffi_call_builds) == 1
     args, kwargs = jax.ffi.ffi_call_builds[0]
@@ -306,6 +560,15 @@ def test_python_module_has_no_eager_jax_import_or_library_load():
     assert top_level_calls == []
     assert "JAX_PLATFORMS" not in source
     assert "HIP_VISIBLE_DEVICES" not in source
+    assert "os.memfd_create" in source
+    assert "F_ADD_SEALS" in source
+    assert "F_GET_SEALS" in source
+    assert "F_SEAL_WRITE" in source
+    assert "F_SEAL_GROW" in source
+    assert "F_SEAL_SHRINK" in source
+    assert "F_SEAL_SEAL" in source
+    assert "ctypes.CDLL(snapshot.proc_path" in source
+    assert "ctypes.CDLL(str(library_path)" not in source
 
 
 def test_hip_handler_is_exact_shape_asynchronous_stream_smoke_only():

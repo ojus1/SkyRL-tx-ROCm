@@ -20,7 +20,11 @@ JAXLIB_INCLUDE_DIR=/absolute/path/to/jaxlib/include \
 
 The script is fixed to `gfx1100`, creates no default build artifact, refuses to
 overwrite, and only compiles/inspects files. It does not enumerate a device or
-open `/dev/kfd`.
+open `/dev/kfd`. Record the complete lowercase digest of that exact output:
+
+```bash
+sha256sum /absolute/private/build/libskyrl_gdn_ffi_smoke_gfx1100.so
+```
 
 Python use is explicitly opt-in:
 
@@ -35,14 +39,22 @@ y = gdn_ffi_smoke_copy(
     x,
     enabled=True,
     library_path="/absolute/private/build/libskyrl_gdn_ffi_smoke_gfx1100.so",
+    library_sha256="<exact 64-character lowercase sha256>",
 )
 ```
 
-The shared object is loaded with `ctypes`, its exported handler is wrapped with
-`jax.ffi.pycapsule`, and the target is registered only for platform `ROCM` with
-typed-FFI registration API version 1. The `ffi_call` uses custom-call API
-version 4 and explicit row-major layouts. The module retains the `ctypes.CDLL`
-for process lifetime.
+The enabled path validates the canonical user-owned source path, opens it with
+`O_NOFOLLOW`, and copies it once into a private `memfd` while computing the
+required digest. It verifies the source file identity stayed unchanged, checks
+the digest before loading, and applies and verifies `F_SEAL_WRITE`,
+`F_SEAL_GROW`, `F_SEAL_SHRINK`, and `F_SEAL_SEAL`. `ctypes` loads only the
+immutable `/proc/self/fd/<retained-fd>` snapshot, never the validated pathname.
+The snapshot descriptor and any `ctypes.CDLL` are retained for process lifetime,
+including later registration failures.
+
+The exported handler is wrapped with `jax.ffi.pycapsule`, and the target is
+registered only for platform `ROCM` with typed-FFI registration API version 1.
+The `ffi_call` uses custom-call API version 4 and explicit row-major layouts.
 
 There is no custom VJP, recurrence, masking, state carry, scratch allocation,
 numerical promotion, or performance claim. Do not wire this smoke into model
