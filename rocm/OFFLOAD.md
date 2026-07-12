@@ -45,12 +45,25 @@ partition spec, and exact target sharding are checked after synchronization.
 The source remains valid. Unsupported/global/uncommitted/deleted arrays and
 NNX Variable subclasses with custom raw-value setters fail closed.
 
+The module also provides an unwired transactional moment-tree manager. The
+caller must explicitly select exact `nnx.OptState` leaves below literal `mu`
+or `nu` path components and must hold exclusive ownership of the NNX tree for
+each operation. A complete selected tree is copied with one tuple
+`device_put`, synchronized, and fully validated before the first Variable is
+replaced. The consumable handle stages every selected leaf back to its exact
+recorded device sharding for one optimizer update, then re-offloads the
+possibly updated values and returns a successor handle. Synchronous failures
+attempt to restore every replaced raw value; incomplete rollback fails
+explicitly. This is not an atomicity guarantee for asynchronous process
+termination or external concurrent mutation.
+
 CPU-only tests validate exact device-to-`pinned_host`-to-device round trips,
-NamedSharding preservation, failure atomicity, and a three-update AdamW replay
-with one moment leaf staged before each update and re-offloaded afterwards.
-These tests establish API and state semantics only. They do not measure ROCm
-DMA bandwidth, VRAM release, overlap, optimizer latency, or end-to-end SFT/GRPO
-performance, and the utility is not connected to the backend.
+NamedSharding preservation, transactional failure handling, and a three-update
+AdamW replay with selected moment state staged before each update and
+re-offloaded afterwards. These tests establish API and state semantics only.
+They do not measure ROCm DMA bandwidth, VRAM release, overlap, optimizer
+latency, or end-to-end SFT/GRPO performance, and the manager is not connected
+to the backend.
 
 For the current two-slot rank-8 Qwen3.5 LoRA inventory, the two BF16 Adam
 moment trees contain exactly 138,051,584 bytes (131.65625 MiB). Offloading both
@@ -61,10 +74,9 @@ would save that persistent VRAM between updates but require at least
 OOM-boundary option, not an expected speed optimization; W8/W4 frozen-weight
 residency and activation work have much larger capacity upside.
 
-Production wiring remains gated on a transactional moment-tree manager. It
-must prepare and block all destination arrays before replacing any of the 804
-moment leaves, stage the complete tree back to each leaf's exact device
-sharding before the jitted update, re-offload only after a successful update,
-and integrate save/load/delete failure paths. Batched tree transfers and
-measured overlap are required; 804 individually synchronized copies are not an
-acceptable performance implementation.
+Production wiring remains gated on trainer integration for update,
+save/load/delete, and failure paths, plus measured gfx1100 transfer behavior.
+The unwired manager performs batched tree transfers, but actual pinned-host
+support, physical VRAM release, PCIe throughput, transfer/compute overlap, and
+step-time impact have not yet been measured on this ROCm system. No production
+offload or performance benefit is claimed until those gates pass.
