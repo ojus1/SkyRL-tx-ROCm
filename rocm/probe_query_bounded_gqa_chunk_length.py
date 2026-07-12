@@ -1192,11 +1192,21 @@ def _host_metrics(np: Any, actual_host: Any, expected_host: Any) -> dict[str, An
         and int(expected_raw.nbytes) == 2 * _EXPECTED_OUTPUT_BYTES
     )
     difference = actual - expected
-    actual_norm = float(np.linalg.norm(actual.ravel()))
-    expected_norm = float(np.linalg.norm(expected.ravel()))
-    denominator = max(expected_norm, float(np.finfo(np.float32).tiny))
+    # Million-element FP32 reductions can accumulate enough rounding error for
+    # a mathematically bounded cosine to be reported slightly above one.  Keep
+    # the tensors themselves at their contract dtypes, but perform diagnostic
+    # dot products and norms in FP64 and retain both raw and clipped values.
+    actual_flat_fp64 = actual.ravel().astype(np.float64)
+    expected_flat_fp64 = expected.ravel().astype(np.float64)
+    difference_flat_fp64 = actual_flat_fp64 - expected_flat_fp64
+    actual_norm = float(np.linalg.norm(actual_flat_fp64))
+    expected_norm = float(np.linalg.norm(expected_flat_fp64))
+    denominator = max(expected_norm, float(np.finfo(np.float64).tiny))
     cosine_denominator = max(
-        actual_norm * expected_norm, float(np.finfo(np.float32).tiny)
+        actual_norm * expected_norm, float(np.finfo(np.float64).tiny)
+    )
+    cosine_raw = float(
+        np.vdot(actual_flat_fp64, expected_flat_fp64) / cosine_denominator
     )
     return {
         "finite": bool(
@@ -1213,8 +1223,9 @@ def _host_metrics(np: Any, actual_host: Any, expected_host: Any) -> dict[str, An
         "reference_nbytes": int(expected_raw.nbytes),
         "max_abs": float(np.max(np.abs(difference))),
         "mean_abs": float(np.mean(np.abs(difference))),
-        "relative_l2": float(np.linalg.norm(difference.ravel()) / denominator),
-        "cosine": float(np.vdot(actual.ravel(), expected.ravel()) / cosine_denominator),
+        "relative_l2": float(np.linalg.norm(difference_flat_fp64) / denominator),
+        "cosine_raw": cosine_raw,
+        "cosine": float(np.clip(cosine_raw, -1.0, 1.0)),
         "actual_sha256": hashlib.sha256(actual_raw.tobytes(order="C")).hexdigest(),
         "reference_sha256": hashlib.sha256(expected_raw.tobytes(order="C")).hexdigest(),
     }
@@ -1235,6 +1246,7 @@ def _validate_candidate(
         and metrics["shape_dtype_nbytes_exact"]
         and math.isfinite(metrics["relative_l2"])
         and metrics["relative_l2"] < _MAX_RELATIVE_L2
+        and math.isfinite(metrics["cosine_raw"])
         and math.isfinite(metrics["cosine"])
         and metrics["cosine"] >= _MIN_COSINE
         and math.isfinite(metrics["max_abs"])

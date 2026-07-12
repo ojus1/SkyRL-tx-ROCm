@@ -374,6 +374,21 @@ def test_oracle_validation_rejects_exclusive_prefix_head_and_dimension_corruptio
             )
 
 
+def test_host_metrics_use_bounded_fp64_cosine_reporting():
+    length = 2048
+    _inputs, _manifests, expected, _oracle = _PROBE._construct_host_inputs(
+        np, ml_dtypes, length
+    )
+    actual = expected.astype(ml_dtypes.bfloat16)
+
+    metrics = _PROBE._host_metrics(np, actual, expected)
+
+    assert np.isfinite(metrics["cosine_raw"])
+    assert -1.0 <= metrics["cosine"] <= 1.0
+    assert metrics["cosine"] == np.clip(metrics["cosine_raw"], -1.0, 1.0)
+    assert metrics["cosine"] >= 0.9999
+
+
 class _FakeCompiled:
     def __init__(self, result: Any = "result", *, error: BaseException | None = None):
         self.result = result
