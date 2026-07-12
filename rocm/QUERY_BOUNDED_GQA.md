@@ -344,6 +344,56 @@ This promotes only one all-valid analytic forward at T=512. It does not
 promote replay, nonzero Q/K, random inputs, padding, a GPU reference, backward,
 larger buckets, or model integration.
 
+## Pending exact T=512 nonzero replay gate
+
+`rocm/probe_query_bounded_gqa_replay.py` is a separate next-rung probe. Its
+default path imports no JAX and emits only an abstract refusal. The guarded
+ROCm path must run in a fresh process under the profiler:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-t512-replay.telemetry.jsonl \
+  --card card1 \
+  --interval 0.1 \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 5 \
+  --max-junction-temp-c 70 \
+  --max-gpu-power-watts 315 \
+  --max-vram-gib 2 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_replay.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-t512-replay.jsonl
+```
+
+The immutable input is dense, nonzero BF16 Q/K/V built on the host from a
+fixed seed. Token/head scalars and seeded sign directions make the input
+random but deliberately factorized, allowing an independent FP32 host causal
+GQA oracle without a GPU reference or a billion-operation CPU matmul. The
+probe compiles once and inherits the exact one-forward-call IR gate and the
+64 MiB temporary/128 MiB total compiled-memory limits from the promoted
+single-forward gate. Command buffers are proven disabled before backend use.
+
+The executable first runs as a candidate. Its synchronized duration must be
+below 100 ms; output must be finite with relative L2 below 1%, cosine at least
+0.9999, and maximum absolute error at most 0.02. Exact invocation counters and
+a clean current-boot journal checkpoint must also pass. Only then does the
+probe issue an opaque one-shot replay authorization, bound by object identity
+to that exact executable and to clean candidate dispatch/device-get proofs.
+The first replay attempt consumes it, including an invalid attempt. The one
+ordinary host-driven replay must pass the same duration/numerical gates and
+match the candidate output byte-for-byte. The private JSONL records a flushed
+pre-dispatch attempt for each launch and journal checkpoints after backend
+initialization, compile, input transfer, each dispatch, each device transfer,
+and final postflight.
+
+This probe has no GPU reference, device-side error reduction, command-buffer
+replay, backward work, padding case, recompilation, or model integration. It
+has not run on the accelerator yet and promotes nothing until its artifacts
+and telemetry receive an independent audit.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
