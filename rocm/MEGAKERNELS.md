@@ -30,7 +30,11 @@ would have poor occupancy and run long enough to recreate the GPU-watchdog risk.
 One exact BF16 full-attention layer streams about 205 MiB (0.200 GiB) of frozen
 weights and one GDN layer about 215 MiB (0.210 GiB); the complete text model is
 7.834 GiB. The problem is repeated, globally synchronized layer work, not
-"several GiB" in one layer.
+"several GiB" in one layer. At 32K, causal attention forward for one of the
+eight full-attention layers is about 8.80 TFLOP, or roughly 1.47 s at the
+conservative 6 TFLOP/s planning rate, before projections or backward. Moving
+the display to the iGPU removes desktop-reset coupling; it does not make a
+watchdog-scale single dispatch safe.
 
 Here, a "megakernel" means a JAX operation or FFI handler composed of several
 short, dependency-ordered GPU dispatches. Every underlying dispatch must have a
