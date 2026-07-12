@@ -7,6 +7,7 @@ import pytest
 
 from skyrl.tx.kernels.query_bounded_gqa import (
     query_bounded_gqa,
+    query_bounded_gqa_forward_chunk,
     qwen35_32k_dispatch_plan,
 )
 
@@ -52,17 +53,11 @@ def test_interpret_forward_and_vjp_match_portable_gqa(valid_length):
     dout = jax.random.normal(jax.random.key(3), q.shape)
 
     actual, actual_pullback = jax.vjp(lambda *args: _prototype(*args, mask), q, k, v)
-    expected, expected_pullback = jax.vjp(
-        lambda *args: _reference(*args, mask), q, k, v
-    )
+    expected, expected_pullback = jax.vjp(lambda *args: _reference(*args, mask), q, k, v)
 
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
-    for actual_gradient, expected_gradient in zip(
-        actual_pullback(dout), expected_pullback(dout), strict=True
-    ):
-        np.testing.assert_allclose(
-            actual_gradient, expected_gradient, rtol=3e-6, atol=3e-6
-        )
+    for actual_gradient, expected_gradient in zip(actual_pullback(dout), expected_pullback(dout), strict=True):
+        np.testing.assert_allclose(actual_gradient, expected_gradient, rtol=3e-6, atol=3e-6)
 
 
 @pytest.mark.parametrize(
@@ -76,9 +71,7 @@ def test_low_precision_forward_and_vjp_match_dtype_semantics(dtype, rtol, atol):
     q, k, v, mask = _inputs(dtype)
     dout = jax.random.normal(jax.random.key(3), q.shape, dtype=dtype)
     actual, actual_pullback = jax.vjp(lambda *args: _prototype(*args, mask), q, k, v)
-    expected, expected_pullback = jax.vjp(
-        lambda *args: _reference(*args, mask), q, k, v
-    )
+    expected, expected_pullback = jax.vjp(lambda *args: _reference(*args, mask), q, k, v)
 
     np.testing.assert_allclose(
         actual.astype(jnp.float32),
@@ -86,9 +79,7 @@ def test_low_precision_forward_and_vjp_match_dtype_semantics(dtype, rtol, atol):
         rtol=rtol,
         atol=atol,
     )
-    for actual_gradient, expected_gradient in zip(
-        actual_pullback(dout), expected_pullback(dout), strict=True
-    ):
+    for actual_gradient, expected_gradient in zip(actual_pullback(dout), expected_pullback(dout), strict=True):
         np.testing.assert_allclose(
             actual_gradient.astype(jnp.float32),
             expected_gradient.astype(jnp.float32),
@@ -138,9 +129,7 @@ def test_exact_qwen_head_geometry_and_dtype_forward_and_vjp():
         rtol=2e-2,
         atol=2e-2,
     )
-    for actual_gradient, expected_gradient in zip(
-        actual_pullback(dout), expected_pullback(dout), strict=True
-    ):
+    for actual_gradient, expected_gradient in zip(actual_pullback(dout), expected_pullback(dout), strict=True):
         np.testing.assert_allclose(
             actual_gradient.astype(jnp.float32),
             expected_gradient.astype(jnp.float32),
@@ -169,6 +158,208 @@ def test_later_query_chunk_uses_global_causal_offset_and_native_head_mapping():
     np.testing.assert_array_equal(output[0, 8, 1], jnp.full((8,), 2.0))
     np.testing.assert_array_equal(output[0, 8, 2], jnp.full((8,), 102.0))
     np.testing.assert_array_equal(output[0, 8, 3], jnp.full((8,), 102.0))
+
+
+@pytest.mark.parametrize(
+    ("query_chunk_size", "sequence_length", "query_start", "valid_length"),
+    [
+        (256, 768, 512, 700),
+        (512, 1024, 512, 900),
+    ],
+)
+def test_forward_chunk_interpret_uses_global_causality_and_native_gqa_mapping(
+    query_chunk_size, sequence_length, query_start, valid_length
+):
+    # Zero logits turn every row into a prefix average.  Using a later chunk
+    # makes an incorrect local causal origin immediately visible, while the
+    # per-KV-head value offset verifies the native Hq-to-Hkv mapping.
+    q = jnp.zeros((1, query_chunk_size, 4, 8), dtype=jnp.float32)
+    k = jnp.zeros((1, sequence_length, 2, 8), dtype=jnp.float32)
+    positions = jnp.arange(sequence_length, dtype=jnp.float32)
+    v = jnp.zeros((1, sequence_length, 2, 8), dtype=jnp.float32)
+    v = v.at[0, :, 0, :].set(positions[:, None])
+    v = v.at[0, :, 1, :].set(1000 + positions[:, None])
+    mask = (jnp.arange(sequence_length)[None, :] < valid_length).astype(jnp.int32)
+
+    output = query_bounded_gqa_forward_chunk(
+        q,
+        k,
+        v,
+        mask,
+        query_start=query_start,
+        block_q=64,
+        block_k=64,
+        interpret=True,
+    )
+
+    assert output.shape == (1, query_chunk_size, 4, 8)
+    for local_query in (0, query_chunk_size // 2, query_chunk_size - 1):
+        visible_keys = min(query_start + local_query + 1, valid_length)
+        expected_mean = (visible_keys - 1) / 2
+        np.testing.assert_allclose(output[0, local_query, 0], jnp.full((8,), expected_mean), atol=1e-5)
+        np.testing.assert_allclose(output[0, local_query, 1], jnp.full((8,), expected_mean), atol=1e-5)
+        np.testing.assert_allclose(
+            output[0, local_query, 2],
+            jnp.full((8,), 1000 + expected_mean),
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            output[0, local_query, 3],
+            jnp.full((8,), 1000 + expected_mean),
+            atol=1e-5,
+        )
+
+
+def _forward_chunk_inputs():
+    q, k, v, mask = _inputs(valid_length=13)
+    return q[:, :8], k, v, mask
+
+
+@pytest.mark.parametrize("query_start", [True, np.int64(0), 0.0])
+def test_forward_chunk_rejects_non_exact_python_query_start(query_start):
+    q, k, v, mask = _forward_chunk_inputs()
+    with pytest.raises(TypeError, match="exact concrete Python int"):
+        query_bounded_gqa_forward_chunk(
+            q,
+            k,
+            v,
+            mask,
+            query_start=query_start,
+            block_q=4,
+            block_k=4,
+            interpret=True,
+        )
+
+
+def test_forward_chunk_rejects_traced_query_start():
+    q, k, v, mask = _forward_chunk_inputs()
+
+    def traced(query_start):
+        return query_bounded_gqa_forward_chunk(
+            q,
+            k,
+            v,
+            mask,
+            query_start=query_start,
+            block_q=4,
+            block_k=4,
+            interpret=True,
+        )
+
+    with pytest.raises(TypeError, match="exact concrete Python int"):
+        jax.make_jaxpr(traced)(0)
+
+
+@pytest.mark.parametrize(
+    ("query_start", "match"),
+    [
+        (-4, "nonnegative"),
+        (2, "aligned to block_q"),
+        (12, "fit within the key sequence"),
+    ],
+)
+def test_forward_chunk_rejects_invalid_query_ranges(query_start, match):
+    q, k, v, mask = _forward_chunk_inputs()
+    with pytest.raises(ValueError, match=match):
+        query_bounded_gqa_forward_chunk(
+            q,
+            k,
+            v,
+            mask,
+            query_start=query_start,
+            block_q=4,
+            block_k=4,
+            interpret=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda q, k, v, m: (q[:, :-1], k, v, m), "divisible by block_q"),
+        (
+            lambda q, k, v, m: (q, k[:, :-1], v[:, :-1], m[:, :-1]),
+            "divisible by block_k",
+        ),
+        (lambda q, k, v, m: (q[:, :0], k, v, m), "lengths must be positive"),
+    ],
+)
+def test_forward_chunk_rejects_partial_or_empty_tiles(mutate, match):
+    q, k, v, mask = mutate(*_forward_chunk_inputs())
+    with pytest.raises(ValueError, match=match):
+        query_bounded_gqa_forward_chunk(
+            q,
+            k,
+            v,
+            mask,
+            query_start=0,
+            block_q=4,
+            block_k=4,
+            interpret=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda q, k, v, m: (
+                jnp.concatenate((q, q), axis=0),
+                jnp.concatenate((k, k), axis=0),
+                jnp.concatenate((v, v), axis=0),
+                jnp.concatenate((m, m), axis=0),
+            ),
+            "batch size one",
+        ),
+        (lambda q, k, v, m: (q[0], k, v, m), "rank four"),
+        (lambda q, k, v, m: (q, k, v, m[0]), "key_mask rank two"),
+        (lambda q, k, v, m: (q, k[:, :-1], v, m), "k and v sequence"),
+        (lambda q, k, v, m: (q[:, :, :3], k, v, m), "divisible by the K/V"),
+        (lambda q, k, v, m: (q, k[..., :-1], v[..., :-1], m), "head dimensions"),
+        (
+            lambda q, k, v, m: (q, k.astype(jnp.float16), v, m),
+            "same floating-point dtype",
+        ),
+        (lambda q, k, v, m: (q, k, v, m.astype(jnp.float32)), "boolean or integer"),
+    ],
+)
+def test_forward_chunk_rejects_invalid_shapes_and_dtypes(mutate, match):
+    q, k, v, mask = mutate(*_forward_chunk_inputs())
+    with pytest.raises((TypeError, ValueError), match=match):
+        query_bounded_gqa_forward_chunk(
+            q,
+            k,
+            v,
+            mask,
+            query_start=0,
+            block_q=4,
+            block_k=4,
+            interpret=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({"block_q": True}, TypeError, "block_q.*exact concrete Python int"),
+        ({"block_k": np.int64(4)}, TypeError, "block_k.*exact concrete Python int"),
+        ({"block_q": 0}, ValueError, "block_q must be positive"),
+        ({"block_k": -4}, ValueError, "block_k must be positive"),
+    ],
+)
+def test_forward_chunk_rejects_invalid_block_types_and_values(kwargs, error, match):
+    q, k, v, mask = _forward_chunk_inputs()
+    call_kwargs = {"block_q": 4, "block_k": 4, "interpret": True}
+    call_kwargs.update(kwargs)
+    with pytest.raises(error, match=match):
+        query_bounded_gqa_forward_chunk(
+            q,
+            k,
+            v,
+            mask,
+            query_start=0,
+            **call_kwargs,
+        )
 
 
 def test_dkdv_reduction_is_bitwise_deterministic():
@@ -209,6 +400,47 @@ def _count_pallas_calls(closed_jaxpr) -> int:
     return count
 
 
+def test_forward_chunk_is_exactly_one_pallas_boundary():
+    q, k, v, mask = _forward_chunk_inputs()
+    forward_jaxpr = jax.make_jaxpr(
+        lambda q_arg, k_arg, v_arg, mask_arg: query_bounded_gqa_forward_chunk(
+            q_arg,
+            k_arg,
+            v_arg,
+            mask_arg,
+            query_start=8,
+            block_q=4,
+            block_k=4,
+            interpret=True,
+        )
+    )(q, k, v, mask)
+
+    assert _count_pallas_calls(forward_jaxpr) == 1
+
+
+def test_qwen35_32k_last_256_query_chunk_has_one_abstract_boundary():
+    q = jax.ShapeDtypeStruct((1, 256, 16, 256), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((1, 32_768, 4, 256), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((1, 32_768, 4, 256), jnp.bfloat16)
+    mask = jax.ShapeDtypeStruct((1, 32_768), jnp.int32)
+
+    forward_jaxpr = jax.make_jaxpr(
+        lambda q_arg, k_arg, v_arg, mask_arg: query_bounded_gqa_forward_chunk(
+            q_arg,
+            k_arg,
+            v_arg,
+            mask_arg,
+            query_start=32_512,
+            block_q=64,
+            block_k=64,
+            interpret=True,
+        )
+    )(q, k, v, mask)
+
+    assert tuple((aval.shape, aval.dtype) for aval in forward_jaxpr.out_avals) == ((q.shape, q.dtype),)
+    assert _count_pallas_calls(forward_jaxpr) == 1
+
+
 def test_each_query_chunk_remains_a_separate_pallas_boundary():
     q, k, v, mask = _inputs()
     forward_jaxpr = jax.make_jaxpr(lambda *args: _prototype(*args, mask))(q, k, v)
@@ -216,9 +448,7 @@ def test_each_query_chunk_remains_a_separate_pallas_boundary():
 
     dout = jnp.ones_like(q)
     backward_jaxpr = jax.make_jaxpr(
-        lambda q_arg, k_arg, v_arg: jax.vjp(
-            lambda *args: _prototype(*args, mask), q_arg, k_arg, v_arg
-        )[1](dout)
+        lambda q_arg, k_arg, v_arg: jax.vjp(lambda *args: _prototype(*args, mask), q_arg, k_arg, v_arg)[1](dout)
     )(q, k, v)
     # Two forward residual calls, then one dQ and one deterministic dK/dV
     # accumulation call per query chunk.
@@ -248,25 +478,19 @@ def test_qwen35_32k_forward_and_vjp_abstract_shapes():
     mask = jax.ShapeDtypeStruct((1, 32_768), jnp.int32)
 
     forward_jaxpr = jax.make_jaxpr(
-        lambda q_arg, k_arg, v_arg, mask_arg: query_bounded_gqa(
-            q_arg, k_arg, v_arg, mask_arg, interpret=True
-        )
+        lambda q_arg, k_arg, v_arg, mask_arg: query_bounded_gqa(q_arg, k_arg, v_arg, mask_arg, interpret=True)
     )(q, k, v, mask)
 
     def pullback(q_arg, k_arg, v_arg, mask_arg, dout_arg):
         return jax.vjp(
-            lambda q_item, k_item, v_item: query_bounded_gqa(
-                q_item, k_item, v_item, mask_arg, interpret=True
-            ),
+            lambda q_item, k_item, v_item: query_bounded_gqa(q_item, k_item, v_item, mask_arg, interpret=True),
             q_arg,
             k_arg,
             v_arg,
         )[1](dout_arg)
 
     backward_jaxpr = jax.make_jaxpr(pullback)(q, k, v, mask, q)
-    assert tuple((aval.shape, aval.dtype) for aval in forward_jaxpr.out_avals) == (
-        (q.shape, q.dtype),
-    )
+    assert tuple((aval.shape, aval.dtype) for aval in forward_jaxpr.out_avals) == ((q.shape, q.dtype),)
     assert tuple((aval.shape, aval.dtype) for aval in backward_jaxpr.out_avals) == (
         (q.shape, q.dtype),
         (k.shape, k.dtype),

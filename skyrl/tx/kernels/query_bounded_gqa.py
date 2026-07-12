@@ -59,9 +59,7 @@ def _forward_kernel(
         k = plgpu.load(k_ref.at[key_slice, :])
         logits = plgpu.dot(q, k.T).astype(jnp.float32)
         logits *= scale * math.log2(math.e)
-        valid = (key_positions[None, :] <= query_positions[:, None]) & (
-            key_mask_ref[key_slice][None, :] != 0
-        )
+        valid = (key_positions[None, :] <= query_positions[:, None]) & (key_mask_ref[key_slice][None, :] != 0)
         logits = jnp.where(valid, logits, _DEFAULT_MASK_VALUE)
 
         current_max = jnp.max(logits, axis=-1)
@@ -70,9 +68,7 @@ def _forward_kernel(
         probabilities = jnp.exp2(logits - next_max[:, None])
         next_sum = correction * previous_sum + jnp.sum(probabilities, axis=-1)
         v = plgpu.load(v_ref.at[key_slice, :])
-        next_output = correction[:, None] * previous_output + plgpu.dot(
-            probabilities.astype(v.dtype), v
-        )
+        next_output = correction[:, None] * previous_output + plgpu.dot(probabilities.astype(v.dtype), v)
         return next_output, next_max, next_sum
 
     # Causality uses global query positions.  This is the key offset that is
@@ -132,9 +128,7 @@ def _dq_kernel(
         v = plgpu.load(v_ref.at[key_slice, :])
         logits = plgpu.dot(q, k.T).astype(jnp.float32)
         logits *= scale * math.log2(math.e)
-        valid = (key_positions[None, :] <= query_positions[:, None]) & (
-            key_mask_ref[key_slice][None, :] != 0
-        )
+        valid = (key_positions[None, :] <= query_positions[:, None]) & (key_mask_ref[key_slice][None, :] != 0)
         logits = jnp.where(valid, logits, _DEFAULT_MASK_VALUE)
         probabilities = jnp.exp2(logits - lse[:, None])
         dprobabilities = plgpu.dot(dout, v.T).astype(jnp.float32)
@@ -194,12 +188,8 @@ def _dkdv_kernel(
     def consume_query_block(local_query_block, carry):
         next_dk, next_dv = carry
         query_slice = pl.dslice(local_query_block * block_q, block_q)
-        query_positions = (
-            query_start + local_query_block * block_q + jnp.arange(block_q)
-        )
-        valid = (key_positions[None, :] <= query_positions[:, None]) & (
-            key_mask_ref[key_slice][None, :] != 0
-        )
+        query_positions = query_start + local_query_block * block_q + jnp.arange(block_q)
+        valid = (key_positions[None, :] <= query_positions[:, None]) & (key_mask_ref[key_slice][None, :] != 0)
 
         # Static unrolling is intentional: it gives a fixed, reproducible
         # reduction order for the four Q heads in each Qwen3.5 KV group.
@@ -209,9 +199,7 @@ def _dkdv_kernel(
             # state-discharge path (JAX 0.10.2).
             head_index = jnp.asarray(query_head_in_group, dtype=jnp.int32)
             q = plgpu.load(q_ref.at[query_slice, head_index, :])
-            output = plgpu.load(out_ref.at[query_slice, head_index, :]).astype(
-                jnp.float32
-            )
+            output = plgpu.load(out_ref.at[query_slice, head_index, :]).astype(jnp.float32)
             dout = plgpu.load(dout_ref.at[query_slice, head_index, :])
             lse = lse_ref[head_index, query_slice]
             delta = jnp.sum(output * dout.astype(jnp.float32), axis=-1)
@@ -219,9 +207,7 @@ def _dkdv_kernel(
             logits *= scale * math.log2(math.e)
             logits = jnp.where(valid, logits, _DEFAULT_MASK_VALUE)
             probabilities = jnp.exp2(logits - lse[:, None])
-            next_dv += plgpu.dot(probabilities.astype(dout.dtype).T, dout).astype(
-                jnp.float32
-            )
+            next_dv += plgpu.dot(probabilities.astype(dout.dtype).T, dout).astype(jnp.float32)
             dprobabilities = plgpu.dot(dout, v.T).astype(jnp.float32)
             dscores = probabilities * (dprobabilities - delta[:, None]) * scale
             next_dk += plgpu.dot(dscores.astype(q.dtype).T, q).astype(jnp.float32)
@@ -271,15 +257,11 @@ def _forward_chunk(
         ),
         out_shape=(
             jax.ShapeDtypeStruct(q.shape, q.dtype),
-            jax.ShapeDtypeStruct(
-                (batch_size, query_heads, query_chunk_size), jnp.float32
-            ),
+            jax.ShapeDtypeStruct((batch_size, query_heads, query_chunk_size), jnp.float32),
         ),
         grid=(query_chunk_size // block_q, batch_size, query_heads),
         in_specs=(
-            pl.BlockSpec(
-                (None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)
-            ),
+            pl.BlockSpec((None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)),
             pl.BlockSpec(
                 (None, sequence_length, None, head_dim),
                 lambda qb, b, qh: (b, 0, qh // group_size, 0),
@@ -291,9 +273,7 @@ def _forward_chunk(
             pl.BlockSpec((None, sequence_length), lambda qb, b, qh: (b, 0)),
         ),
         out_specs=(
-            pl.BlockSpec(
-                (None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)
-            ),
+            pl.BlockSpec((None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)),
             pl.BlockSpec((None, None, block_q), lambda qb, b, qh: (b, qh, qb)),
         ),
         compiler_params=_compiler_params(),
@@ -336,9 +316,7 @@ def _dq_chunk(
         out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
         grid=(query_chunk_size // block_q, batch_size, query_heads),
         in_specs=(
-            pl.BlockSpec(
-                (None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)
-            ),
+            pl.BlockSpec((None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)),
             pl.BlockSpec(
                 (None, sequence_length, None, head_dim),
                 lambda qb, b, qh: (b, 0, qh // group_size, 0),
@@ -348,17 +326,11 @@ def _dq_chunk(
                 lambda qb, b, qh: (b, 0, qh // group_size, 0),
             ),
             pl.BlockSpec((None, sequence_length), lambda qb, b, qh: (b, 0)),
-            pl.BlockSpec(
-                (None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)
-            ),
-            pl.BlockSpec(
-                (None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)
-            ),
+            pl.BlockSpec((None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)),
+            pl.BlockSpec((None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)),
             pl.BlockSpec((None, None, block_q), lambda qb, b, qh: (b, qh, qb)),
         ),
-        out_specs=pl.BlockSpec(
-            (None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)
-        ),
+        out_specs=pl.BlockSpec((None, block_q, None, head_dim), lambda qb, b, qh: (b, qb, qh, 0)),
         compiler_params=_compiler_params(),
         interpret=interpret,
         name=f"query_bounded_gqa_dq_q{query_start}",
@@ -409,12 +381,8 @@ def _accumulate_dkdv_chunk(
                 (None, query_chunk_size, group_size, head_dim),
                 lambda kb, b, kvh: (b, 0, kvh, 0),
             ),
-            pl.BlockSpec(
-                (None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)
-            ),
-            pl.BlockSpec(
-                (None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)
-            ),
+            pl.BlockSpec((None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)),
+            pl.BlockSpec((None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)),
             pl.BlockSpec((None, sequence_length), lambda kb, b, kvh: (b, 0)),
             pl.BlockSpec(
                 (None, query_chunk_size, group_size, head_dim),
@@ -428,20 +396,12 @@ def _accumulate_dkdv_chunk(
                 (None, group_size, query_chunk_size),
                 lambda kb, b, kvh: (b, kvh, 0),
             ),
-            pl.BlockSpec(
-                (None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)
-            ),
-            pl.BlockSpec(
-                (None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)
-            ),
+            pl.BlockSpec((None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)),
+            pl.BlockSpec((None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)),
         ),
         out_specs=(
-            pl.BlockSpec(
-                (None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)
-            ),
-            pl.BlockSpec(
-                (None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)
-            ),
+            pl.BlockSpec((None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)),
+            pl.BlockSpec((None, block_k, None, head_dim), lambda kb, b, kvh: (b, kb, kvh, 0)),
         ),
         input_output_aliases={7: 0, 8: 1},
         compiler_params=_compiler_params(),
@@ -475,11 +435,7 @@ def _validate_inputs(
 ):
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or key_mask.ndim != 2:
         raise ValueError("q/k/v must be rank four and key_mask rank two")
-    if (
-        q.dtype != k.dtype
-        or q.dtype != v.dtype
-        or not jnp.issubdtype(q.dtype, jnp.floating)
-    ):
+    if q.dtype != k.dtype or q.dtype != v.dtype or not jnp.issubdtype(q.dtype, jnp.floating):
         raise TypeError("q, k, and v must have the same floating-point dtype")
     batch, sequence_length, query_heads, head_dim = q.shape
     if batch != 1:
@@ -496,10 +452,7 @@ def _validate_inputs(
         raise ValueError("q, k, and v head dimensions must match")
     if key_mask.shape != (batch, sequence_length):
         raise ValueError("key_mask must have shape [batch, sequence_length]")
-    if not (
-        jnp.issubdtype(key_mask.dtype, jnp.bool_)
-        or jnp.issubdtype(key_mask.dtype, jnp.integer)
-    ):
+    if not (jnp.issubdtype(key_mask.dtype, jnp.bool_) or jnp.issubdtype(key_mask.dtype, jnp.integer)):
         raise TypeError("key_mask must have boolean or integer dtype")
     for name, value in (
         ("query_chunk_size", query_chunk_size),
@@ -520,6 +473,61 @@ def _validate_inputs(
         raise ValueError("query_chunk_size must be divisible by backward_block_q")
     if sequence_length % backward_block_k:
         raise ValueError("sequence length must be divisible by backward_block_k")
+
+
+def _validate_forward_chunk_inputs(
+    q_chunk,
+    k,
+    v,
+    key_mask,
+    *,
+    query_start: int,
+    block_q: int,
+    block_k: int,
+):
+    """Validate the standalone forward-chunk contract without full-Q assumptions."""
+    if type(query_start) is not int:
+        raise TypeError("query_start must be an exact concrete Python int")
+    for name, value in (("block_q", block_q), ("block_k", block_k)):
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an exact concrete Python int")
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+
+    if q_chunk.ndim != 4 or k.ndim != 4 or v.ndim != 4 or key_mask.ndim != 2:
+        raise ValueError("q_chunk/k/v must be rank four and key_mask rank two")
+    if q_chunk.dtype != k.dtype or q_chunk.dtype != v.dtype or not jnp.issubdtype(q_chunk.dtype, jnp.floating):
+        raise TypeError("q_chunk, k, and v must have the same floating-point dtype")
+
+    batch, query_chunk_size, query_heads, head_dim = q_chunk.shape
+    key_batch, sequence_length, kv_heads, key_head_dim = k.shape
+    if batch != 1 or key_batch != 1 or v.shape[0] != 1:
+        raise ValueError("the forward-chunk prototype is restricted to batch size one")
+    if query_chunk_size <= 0 or sequence_length <= 0:
+        raise ValueError("query-chunk and key sequence lengths must be positive")
+    if query_heads <= 0 or kv_heads <= 0 or head_dim <= 0:
+        raise ValueError("query-head, K/V-head, and head dimensions must be positive")
+    if v.shape[1] != sequence_length or v.shape[2] != kv_heads:
+        raise ValueError("k and v sequence and head dimensions must match")
+    if query_heads % kv_heads:
+        raise ValueError("query heads must be divisible by the K/V head count")
+    if key_head_dim != head_dim or v.shape[3] != head_dim:
+        raise ValueError("q_chunk, k, and v head dimensions must match")
+    if key_mask.shape != (1, sequence_length):
+        raise ValueError("key_mask must have shape [1, key_sequence_length]")
+    if not (jnp.issubdtype(key_mask.dtype, jnp.bool_) or jnp.issubdtype(key_mask.dtype, jnp.integer)):
+        raise TypeError("key_mask must have boolean or integer dtype")
+
+    if query_chunk_size % block_q:
+        raise ValueError("query chunk length must be divisible by block_q")
+    if sequence_length % block_k:
+        raise ValueError("key sequence length must be divisible by block_k")
+    if query_start < 0:
+        raise ValueError("query_start must be nonnegative")
+    if query_start % block_q:
+        raise ValueError("query_start must be aligned to block_q")
+    if query_start + query_chunk_size > sequence_length:
+        raise ValueError("query chunk must fit within the key sequence length")
 
 
 def _forward_impl(
@@ -673,6 +681,57 @@ def _query_bounded_gqa_bwd(
 
 
 _query_bounded_gqa.defvjp(_query_bounded_gqa_fwd, _query_bounded_gqa_bwd)
+
+
+def query_bounded_gqa_forward_chunk(
+    q_chunk,
+    k,
+    v,
+    key_mask,
+    *,
+    query_start: int,
+    scale: float | None = None,
+    block_q: int = 64,
+    block_k: int = 64,
+    interpret: bool = False,
+):
+    """Run one experimental, forward-only query chunk against a longer K/V.
+
+    ``q_chunk`` has shape ``[1, C, Hq, D]`` while ``k`` and ``v`` have shape
+    ``[1, L, Hkv, D]``.  ``query_start`` is the chunk's global position in the
+    causal sequence, must be an exact Python ``int`` aligned to ``block_q``,
+    and the complete chunk must lie inside ``[0, L)``.  No query chunks are
+    concatenated and no custom VJP is installed around this entry point.
+
+    As in :func:`query_bounded_gqa`, ``key_mask`` must be a nonempty prefix of
+    ones followed by zeros.  Shape and dtype are checked here, but the mask's
+    data-dependent right-padding structure cannot be inspected while JAX is
+    tracing.  ``interpret=True`` is the CPU correctness mode.
+    """
+    _validate_forward_chunk_inputs(
+        q_chunk,
+        k,
+        v,
+        key_mask,
+        query_start=query_start,
+        block_q=block_q,
+        block_k=block_k,
+    )
+    if scale is None:
+        scale = q_chunk.shape[-1] ** -0.5
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be finite and positive")
+    return _forward_chunk(
+        q_chunk,
+        k,
+        v,
+        key_mask,
+        query_start=query_start,
+        scale=float(scale),
+        block_q=block_q,
+        block_k=block_k,
+        interpret=interpret,
+    )[0]
 
 
 def query_bounded_gqa(
