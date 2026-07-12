@@ -574,6 +574,57 @@ bounded GPU profiling work, but every executable/lowered-call counter remains
 zero. This gate promotes nothing until its source, artifact, and telemetry are
 independently audited.
 
+### ROCm 7.2.4 C=256 compile-only result
+
+The gate passed from clean commit `dd5e45e4` on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. Every source hash in the manifest
+matches that checkout. Lowering took 0.250435 s and compilation took 1.988343
+s. StableHLO and optimized HLO each contained exactly one total custom/Pallas
+call with the sole target `__gpu$xla.gpu.triton`, the exact q256 marker, exact
+decoded `query_start=256` and `query_size=256`, no other forward/backward
+kernel marker, and no outer `while`. Their SHA-256 values were
+`f604694d4de7d8e2c24b1e6dd94adf1cd566736bf99d78d464e91d2d821b8e57`
+and `6df7e0ccfad755c6ab88ce3eb9e6ea3c217742bc917fb3e8f2fe39b4437c23dc`.
+
+Compiler analysis reported the exact 4,196,352 B of arguments and 2,097,152 B
+of output, plus 16,640 B of temporary storage (6,310,144 B combined). All
+forward-attempt/completion, lowered-callable, and compiled-executable counters
+remained zero. The compiled executable was deleted without being returned or
+invoked.
+
+The profiler completed in 22.577327 s with return code zero. Its 20 baseline,
+one preflight, and 206 measured samples observed at most 711,974,912 B physical
+VRAM, 49 C junction temperature, and 129 W power. Host-available memory stayed
+at or above 62,351,974,400 B and swap remained zero. Temperature and power
+first became jointly readable 6.925 s after measured sampling began, within
+the deliberately extended 15 s grace needed for the child preflight and
+pre-backend journal check; neither was missing afterwards. The longest
+measured sample gap was 105.407 ms. Values are sampled run maxima, not
+continuous bounds on compiler profiling kernels.
+
+All four child journal checkpoints, preflight/postflight, profiler driver
+checks, and a separate operator postcheck were clean. `/dev/kfd` and the AMD
+render node were unowned and the card returned to runtime suspend. All
+artifacts are mode `0600`:
+
+- `/tmp/query-bounded-gqa-c256-t512-compile-boot54ccf56c-run3.jsonl`
+- `/tmp/query-bounded-gqa-c256-t512-compile-boot54ccf56c-run3.telemetry.jsonl`
+- `/tmp/query-bounded-gqa-c256-t512-compile-boot54ccf56c-run3.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`c1d272756fc05c0cec34424687da8764bd9c40db30bbdcf4b7aec6e419b00875`,
+`556396c1e53be2470878c8c1e693ebfb7d0267ca2728a18d362e7f247ca7fd24`,
+and `0f3e461b5846ebd175513edcd5fbccdc74e1d1ef7c401ee867470c6d7ea42b2e`.
+
+Two precursor attempts are deliberately not promotion evidence. Run 1 was
+terminated before backend initialization when the old 5 s sensor grace
+expired during pre-backend safety work; VRAM stayed at idle and the boot
+remained clean. Run 2 compiled successfully with zero invocations but was
+rejected by an over-strict pre-fix parser that did not decode canonical MLIR
+metadata. This result promotes only compilation of the exact C=256/T=512 last
+chunk. It does not authorize executing it or qualify any runtime, other
+query-start, longer length, padding, backward path, or model integration.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
