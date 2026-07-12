@@ -249,6 +249,62 @@ This promotes only the exact T=512 structure through compile. It does not
 promote execution, numerical correctness, padding, repeated launches, or any
 larger bucket. The prototype remains disconnected from model attention.
 
+## Pending exact T=512 single-forward runtime gate
+
+`rocm/probe_query_bounded_gqa_runtime.py` implements the next gate but has not
+been run. Its default path imports no JAX and emits only an abstract refusal:
+
+```bash
+.venv/bin/python rocm/probe_query_bounded_gqa_runtime.py \
+  --output /tmp/query-bounded-gqa-t512-runtime-abstract.jsonl
+```
+
+The first hardware run must use fresh artifact paths and the tighter
+expected-footprint anomaly limits below. Separately reviewed larger experiments
+may use ceilings up to 90 C, 315 W, and the full practical VRAM budget; this
+one-call attention probe is expected to remain far below them:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-t512-runtime.telemetry.jsonl \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 60 \
+  --max-junction-temp-c 70 \
+  --max-vram-gib 2 \
+  --max-gpu-power-watts 315 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_runtime.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-t512-runtime.jsonl
+```
+
+The probe does not consume the prior compile artifact. In its guarded process
+it freshly lowers and compiles the immutable BF16
+`B=1, T=512, Hq=16, Hkv=4, D=256` forward. Before an executable is exposed,
+both StableHLO and optimized HLO must contain exactly one custom call total.
+Its target set must be exactly `{__gpu$xla.gpu.triton}`, its sole marker must
+be the exact forward name, and there may be no dQ, dK/dV, or outer `while`.
+Compiler memory analysis is mandatory: temporary memory must be at most 64 MiB
+and arguments plus output plus temporary memory at most 128 MiB.
+
+Only after those gates pass does it build hashed host BF16 inputs: zero Q/K,
+deterministic position-plus-KV-head V values in approximately `[-1, 1]`, and
+an all-ones mask. The candidate executable is invoked exactly once and must
+complete in less than 100 ms, with a clean journal check immediately after the
+dispatch. A flushed `dispatch_started` record must first show one attempt and
+zero completions. The result is copied to the host and compared entirely in
+NumPy to the analytic cumulative-mean causal GQA result mapped by
+`query_head // 4`.
+The full output must be finite with relative L2 below 1%, cosine at least
+0.9999, and maximum absolute error at most 0.02.
+
+There is no GPU reference, random input, replay, backward, padding case, or
+model-dispatcher connection in this first runtime gate. Any compile, memory,
+journal, duration, transfer, or numerical failure is fatal. Replay and the
+broader input matrix remain separate later probes.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
@@ -256,16 +312,18 @@ all gates pass in fresh, profiler-controlled processes:
 
 1. Compile only the Qwen shape at T=512 and inspect the generated artifacts as
    described above. The returned attention executable must not be invoked.
-2. Run forward-only at 512, 1K, 2K, 4K, 8K, 16K, 24K, and 32K, comparing finite
-   outputs and sampled rows to a bounded reference.
-3. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
+2. Run the exact single-forward T=512 analytic gate above. Do not add a replay,
+   random input, GPU reference, padding case, or backward work to that process.
+3. In fresh later gates, qualify T=512 replay and the broader forward-only
+   input matrix before advancing through 1K, 2K, 4K, 8K, 16K, 24K, and 32K.
+4. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
    gradients where the reference fits.
-4. Repeat padding boundaries including valid lengths 1, `T-1`, and `T`.
-5. Repeat every bucket enough times to expose replay and cleanup faults, with
-   command buffers disabled and kernel/journal monitoring active.
-6. Record maximum individual dispatch duration. The initial safety target is
+5. Repeat padding boundaries including valid lengths 1, `T-1`, and `T`.
+6. Repeat every promoted bucket enough times to expose replay and cleanup
+   faults, with command buffers disabled and kernel/journal monitoring active.
+7. Record maximum individual dispatch duration. The initial safety target is
    below 100 ms; reduce the query range to 256 if any call approaches it.
-7. Only after 32K isolated attention passes, add a separate environment opt-in
+8. Only after 32K isolated attention passes, add a separate environment opt-in
    (for example `SKYRL_ROCM_QUERY_BOUNDED_GQA=1`) while retaining the current
    16K monolithic limit and default-off behavior for the old kernel.
 
