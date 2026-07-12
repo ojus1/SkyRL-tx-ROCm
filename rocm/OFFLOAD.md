@@ -97,7 +97,7 @@ final re-offload:
   --interval 0.05 \
   --baseline-seconds 2 \
   --timeout 60 \
-  --sensor-grace-seconds 5 \
+  --sensor-grace-seconds 15 \
   --max-junction-temp-c 70 \
   --max-gpu-power-watts 200 \
   --max-vram-gib 2 \
