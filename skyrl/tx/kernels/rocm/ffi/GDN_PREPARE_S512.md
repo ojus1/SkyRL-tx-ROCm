@@ -80,11 +80,51 @@ mode-`0600`, fully sealed memfd. Only the retained `/proc/self/fd/<fd>` snapshot
 is passed to `dlopen`; the source path is never loaded. The descriptor and CDLL
 are retained for process lifetime even across later registration failures.
 
-JAX compile and runtime gates are pending. Do not build or invoke this
-operation outside the guarded probe protocol, and do not wire it into the
-model or a custom VJP. The next rungs require an independently reviewed
-compile-only gate, an analytic plus dense-oracle runtime gate at S512, then
-separate execute and explicit reverse-superblock kernels.
+The compile-only gate is default-refusing and imports neither JAX nor the ROCm
+package on its safe path:
+
+```bash
+.venv/bin/python rocm/probe_gdn_prepare_s512_compile.py
+```
+
+After independent source review, an exact external build may be compiled—but
+not executed—under telemetry with fresh mode-`0600` output paths:
+
+```bash
+XLA_FLAGS=--xla_gpu_enable_command_buffer= \
+  .venv/bin/python rocm/profile_rocm.py \
+    --output /tmp/gdn-prepare-s512-compile.telemetry.jsonl \
+    --interval 0.25 --timeout 120 --sensor-grace-seconds 15 \
+    --max-junction-temp-c 90 --max-gpu-power-watts 315 \
+    --max-vram-gib 2 --min-host-available-gib 8 --max-swap-gib 0 -- \
+    .venv/bin/python rocm/probe_gdn_prepare_s512_compile.py \
+      --platform rocm --allow-gpu --case s512-compile \
+      --library /absolute/private/build/libskyrl_gdn_prepare_s512_gfx1100.so \
+      --library-sha256 '<exact 64-character lowercase sha256>' \
+      --output /tmp/gdn-prepare-s512-compile.jsonl
+```
+
+The probe pins the committed wrapper, HIP handler, safety helper, sealed-loader
+implementation, and every executed package initializer in the wrapper import
+chain before configuring ROCm or importing JAX. It registers only the sealed
+memfd snapshot, then performs one abstract lower and one compile from four FP32
+`ShapeDtypeStruct` inputs. StableHLO and optimized HLO must independently show
+exactly one `skyrl_gdn_prepare_s512_f32_v1` call, no other custom call, loop, or
+alias, and exact physical row-major minor-to-major layouts: four rank-4
+`{3,2,1,0}` buffers and three rank-3 `{2,1,0}` buffers. Compiler accounting
+must report exactly 12,713,984 argument bytes, 16,842,752 output bytes, zero
+alias bytes, at most 64 MiB temporary bytes, and at most 96 MiB for arguments,
+outputs, and temporaries together. StableHLO must pass its complete structural,
+typed-signature, ordered-layout, loop, and alias gate before `compile()` is
+allowed to run; optimized HLO and compiler memory remain independent
+postcompile gates.
+
+The executable is discarded without invocation; no user array, device put,
+device get, or synchronization is allowed. `compile()` may still dispatch ROCm
+compiler profiling or autotuning work, so the guarded command is GPU work. A
+passing result is not numerical, launch-safety, performance, model-integration,
+or VJP evidence. Runtime gates remain pending: first analytic plus dense-oracle
+S512 execution, then separate execute and explicit reverse-superblock kernels.
 
 ## ROCm 7.2.4 external build result
 
