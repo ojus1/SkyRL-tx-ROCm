@@ -53,6 +53,63 @@ private artifacts are:
 The client-observed step time includes the local HTTP/database/future path. It
 must not be compared directly with isolated device-event kernel timing.
 
+## Full Qwen3.5-4B SFT at context 512
+
+On 2026-07-12, revision `82e038f61565e820d8dc86b5fd285eb77a07a301`
+completed one cold and five measured forward/backward/Adam steps at batch 1,
+context 512, using the opt-in Pallas attention path. LoRA, rematerialization,
+loss chunking, model revision, and command-buffer settings matched the
+64-token control.
+
+| Result | Measured value |
+|---|---:|
+| Cold forward/backward plus first Adam | 170.225 s |
+| Server-reported train JIT | 157.79 s |
+| Measured median / p95 step | 1.4281 / 1.4299 s |
+| Median useful throughput | 358.52 tokens/s |
+| Maximum system VRAM used | 18,530,045,952 B (17.26 GiB) |
+| Maximum process RSS / PSS / USS | 16.13 / 15.77 / 15.59 GiB |
+| Maximum / p95 junction temperature | 80 / 66 C |
+| Maximum / p95 GPU power | 358 / 143 W |
+| Maximum host memory used | 17.35 GiB |
+| Maximum swap used | 0 B |
+
+All six losses and gradient norms were finite, the adapter unload succeeded,
+the fatal-journal query was empty, VRAM returned to the 27,947,008-byte idle
+baseline, and `/dev/kfd` was unowned after exit. Relative to the T64 control,
+the end-to-end client median used 2.41x the time for 8x the useful tokens, or
+3.32x the throughput. This comparison includes polling/API overhead and also
+changes attention implementation at the 512-token safety boundary; it is not
+an isolated Pallas speedup.
+
+The manifest had no tracked source diff and identified the exact commit above.
+It did list three untracked, unwired GRPO-benchmark files being reviewed in
+parallel; none is imported by the server or SFT client. Local private artifacts
+are:
+
+- `/tmp/t512-sft-1783856707.sft.jsonl`
+- `/tmp/t512-sft-1783856707.telemetry.jsonl`
+- `/tmp/t512-sft-1783856707.telemetry.jsonl.summary.json`
+
+### Context-1024 progression
+
+The same guarded configuration then completed one cold and five measured
+steps at context 1,024. The server-reported JIT was 160.24 s; the client cold
+step including the first Adam was 172.242 s. Median/p95 step time was
+2.1917/2.2023 s, or 467.21 useful tokens/s. Peak system VRAM was
+18,823,901,184 B (17.53 GiB), maximum process RSS/PSS/USS was
+16.93/16.72/16.47 GiB, and maximum host use was 16.90 GiB. Maximum/p95
+junction temperature was 85/72 C, maximum/p95 GPU power was 358/160 W, and
+swap remained unused.
+
+All losses and gradient norms were finite, adapter unload succeeded, the fatal
+journal query was empty, and the device returned to its idle VRAM/KFD state.
+The local artifacts are:
+
+- `/tmp/t1024-sft-1783857150.sft.jsonl`
+- `/tmp/t1024-sft-1783857150.telemetry.jsonl`
+- `/tmp/t1024-sft-1783857150.telemetry.jsonl.summary.json`
+
 ## Isolated evidence and known failures
 
 - The bounded correctness probe completed 512-token BF16 Pallas attention for
@@ -67,6 +124,11 @@ must not be compared directly with isolated device-event kernel timing.
   materially the same. Telemetry is in
   `/tmp/pallas512-reference-1783855014.telemetry.jsonl` and
   `/tmp/pallas512-pad385-1783855051.telemetry.jsonl`.
+- The same bounded reference at 1,024 tokens completed with 1.194/4.645 ms
+  median forward/backward, 339,747,840 B JAX peak allocation, and no driver
+  event. Output relative L2 was 0.00206; `dq`/`dk` remained 0.0113/0.0107, so
+  the numerical promotion decision did not change. Telemetry is in
+  `/tmp/pallas1024-reference-1783857107.telemetry.jsonl`.
 - The exact synthetic Qwen3.5 LoRA optimizer tree contains 402 leaves and
   34,512,896 BF16 parameter elements. Three repeated GPU updates passed with
   command buffers disabled, with about 70 ms steady optimizer time and
@@ -86,7 +148,9 @@ must not be compared directly with isolated device-event kernel timing.
 
 ## Validation frontier
 
-The post-fix full-model validation frontier is currently context 64. Context
-512 and larger, GRPO, quantized model execution, and fused-kernel execution
-remain unverified. The staged gates in [`MEGAKERNELS.md`](MEGAKERNELS.md) must
-be followed; no quantized or custom-kernel path is enabled by default.
+The post-fix full-model validation frontier is currently context 1,024.
+Contexts above 1,024, GRPO, quantized model execution, and fused-kernel execution remain
+unverified. The Pallas gradient result remains just outside its initial
+promotion gate, so it is still opt-in despite the clean integrated run. The
+staged gates in [`MEGAKERNELS.md`](MEGAKERNELS.md) must be followed; no
+quantized or custom-kernel path is enabled by default.

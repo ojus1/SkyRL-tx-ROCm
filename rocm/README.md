@@ -93,6 +93,27 @@ This benchmark uses deterministic synthetic tokens. It measures the local
 HTTP/database/future path plus forward, backward, and Adam; it is throughput
 and stability evidence, not SFT quality evidence.
 
+The fixed-rollout GRPO learner harness follows the Cookbook's causal shift,
+group-mean advantage, mask-removal, `importance_sampling`, and Adam call order
+without performing sampling or grading. Its smallest nondegenerate control is:
+
+```bash
+TINKER_API_KEY=tml-dummy ../tinker-cookbook/.venv/bin/python \
+  rocm/bench_grpo.py \
+  --base-url http://127.0.0.1:8001 \
+  --context 64 \
+  --completion-tokens 16 \
+  --group-size 2 \
+  --warmup-steps 1 \
+  --measured-steps 5 \
+  --run-id grpo-t64-g2 \
+  --output /tmp/grpo-t64-g2.jsonl
+```
+
+The rollouts, old log-probabilities, rewards, and advantages are deterministic
+synthetic inputs. This isolates learner execution; it is not rollout-quality,
+reward, KL, or policy-improvement evidence.
+
 Use the telemetry wrapper for every GPU experiment. It writes private JSONL
 and summary files, watches fatal AMDGPU journal events once per second, and
 terminates wrapped/deliberately included process trees on configured limits:
