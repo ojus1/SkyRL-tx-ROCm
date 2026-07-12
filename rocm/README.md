@@ -214,11 +214,13 @@ TINKER_API_KEY=tml-dummy ../tinker-cookbook/.venv/bin/python \
 ```
 
 Its fail-closed protocol, cleanup paths, direct-script invocation, and normal
-1+5 compatibility have passed CPU/mocked review; hardware validation still
-begins at context 64 under telemetry. Compile success alone does not move the
-training frontier. Context-2,048 execution remains blocked until the lower
-context hardware gate passes and Pallas is numerically qualified: isolated
-`dq`/`dk` relative-L2 error is about 1.1%, above the 1% promotion threshold.
+1+5 compatibility passed CPU/mocked review. The first hardware gate then passed
+at context 64 on ROCm 7.2.4: exactly one update completed, cleanup unloaded the
+adapter, and the device returned to idle without a fatal driver event. This
+validates the protocol and the short-context post-upgrade model path, not
+steady-state throughput. Context-2,048 execution remains blocked until Pallas
+is numerically qualified: isolated `dq`/`dk` relative-L2 error is about 1.1%,
+above the 1% promotion threshold. Exact results are in [`RESULTS.md`](RESULTS.md).
 
 The fixed-rollout GRPO learner harness follows the Cookbook's causal shift,
 group-mean advantage, mask-removal, `importance_sampling`, and Adam call order

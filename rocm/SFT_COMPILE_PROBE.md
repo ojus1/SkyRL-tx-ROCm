@@ -78,11 +78,12 @@ autotuning/profiling work described above. Artifacts:
 - `/tmp/postrocm-compile-t2048-pallas-1783872544.telemetry.jsonl.summary.json`
 
 This is compile-only capacity evidence. `bench_sft.py --one-update-gate` has
-passed independent source review and CPU/mocked protocol tests, but its first
-hardware validation must occur at context 64 under telemetry. It does not yet
-authorize invoking the 2,048-token executable. Separate Pallas numerical
-qualification also remains required: the approximately 1.1% isolated `dq`/`dk`
-relative-L2 result still exceeds the 1% promotion threshold.
+passed independent source review, CPU/mocked protocol tests, and its first
+context-64 hardware validation on ROCm 7.2.4. That result is recorded in
+`RESULTS.md`; it does not authorize invoking the 2,048-token executable.
+Separate Pallas numerical qualification also remains required: the
+approximately 1.1% isolated `dq`/`dk` relative-L2 result still exceeds the 1%
+promotion threshold.
 
 ## Safety contract
 
@@ -138,9 +139,9 @@ run under telemetry:
 
 The setup-only sequence and subsequent context-2,048 Pallas compile-only gate
 have now passed cleanly after reboot. This does not authorize invoking the
-compiled callable. The reviewed exact-one-update client must first pass its
-context-64 hardware gate, and effective context 2,048 still carries the Pallas
-numerical qualification above.
+compiled callable. The reviewed exact-one-update client passed its context-64
+hardware gate, but effective context 2,048 still carries the Pallas numerical
+qualification above.
 
 Setup-only success produces `manifest`, the flushed `setup_stage` sequence,
 `backend_ready`, and `stopped`; it produces no `lowered` or `compiled` record.

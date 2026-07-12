@@ -81,12 +81,50 @@ returned to idle after each process. Artifacts:
 
 This advances context 2,048 to **compile-only capacity**, not validated
 training. The exact-one-update client protocol has now passed independent
-source review plus CPU/mocked tests, but has not yet run on hardware. Its first
-hardware gate is context 64 under telemetry; it is not permission to invoke the
-context-2,048 executable. The 2,048-token Pallas backward path must also pass
-its numerical promotion criterion: the isolated `dq`/`dk` relative-L2 errors
-remain about 1.1%, above the 1% threshold. Neither compile success nor bounded
-autotuning qualifies that attention implementation for training.
+source review plus CPU/mocked tests and the context-64 hardware gate below. It
+is not permission to invoke the context-2,048 executable. The 2,048-token
+Pallas backward path must also pass its numerical promotion criterion: the
+isolated `dq`/`dk` relative-L2 errors remain about 1.1%, above the 1% threshold.
+Neither compile success nor bounded autotuning qualifies that attention
+implementation for training.
+
+### Post-upgrade exact-one-update hardware gate
+
+Pushed revision `8437dd7739f16ca0c42832cbbca9858f3ced7875` completed the
+reviewed `--one-update-gate` at context 64 in the growth allocator mode. The
+artifact contains exactly `manifest`, `step`, `cleanup`, and `summary` records:
+one requested update, no warmup or measured throughput samples, one cold
+forward/backward/Adam step, `adapter_unloaded: true`, and
+`updates_completed: 1`. The repository manifest was clean at that exact
+revision.
+
+| Result | Measured value |
+|---|---:|
+| Client-observed cold update | 103.215228 s |
+| Server training JIT | 69.06 s |
+| Server optimizer request | 33.316 s |
+| Synthetic mean NLL | 0.4008960724 |
+| Optimizer gradient norm | 4.90625 |
+| Maximum system VRAM used | 18,066,522,112 B (16.83 GiB) |
+| Maximum process RSS / PSS / USS | 17,610,248,192 / 17,316,330,496 / 17,040,822,272 B |
+| Maximum junction temperature / power | 67 C / 261 W |
+| Maximum host memory used / swap | 16,740,802,560 B / 0 B |
+
+After the successful client summary, the long-running server wrapper was
+stopped intentionally with SIGINT; its telemetry summary therefore records
+`status: signal`, `received_signal: 2`, and wrapper return code 143 rather than
+a natural server exit. Uvicorn completed application shutdown and stopped the
+background engine. The client artifact proves adapter unload before that
+signal. The subsequent entire-boot guard was clean, port 8001 was free,
+`/dev/kfd` was unowned, and the GPU returned to runtime suspend. Artifacts:
+
+- `/tmp/postrocm-one-t64-1783873721.sft.jsonl`
+- `/tmp/postrocm-one-t64-1783873721.telemetry.jsonl`
+- `/tmp/postrocm-one-t64-1783873721.telemetry.jsonl.summary.json`
+
+This re-establishes one full Qwen3.5-4B forward/backward/Adam execution at
+context 64 on ROCm 7.2.4. It is a safety/correctness gate, not a throughput
+baseline and not evidence for contexts above the previously validated 1,024.
 
 ## Full Qwen3.5-4B SFT control
 
