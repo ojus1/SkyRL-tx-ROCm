@@ -95,6 +95,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="exclusive mode-0600 JSONL artifact (required for ROCm)",
     )
+    parser.add_argument(
+        "--stop-after-backend-ready",
+        action="store_true",
+        help="load exact model/Adam state, synchronize it, and stop before lowering",
+    )
     args = parser.parse_args(argv)
 
     if args.platform == "rocm" and not args.allow_gpu:
@@ -105,6 +110,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--allow-download is only valid with --platform rocm")
     if args.platform == "abstract" and args.attention_backend != "xla":
         parser.error("--attention-backend pallas is only valid with --platform rocm")
+    if args.platform == "abstract" and args.stop_after_backend_ready:
+        parser.error("--stop-after-backend-ready is only valid with --platform rocm")
     if args.platform == "rocm" and args.output is None:
         parser.error("--platform rocm requires --output for a clean JSONL artifact")
     if args.context <= 0 or args.context > _MAX_CONTEXT:
@@ -112,7 +119,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.context > _DEFAULT_CONTEXT and not args.allow_large_context:
         parser.error("contexts above 2048 require --allow-large-context")
     effective_context = _round_up_seq_len(args.context)
-    if args.platform == "rocm":
+    if args.platform == "rocm" and not args.stop_after_backend_ready:
         if effective_context >= _PALLAS_REQUIRED_CONTEXT and args.attention_backend != "pallas":
             parser.error(
                 "ROCm effective contexts >=512 require --attention-backend pallas; "
@@ -477,6 +484,18 @@ def _run_rocm(
         jax, jax_backend.get_backend
     )
 
+    def emit_setup_stage(stage: str) -> None:
+        _emit(
+            {
+                "record_type": "setup_stage",
+                "timestamp": _utc_now(),
+                "stage": stage,
+                "model_pass_executable_invocations": 0,
+                "optimizer_step_invocations": 0,
+            },
+            output,
+        )
+
     try:
         checkpoint_path = snapshot_download(
             _MODEL,
@@ -493,6 +512,7 @@ def _run_rocm(
         raise RuntimeError(
             f"resolved model revision {resolved_revision!r}, expected {_MODEL_REVISION!r}"
         )
+    emit_setup_stage("checkpoint_resolved")
 
     config_kwargs = {
         "max_lora_adapters": 2,
@@ -510,11 +530,22 @@ def _run_rocm(
         )
 
     setup_start = time.perf_counter()
+    emit_setup_stage("backend_constructor_start")
     backend = JaxBackendImpl(
         checkpoint_path,
         JaxBackendConfig(**config_kwargs),
         process_id=0,
     )
+    emit_setup_stage("backend_constructor_barrier_start")
+    jax.block_until_ready(
+        (
+            backend.lora_params,
+            backend.non_lora_params,
+            backend.accumulated_grads,
+        )
+    )
+    emit_setup_stage("backend_constructor_complete")
+    emit_setup_stage("create_model_start")
     backend.create_model(
         _MODEL_ID,
         types.LoraConfig(rank=8, alpha=32.0, seed=0),
@@ -523,6 +554,10 @@ def _run_rocm(
     if adapter_index != 1:
         raise RuntimeError(f"expected active adapter index 1, got {adapter_index}")
     optimizer_state = nnx.state(backend.optimizers[_MODEL_ID])
+    emit_setup_stage("create_model_barrier_start")
+    jax.block_until_ready((backend.lora_params, optimizer_state))
+    emit_setup_stage("create_model_complete")
+    emit_setup_stage("state_barrier_start")
     jax.block_until_ready(
         (
             backend.lora_params,
@@ -531,6 +566,7 @@ def _run_rocm(
             optimizer_state,
         )
     )
+    emit_setup_stage("state_barrier_complete")
     setup_seconds = time.perf_counter() - setup_start
 
     effective_context = _round_up_seq_len(args.context)
@@ -622,6 +658,21 @@ def _run_rocm(
         },
         output,
     )
+    if args.stop_after_backend_ready:
+        _emit(
+            {
+                "record_type": "stopped",
+                "timestamp": _utc_now(),
+                "stage": "backend_ready",
+                "status": "passed",
+                "reason": "explicit stop before lowering",
+                "allocator": _allocator_snapshot(jax),
+                "model_pass_executable_invocations": 0,
+                "optimizer_step_invocations": 0,
+            },
+            output,
+        )
+        return 0
 
     model_pass = backend._forward_backward_and_accumulate
     if not hasattr(model_pass, "lower"):
@@ -711,13 +762,22 @@ def _execute(
             "scope": (
                 "cpu_guard_refusal"
                 if args.platform == "abstract"
-                else "backend_setup_and_model_pass_compile_only"
+                else (
+                    "backend_setup_only"
+                    if args.stop_after_backend_ready
+                    else "backend_setup_and_model_pass_compile_only"
+                )
             ),
             "normal_api_lifecycle_planned_before_lowering": args.platform == "rocm",
+            "stop_after_backend_ready": args.stop_after_backend_ready,
             "compile_dispatch_caveat": (
-                "lowered.compile may execute bounded GPU autotuning/profiling kernels "
-                "and allocate representative buffers; the compiled model-pass callable "
-                "itself is never invoked"
+                None
+                if args.stop_after_backend_ready
+                else (
+                    "lowered.compile may execute bounded GPU autotuning/profiling kernels "
+                    "and allocate representative buffers; the compiled model-pass callable "
+                    "itself is never invoked"
+                )
             ),
             "model_pass_executable_invocations": 0,
         },
@@ -744,7 +804,15 @@ def _execute(
     stage = "hardware_preflight"
     try:
         launch_lock = _acquire_global_lock()
-        hardware = _hardware_preflight()
+        try:
+            from rocm.amdgpu_safety import require_clean_amdgpu_boot
+        except ModuleNotFoundError:
+            from amdgpu_safety import require_clean_amdgpu_boot
+
+        hardware = {
+            **require_clean_amdgpu_boot(),
+            **_hardware_preflight(),
+        }
         stage = "rocm_backend"
         return _run_rocm(args, hardware, output)
     except Exception as error:

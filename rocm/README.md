@@ -108,7 +108,11 @@ The alternative `SKYRL_QWEN35_MEMORY_MODE=preallocate85` is default-off. It
 forces the BFC allocator, fixed preallocation, `XLA_CLIENT_MEM_FRACTION=0.85`,
 and abstract checkpoint construction. The launcher rejects inherited allocator,
 fraction, preallocation, or device-selection settings that conflict with that
-contract. Do not select this mode until the allocation-only gate below passes.
+contract. Allocation and one direct load passed, but a later repeated backend
+setup hit an AMDGPU illegal opcode. Treat this mode as experimentally unstable,
+not production-ready. All guarded Qwen3.5 full-model entrypoints now refuse
+further ROCm work when the current boot journal contains a fatal AMDGPU event;
+reboot before any new guarded diagnostic.
 
 The allocation probe defaults to CPU and is safe to run without an accelerator
 acknowledgement:

@@ -26,12 +26,10 @@ import psutil
 _SENSITIVE_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH", "COOKIE")
 _SENSITIVE_ARGUMENT_FLAGS = ("--header", "--proxy-header", "--user", "--proxy-user", "-u")
 _GIB = 1024**3
-_AMDGPU_FATAL_PATTERN = re.compile(
-    r"(?=.*\bamdgpu\b).*(?:ring\s+\S+\s+timeout|illegal opcode|page fault|vm fault|"
-    r"protection[_. -]?fault|gpu fault|device wedged|gpu reset|ring reset|"
-    r"job[ _]timed[ _]?out|failed to reset)",
-    re.IGNORECASE,
-)
+try:
+    from rocm.amdgpu_safety import AMDGPU_FATAL_PATTERN as _AMDGPU_FATAL_PATTERN
+except ModuleNotFoundError:
+    from amdgpu_safety import AMDGPU_FATAL_PATTERN as _AMDGPU_FATAL_PATTERN
 
 
 def _redact_argument(value: str) -> str:

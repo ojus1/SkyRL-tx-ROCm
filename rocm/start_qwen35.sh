@@ -106,6 +106,11 @@ if ! flock -n "$launch_lock_fd"; then
   exit 2
 fi
 
+if ! python3 -m rocm.amdgpu_safety >/dev/null; then
+  echo "refusing to launch until the fatal AMDGPU boot quarantine is cleared by a reboot" >&2
+  exit 2
+fi
+
 if [[ ! -c /dev/kfd || ! -r /dev/kfd || ! -w /dev/kfd ]]; then
   echo "refusing to launch because /dev/kfd is missing or inaccessible" >&2
   exit 2

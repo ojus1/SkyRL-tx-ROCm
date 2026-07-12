@@ -425,7 +425,20 @@ def main(argv: list[str] | None = None) -> int:
     effective_environment = _configure_environment(args)
     launch_lock = _acquire_global_lock() if args.platform == "rocm" else None
     try:
-        gpu_preflight = _gpu_preflight() if args.platform == "rocm" else None
+        if args.platform == "rocm":
+            try:
+                from rocm.amdgpu_safety import require_clean_amdgpu_boot
+            except ModuleNotFoundError:
+                from amdgpu_safety import require_clean_amdgpu_boot
+
+            try:
+                boot_preflight = require_clean_amdgpu_boot()
+            except RuntimeError as error:
+                print(str(error), file=sys.stderr)
+                return 2
+            gpu_preflight = {**boot_preflight, **_gpu_preflight()}
+        else:
+            gpu_preflight = None
         if args.output is None:
             return _run(args, effective_environment, gpu_preflight, sys.stdout)
 

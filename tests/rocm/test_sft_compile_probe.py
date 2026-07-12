@@ -63,6 +63,7 @@ def test_default_is_cpu_forced_refusal_without_jax_import():
     assert manifest["effective_context"] == 2048
     assert manifest["batch_size"] == 1
     assert manifest["attention_backend"] == "xla"
+    assert manifest["stop_after_backend_ready"] is False
     assert manifest["fixed_preallocation_fraction"] == 0.85
     assert manifest["command_buffers_disabled"] is True
     assert manifest["environment"]["JAX_PLATFORMS"] == "cpu"
@@ -91,6 +92,10 @@ def test_default_is_cpu_forced_refusal_without_jax_import():
         ),
         (("--allow-gpu",), "only valid with --platform rocm"),
         (("--allow-download",), "only valid with --platform rocm"),
+        (
+            ("--stop-after-backend-ready",),
+            "only valid with --platform rocm",
+        ),
         (
             ("--attention-backend", "pallas"),
             "only valid with --platform rocm",
@@ -221,6 +226,25 @@ def test_rocm_pallas_selection_is_fixed_before_jax_import(monkeypatch):
 
     assert os.environ["SKYRL_ROCM_PALLAS_ATTENTION"] == "1"
     assert effective["SKYRL_ROCM_PALLAS_ATTENTION"] == "1"
+
+
+def test_setup_only_mode_does_not_require_an_unused_attention_path(tmp_path):
+    from rocm.probe_sft_compile import _parse_args
+
+    args = _parse_args(
+        [
+            "--platform",
+            "rocm",
+            "--allow-gpu",
+            "--stop-after-backend-ready",
+            "--output",
+            str(tmp_path / "setup.jsonl"),
+        ]
+    )
+
+    assert args.context == 2048
+    assert args.attention_backend == "xla"
+    assert args.stop_after_backend_ready is True
 
 
 def test_rocm_pallas_selection_rejects_inherited_conflict(monkeypatch):
@@ -360,3 +384,17 @@ def test_module_has_no_top_level_jax_import_and_never_calls_compiled_executable(
     assert source.count("compiled = lowered.compile()") == 1
     assert "compiled(" not in source
     assert "model_pass(" not in source
+    assert source.index("if args.stop_after_backend_ready:") < source.index(
+        "model_pass = backend._forward_backward_and_accumulate"
+    )
+    for stage in (
+        "backend_constructor_start",
+        "backend_constructor_barrier_start",
+        "backend_constructor_complete",
+        "create_model_start",
+        "create_model_barrier_start",
+        "create_model_complete",
+        "state_barrier_start",
+        "state_barrier_complete",
+    ):
+        assert f'emit_setup_stage("{stage}")' in source

@@ -240,6 +240,47 @@ compile pass. Artifacts are
 `/tmp/bfc85-compile-t2048-1783864343.{jsonl,telemetry.jsonl}` with the telemetry
 summary alongside them.
 
+A separate context-64 XLA compile-only control subsequently passed. Backend
+setup used 8,691,296,256 B, lowering took 5.945 s, and compilation took
+41.811 s. Compiler accounting reported 196,234,800 B (187.14 MiB) of temporary
+memory; no returned callable or optimizer step was invoked. Physical VRAM
+peaked at 22,642,417,664 B, junction temperature at 71 C, swap did not grow,
+and the process returned cleanly to idle. Artifacts:
+
+- `/tmp/bfc85-compile-t64-1783864767.jsonl`
+- `/tmp/bfc85-compile-t64-1783864767.telemetry.jsonl`
+- `/tmp/bfc85-compile-t64-1783864767.telemetry.jsonl.summary.json`
+
+The following fresh process was configured for context 2,048 with Pallas, but
+it did **not** reach Pallas lowering or compilation. Its private JSONL contains
+only the flushed manifest—no `backend_ready`, `lowered`, or `compiled` record.
+At 19:32:28 local time, during common backend/model/optimizer setup, the kernel
+reported `Illegal opcode in command stream`; ROCm also surfaced
+an invalid-packet diagnostic in the live terminal. That terminal line was not
+persisted in the local artifacts, so the kernel journal event is the durable
+evidence. The profiler immediately terminated the child. Peak physical VRAM
+was 22,610,432,000 B, maximum junction was 60 C,
+and swap did not grow, so this was not a resource-limit trip. The desktop stayed
+up on the iGPU, KFD and VRAM returned to idle, and no ring timeout, VM fault,
+reset, or reboot followed. Artifacts:
+
+- `/tmp/bfc85-compile-t2048-pallas-1783864906.jsonl`
+- `/tmp/bfc85-compile-t2048-pallas-1783864906.telemetry.jsonl`
+- `/tmp/bfc85-compile-t2048-pallas-1783864906.telemetry.jsonl.summary.json`
+
+The exact offending asynchronous setup operation is not instrumented in that
+artifact, and attributing the event to Pallas or context length would be wrong.
+Postmortem inspection also found an earlier illegal-opcode event at 15:11:54 in
+the same boot, predating these fixed-BFC gates; moving the display to the iGPU
+did not clear potentially suspect driver state. This is an important confounder
+and is why the new guard scans the entire current-boot journal.
+The observed failure occurred during repeated fresh-process fixed-arena setup;
+the earlier same-boot event means that path is not established as the original
+cause. Command buffers were disabled but were not sufficient protection. No further GPU work is
+permitted in this boot. The next post-reboot diagnostic must stop after finely
+flushed backend-constructor/model-creation/state-barrier markers; no 2K model
+step or integrated megakernel run is authorized by these results.
+
 ## Fixed-rollout GRPO learner control
 
 Revision `31800cf001c0c982e56231f386182f0cb02c163c` completed one cold

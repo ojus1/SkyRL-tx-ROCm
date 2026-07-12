@@ -29,6 +29,15 @@ first model pass:
 The compiled callable is never invoked, and `optim_step` is never called.
 Every record carries `model_pass_executable_invocations: 0`.
 
+The probe flushes a minimal `setup_stage` record before every potentially
+blocking action. It separately synchronizes constructor state, newly created
+optimizer/adapter state, and the combined final state before marking each phase
+complete. After the July 12 illegal-opcode event, every guarded Qwen3.5
+full-model entrypoint also refuses a current boot whose kernel journal contains
+a fatal AMDGPU event; rebooting is the only way to clear that quarantine.
+`--stop-after-backend-ready` provides the next post-reboot setup-only diagnostic
+and exits before lowering.
+
 ROCm effective (bucketed) context 512 and above must explicitly select
 `--attention-backend pallas`; the code refuses the quadratic XLA fallback.
 The isolated 2,048-token Pallas path passed the hardware safety gate, but its
@@ -73,25 +82,33 @@ The safe default is:
 .venv/bin/python rocm/probe_sft_compile.py
 ```
 
-It emits `manifest` and `refused` records only. The first real compile should
-run in a fresh process under telemetry:
+It emits `manifest` and `refused` records only. After a reboot, the next GPU
+diagnostic is setup-only—not a compile—and must run under telemetry:
 
 ```bash
 .venv/bin/python rocm/profile_rocm.py \
-  --output /tmp/qwen35-sft-compile-t2048.telemetry.jsonl \
-  --interval 0.25 --timeout 1800 --sensor-grace-seconds 60 \
+  --output /tmp/qwen35-backend-setup.telemetry.jsonl \
+  --interval 0.25 --timeout 600 --sensor-grace-seconds 60 \
   --max-junction-temp-c 80 --max-vram-gib 22 \
   --min-host-available-gib 8 --max-swap-gib 0.001 -- \
   .venv/bin/python rocm/probe_sft_compile.py \
-    --platform rocm --allow-gpu --context 2048 \
-    --attention-backend pallas \
-    --output /tmp/qwen35-sft-compile-t2048.jsonl
+    --platform rocm --allow-gpu --context 64 \
+    --attention-backend xla --stop-after-backend-ready \
+    --output /tmp/qwen35-backend-setup.jsonl
 ```
 
-Success produces `manifest`, `backend_ready`, `lowered`, and `compiled`
-records. A guarded failure produces an `error` record and a nonzero exit. The
-memory report is compiler accounting, not physical peak VRAM; interpret it
-alongside the telemetry file.
+Do not return to the full context-2,048 compile until the setup-only sequence
+has passed cleanly after reboot and received a new review. At that later gate,
+effective context 2,048 requires explicit Pallas and still carries the numerical
+qualification above.
+
+Setup-only success produces `manifest`, the flushed `setup_stage` sequence,
+`backend_ready`, and `stopped`; it produces no `lowered` or `compiled` record.
+A later full compile success additionally produces `lowered` and `compiled`.
+A guarded Python failure produces an `error` record and a nonzero exit. A fatal
+driver event can terminate the process before it can emit that final error
+record. Compiler memory reports are accounting, not physical peak VRAM;
+interpret them alongside telemetry.
 
 ## CPU verification
 
