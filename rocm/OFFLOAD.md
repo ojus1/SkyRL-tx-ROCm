@@ -291,3 +291,41 @@ first recover the much higher 64-leaf bandwidth, then pass optimizer-equivalence
 and end-to-end step-time gates. Persistent INT8 optimizer moments may be a
 better capacity trade because they avoid PCIe transfers, but require their own
 accuracy and kernel benchmarks.
+
+## Default-off INT8 moment prototype: rejected for BF16
+
+`skyrl/tx/utils/quantized_optimizer.py` records a CPU semantic experiment; it
+is not exported, selected, JIT-qualified, or wired into the trainer. The tested
+candidate stores first moments as affine INT8 with one FP32 scale and offset
+per 16 values, and nonnegative second moments as square-root-companded UINT8
+with one FP32 scale per 16 values. AdamW arithmetic is performed in FP32 after
+dequantization. This deliberately measures the complete proposed replacement
+against SkyRL's actual `optax.adamw(mu_dtype=None)`, including Optax's native
+BF16 arithmetic, rather than substituting a hand-written reference.
+
+For the exact 34,512,896-element-per-slot rank-8 Qwen LoRA inventory, the two
+byte payloads, FP32 scales, and first-moment offsets total 94,910,464 B
+(90.513672 MiB). That is 43,141,120 B (41.142578 MiB) below the two-slot BF16
+payload, a 1.4545x payload compression ratio. All pinned LoRA shapes are
+divisible by 16, so this inventory has no omitted per-leaf padding. Scalar
+state, Python metadata, allocator overhead, temporary FP32 decode buffers, and
+kernel workspace are excluded; this is capacity arithmetic, not measured VRAM
+or peak-memory saving.
+
+The fixed 100-step CPU semantic gate uses deterministic varying gradients and
+LoRA-like shapes. Against actual Optax, the FP32 case reached 0.687632% worst
+relative update-norm error and passed the 1% threshold. The BF16 case reached
+5.239612% and was explicitly rejected. Its first-step direction cosine was
+0.999996868, but that is only a gross sanity check: the first step starts from
+zero moments and therefore precedes any carried-state quantization. The
+multi-step error is the substantive result. The complete targeted suite passed
+29 tests; the reviewed module and test SHA-256 values were respectively
+`a82988188bf7a6d2744e3c1cc0bb5a6dfe191c637d3c69546c2a47d40b9f46ad`
+and
+`daf572c34f5296f02f2b7f571e19f89ae9576cf8980999d77d3db5f0fa6afd33`.
+
+This encoding must remain unwired. It has no convergence evidence, GPU kernel,
+speed measurement, model-tree integration, checkpoint format, or production
+qualification. A different 8-bit scheme may be explored only as a new
+candidate against the same real Optax BF16 baseline; the present result is
+negative evidence, not an optimizer recommendation.
