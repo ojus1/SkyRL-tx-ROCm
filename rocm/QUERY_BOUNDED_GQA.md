@@ -531,6 +531,49 @@ This promotes only one all-valid, forward-only T=512 candidate with fully IID
 per-feature bounded-grid inputs. It does not promote replay, padding,
 backward, other lengths, latency distributions, or model integration.
 
+## C=256/T=512 last-chunk compile-only gate
+
+Longer sequences require timing one Pallas call at a time: the full public
+forward contains `T/C` static calls, so an aggregate synchronized time cannot
+identify or bound an individual launch once it exceeds the watchdog target.
+`query_bounded_gqa_forward_chunk` is therefore a forward-only experimental
+entry point for one query range against longer K/V. It has no concatenation or
+custom VJP and remains disconnected from model dispatch.
+
+`rocm/probe_query_bounded_gqa_chunk_compile.py` is the first C=256 gate. Its
+default mode imports no JAX and emits only an abstract refusal. The guarded
+path lowers exactly `[1,256,16,256]` BF16 queries at global `query_start=256`
+against `[1,512,4,256]` BF16 K/V, then compiles once and discards the
+executable without returning or invoking it:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-c256-t512-compile.telemetry.jsonl \
+  --card card1 \
+  --interval 0.1 \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 5 \
+  --max-junction-temp-c 70 \
+  --max-gpu-power-watts 315 \
+  --max-vram-gib 2 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_chunk_compile.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-c256-t512-compile.jsonl
+```
+
+StableHLO and optimized HLO must independently contain exactly one custom
+call, with the sole target `__gpu$xla.gpu.triton`, the exact full marker
+`query_bounded_gqa_forward_q256`, no other forward/backward/lookalike marker,
+no outer `while`, and exact query metadata wherever preserved. Compiler memory
+analysis must report exactly 4,196,352 B of arguments and 2,097,152 B of
+output, with at most 64 MiB of temporary storage. Compilation may issue
+bounded GPU profiling work, but every executable/lowered-call counter remains
+zero. This gate promotes nothing until its source, artifact, and telemetry are
+independently audited.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
