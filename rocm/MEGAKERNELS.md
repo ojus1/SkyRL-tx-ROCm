@@ -201,7 +201,7 @@ after validation, with 2,048 tokens as the initial hard maximum:
 | Down projection, `M=2048` | 96.6 GFLOP | 16.1 ms |
 | Concatenated GDN input projection, `M=2048` | 129.5 GFLOP | 21.6 ms |
 | GDN output projection, `M=2048` | 42.9 GFLOP | 7.2 ms |
-| Native-GQA query chunk, `Cq=128`, `T=32K` | 68.7 GFLOP | 11.5 ms |
+| Native-GQA query chunk, `Cq=512`, `T=32K` | 274.9 GFLOP | 45.8 ms |
 | Tied-head token chunk, `M=128` | 162.7 GFLOP | 27.1 ms |
 | GDN 1,024-token superblock | about 5-6 GFLOP | below 1 ms compute |
 
@@ -350,10 +350,14 @@ for q_start in range(0, T, Cq):
         Q[q_start:q_start+Cq], K, V, key_mask, q_start)
 ```
 
-Start with `Cq=128`. Forward, dQ, and dKV are separate bounded dispatches.
-Keep online-softmax statistics and dK/dV accumulation in FP32. Map query head
-`hq` to KV head `hq // 4`. Accumulate dK/dV through aliased FP32 buffers in a
-fixed query-chunk order; do not use atomics.
+The reviewed prototype starts with `Cq=512`, giving 64 query ranges at 32K,
+but this is only a compile/resource hypothesis. Forward, dQ, and dKV are
+separate bounded dispatches. Reduce `Cq` from 512 to 256 and then 128 if any
+dispatch approaches 100 ms, spills, or exceeds gfx1100 resources; abandon this
+Pallas route if 128 still fails. Keep online-softmax statistics and dK/dV
+accumulation in FP32. Map query head `hq` to KV head `hq // 4`. Accumulate
+dK/dV through aliased FP32 buffers in a fixed query-chunk order; do not use
+atomics.
 
 ### 4. Attention gate, O projection, and first residual
 
