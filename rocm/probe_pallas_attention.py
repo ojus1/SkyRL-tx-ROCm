@@ -52,6 +52,58 @@ def _error_metrics(jnp, actual, expected) -> dict[str, float]:
     }
 
 
+def _chunked_reference_attention(jax, jnp, q, k, v, mask, scale, *, query_block_size=16):
+    """Evaluate causal GQA without materializing the full attention matrix.
+
+    JAX's generic GQA lowering can fuse an entire query tile and request more
+    shared memory than gfx1100 provides, even for a 512-token correctness
+    check. Mapping fixed-size query blocks keeps both the reference forward and
+    its automatically differentiated backward independently bounded.
+    """
+    batch_size, sequence_length, query_heads, head_dim = q.shape
+    if sequence_length % query_block_size:
+        raise ValueError("sequence length must be divisible by the reference query block size")
+
+    repeats = query_heads // k.shape[2]
+    k_repeated = jnp.repeat(k, repeats, axis=2).astype(jnp.float32)
+    v_repeated = jnp.repeat(v, repeats, axis=2).astype(jnp.float32)
+    query_blocks = q.reshape(
+        batch_size,
+        sequence_length // query_block_size,
+        query_block_size,
+        query_heads,
+        head_dim,
+    ).transpose(1, 0, 2, 3, 4)
+    query_positions = jnp.arange(sequence_length, dtype=jnp.int32).reshape(
+        sequence_length // query_block_size, query_block_size
+    )
+    key_positions = jnp.arange(sequence_length, dtype=jnp.int32)
+    valid_keys = mask.astype(bool)[:, None, None, :]
+
+    def attend_query_block(items):
+        q_block, q_positions = items
+        logits = jnp.einsum(
+            "bqhd,bkhd->bhqk",
+            q_block.astype(jnp.float32),
+            k_repeated,
+            preferred_element_type=jnp.float32,
+        )
+        logits *= scale
+        causal = key_positions[None, None, None, :] <= q_positions[None, None, :, None]
+        logits = jnp.where(valid_keys & causal, logits, jnp.finfo(jnp.float32).min)
+        probabilities = jax.nn.softmax(logits, axis=-1)
+        output = jnp.einsum(
+            "bhqk,bkhd->bqhd",
+            probabilities,
+            v_repeated,
+            preferred_element_type=jnp.float32,
+        )
+        return output.astype(q.dtype)
+
+    output_blocks = jax.lax.map(attend_query_block, (query_blocks, query_positions))
+    return output_blocks.transpose(1, 0, 2, 3, 4).reshape(q.shape)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-length", type=int, required=True)
@@ -85,8 +137,7 @@ def main() -> None:
     if args.warmups < 1 or args.repeats < 1:
         parser.error("--warmups and --repeats must be positive")
     score_bytes = args.batch_size * args.query_heads * args.sequence_length**2 * 4
-    if args.reference and score_bytes > 2 * 1024**3:
-        parser.error("generic reference score matrix would exceed 2 GiB; omit --reference")
+    reference_block_score_bytes = args.batch_size * args.query_heads * 16 * args.sequence_length * 4
 
     # The selector reads this at JIT trace time. Set it before importing SkyRL.
     os.environ["SKYRL_ROCM_PALLAS_ATTENTION"] = "1"
@@ -139,7 +190,8 @@ def main() -> None:
         "config": {
             **vars(args),
             "valid_length": valid_length,
-            "score_bytes_if_generic": score_bytes,
+            "logical_score_bytes_if_unchunked": score_bytes,
+            "reference_block_score_bytes": reference_block_score_bytes,
         },
         "forward": {
             "compile_and_first_seconds": forward_compile_seconds,
@@ -167,13 +219,14 @@ def main() -> None:
     if args.reference:
         @jax.jit
         def generic_forward(q_arg, k_arg, v_arg):
-            return jax.nn.dot_product_attention(
+            return _chunked_reference_attention(
+                jax,
+                jnp,
                 q_arg,
                 k_arg,
                 v_arg,
-                scale=scale,
-                mask=mask[:, None, None, :].astype(bool),
-                is_causal=True,
+                mask,
+                scale,
             )
 
         try:

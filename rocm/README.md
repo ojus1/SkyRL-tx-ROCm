@@ -103,6 +103,7 @@ TINKER_API_KEY=tml-dummy .venv/bin/python rocm/profile_rocm.py \
   --output /tmp/qwen35-profile.jsonl \
   --include-pid "server=$server_pid" \
   --terminate-included-on-safety \
+  --sensor-grace-seconds 60 \
   --max-junction-temp-c 90 \
   --max-vram-gib 23 \
   --min-host-available-gib 4 \
@@ -111,6 +112,12 @@ TINKER_API_KEY=tml-dummy .venv/bin/python rocm/profile_rocm.py \
        --context 64 --warmup-steps 1 --measured-steps 5 \
        --run-id profiled-t64 --output /tmp/profiled-t64.sft.jsonl
 ```
+
+The explicit 60-second sensor grace is needed after the headless AMD GPU has
+runtime-suspended: its hwmon files can remain temporarily unreadable while the
+first ROCm context starts. Safety limits still apply as soon as the sensors
+become readable. See [`RESULTS.md`](RESULTS.md) for the exact validated runs
+and the context buckets that remain untested.
 
 The exact optimizer replay probe defaults to CPU. GPU use requires two
 explicit acknowledgements and should only be run in a fresh process with the
