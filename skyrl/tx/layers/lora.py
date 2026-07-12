@@ -77,6 +77,37 @@ class LoRAMixin:
         assert x_sorted.shape[1] == lora_weight.shape[1]
         return jax.lax.ragged_dot(x_sorted, lora_weight, group_sizes)
 
+    def _apply_single_lora_weight(self, lora_weight: jax.Array, x_flat: jax.Array) -> jax.Array:
+        """Apply one already-selected LoRA A matrix without adapter routing."""
+        assert lora_weight.ndim == 2
+        assert x_flat.ndim == 2  # (tokens, in_features)
+        assert x_flat.shape[1] == lora_weight.shape[0]
+        return x_flat @ lora_weight
+
+    def _apply_single_adapter_lora(
+        self,
+        x_flat: jax.Array,
+        base_output: jax.Array,
+        adapter_index: jax.Array,
+    ) -> jax.Array:
+        """Apply LoRA when every token uses one adapter.
+
+        Selecting the adapter once turns both low-rank operations into ordinary
+        matrix multiplications. In particular, this avoids sorting every token
+        twice and gathering it into and out of the ragged-dot layout, which is
+        unnecessary for the common batch-size-one training and sampling path.
+        """
+        assert self.lora_A is not None and self.lora_B is not None and self.lora_scaling is not None
+
+        lora_A = jax.lax.dynamic_index_in_dim(self.lora_A[...], adapter_index, axis=0, keepdims=False)
+        lora_B = jax.lax.dynamic_index_in_dim(self.lora_B[...], adapter_index, axis=0, keepdims=False)
+        intermediate = self._apply_single_lora_weight(lora_A, x_flat)
+        lora_output = intermediate @ lora_B
+        scaling = jax.lax.dynamic_index_in_dim(
+            self.lora_scaling[...], adapter_index, axis=0, keepdims=False
+        )
+        return base_output + lora_output.reshape(base_output.shape) * scaling
+
     def apply_lora(
         self,
         x: jax.Array,
@@ -94,6 +125,13 @@ class LoRAMixin:
         # Flatten x: (tokens, features) for linear, (tokens,) for embed, in the latter case feature_shape is ()
         feature_shape = x.shape[base_output.ndim - 1 :]
         x_flat = x.reshape(-1, *feature_shape)
+
+        # A batch of one necessarily routes every token to the same adapter.
+        # Keep the generic sorted ragged-dot path below for true multi-adapter
+        # batches, where different examples may select different adapters.
+        if adapter_indices.shape[0] == 1:
+            return self._apply_single_adapter_lora(x_flat, base_output, adapter_indices[0])
+
         adapter_indices_expanded = jnp.repeat(adapter_indices, x_flat.shape[0] // adapter_indices.shape[0])
 
         # Sort tokens to prepare for ragged_dot
@@ -161,6 +199,11 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
         assert lora_weight.ndim == 3
         assert x_sorted.ndim == 1  # (tokens,) integer indices
         return lora_weight[adapter_indices_sorted, x_sorted, :]
+
+    def _apply_single_lora_weight(self, lora_weight: jax.Array, x_flat: jax.Array) -> jax.Array:
+        assert lora_weight.ndim == 2
+        assert x_flat.ndim == 1  # (tokens,) integer indices
+        return lora_weight[x_flat, :]
 
     def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
         base_out = super().__call__(x)
