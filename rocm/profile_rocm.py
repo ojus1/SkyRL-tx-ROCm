@@ -409,6 +409,40 @@ def _safety_violation(
     return None
 
 
+def _unobserved_required_sensor_violation(
+    samples: list[Mapping[str, Any]],
+    limits: Mapping[str, float | None],
+) -> dict[str, Any] | None:
+    """Fail a successful run that never observed a configured GPU sensor.
+
+    ``sensor_grace_seconds`` prevents a runtime-suspended card from causing an
+    immediate stop while it wakes. A short command can finish inside that
+    grace window, though, so completion must not silently promote a run whose
+    temperature or power guard was never measurable. Only measured samples
+    count: a baseline reading does not prove that the sensor remained readable
+    while the wrapped workload ran.
+    """
+    required_sensors = (
+        ("gpu_junction_temp_c", "max_junction_temp_c", "maximum"),
+        ("gpu_power_watts", "max_gpu_power_watts", "maximum"),
+    )
+    measured = [sample for sample in samples if sample.get("phase") == "measured"]
+    for metric, limit_name, limit_kind in required_sensors:
+        limit = limits.get(limit_name)
+        if limit is None:
+            continue
+        if any(sample.get(metric) is not None for sample in measured):
+            continue
+        return {
+            "metric": metric,
+            "value": None,
+            "limit": float(limit),
+            "limit_kind": limit_kind,
+            "unavailable": True,
+        }
+    return None
+
+
 def _nearest_rank_p95(values: list[float]) -> float:
     ordered = sorted(values)
     return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
@@ -989,6 +1023,13 @@ def main() -> int:
             # already-recorded resource-limit violation.
             if kernel_driver_errors and status not in {"safety_limit", "error"}:
                 status = "driver_error"
+            if status in {"completed", "targets_exited"}:
+                unobserved_sensor = _unobserved_required_sensor_violation(
+                    samples, safety_limits
+                )
+                if unobserved_sensor is not None:
+                    safety_violation = unobserved_sensor
+                    status = "safety_limit"
             if (
                 status in {"safety_limit", "driver_error"}
                 and args.terminate_included_on_safety

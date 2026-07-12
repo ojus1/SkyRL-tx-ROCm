@@ -267,7 +267,10 @@ TINKER_API_KEY=tml-dummy .venv/bin/python rocm/profile_rocm.py \
 The explicit 60-second sensor grace is needed after the headless AMD GPU has
 runtime-suspended: its hwmon files can remain temporarily unreadable while the
 first ROCm context starts. Safety limits still apply as soon as the sensors
-become readable. See [`RESULTS.md`](RESULTS.md) for the exact validated runs
+become readable. A successful wrapped command or attach-only measurement is
+also rejected if any configured junction-temperature or power sensor produced
+no measured value at all, so a short run cannot silently finish entirely inside
+the grace window. See [`RESULTS.md`](RESULTS.md) for the exact validated runs
 and the context buckets that remain untested.
 
 Large-context runs may use the full practical VRAM budget and explicit
