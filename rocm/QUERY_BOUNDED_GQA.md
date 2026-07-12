@@ -1,9 +1,8 @@
 # Query-bounded native GQA prototype
 
-Status: CPU/Pallas-interpret correctness plus exact T=512 guarded ROCm
-compile-only structural prototype. Compilation has run, but the returned
-attention executable has never been invoked and the prototype is not connected
-to the model dispatcher.
+Status: CPU/Pallas-interpret correctness plus exact T=512 guarded ROCm compile
+and one single-forward runtime promotion. Only the deterministic analytic input
+below has executed; the prototype is not connected to the model dispatcher.
 
 The prototype in `skyrl/tx/kernels/query_bounded_gqa.py` is the next safe
 attention architecture for Qwen3.5-4B's `B=1, Hq=16, Hkv=4, D=256` training
@@ -245,14 +244,14 @@ is no error record. The guarded journal postflight passed. A separate
 point-in-time postcheck found `/dev/kfd` and the AMD render node unowned and
 the card back in runtime suspend.
 
-This promotes only the exact T=512 structure through compile. It does not
-promote execution, numerical correctness, padding, repeated launches, or any
-larger bucket. The prototype remains disconnected from model attention.
+That result promoted only the exact T=512 structure through compile. It did
+not by itself promote execution, numerical correctness, padding, repeated
+launches, or any larger bucket; the separate first runtime gate follows below.
 
-## Pending exact T=512 single-forward runtime gate
+## Exact T=512 single-forward runtime gate
 
-`rocm/probe_query_bounded_gqa_runtime.py` implements the next gate but has not
-been run. Its default path imports no JAX and emits only an abstract refusal:
+`rocm/probe_query_bounded_gqa_runtime.py` implements the first execution gate.
+Its default path imports no JAX and emits only an abstract refusal:
 
 ```bash
 .venv/bin/python rocm/probe_query_bounded_gqa_runtime.py \
@@ -304,6 +303,46 @@ There is no GPU reference, random input, replay, backward, padding case, or
 model-dispatcher connection in this first runtime gate. Any compile, memory,
 journal, duration, transfer, or numerical failure is fatal. Replay and the
 broader input matrix remain separate later probes.
+
+### ROCm 7.2.4 runtime result
+
+The gate passed on clean commit `f421039b` and boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. Fresh lowering took 0.264439 s and
+compilation took 2.035000 s. StableHLO and optimized HLO each contained one
+custom call total, exactly targeted `__gpu$xla.gpu.triton`, with the exact
+forward marker and no dQ, dK/dV, or outer `while`. Their SHA-256 digests were
+`cee355417f5e3220893f3f4ddd85299cfdb055e46e9fe3d6b4e8de4ce9fb3b62` and
+`6ee442dffa82364b6f2feb453eb6030877012e328d3718df19b9eeef12d5c0d1`.
+
+Compiler memory analysis reported 6,293,504 B of arguments, 4,194,304 B of
+output, and 33,024 B of temporary storage (10,520,832 B combined), passing the
+mandatory release gate. The one checked invocation completed in 0.006422197 s.
+Its output was finite; against the host analytic result, relative L2 was
+0.001571651, cosine was 0.999958456, mean absolute error was 0.000613824, and
+maximum absolute error was 0.001953125. The flushed invocation record showed
+one attempt and zero completions before dispatch; the final counters were
+exactly one attempt and one completion, with zero replay, backward, GPU
+reference, device error-reduction, or lowered-callable invocations.
+
+The telemetry wrapper completed in 19.649497 s with return code zero. Physical
+VRAM peaked at 765,751,296 B and swap remained at zero. Among the 141 readable
+sensor samples, observed junction temperature and power reached 50 C and
+130 W. Temperature and power were unavailable for the first 34 of 175 measured
+samples (3.42 s of the measured window), so those values are observed maxima,
+not guaranteed full-run peaks. The backend-initialization, compile,
+input-transfer, candidate-dispatch, device-get, and final guarded journal
+checks were all clean. A separate, unarchived point-in-time operator postcheck
+found `/dev/kfd` and the AMD render node unowned and the card back in runtime
+suspend; the telemetry artifacts themselves prove process exit, not GPU
+cooldown. All artifacts are mode `0600`:
+
+- `/tmp/query-bounded-gqa-t512-runtime-boot54ccf56c-run1.jsonl`
+- `/tmp/query-bounded-gqa-t512-runtime-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/query-bounded-gqa-t512-runtime-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+This promotes only one all-valid analytic forward at T=512. It does not
+promote replay, nonzero Q/K, random inputs, padding, a GPU reference, backward,
+larger buckets, or model integration.
 
 ## GPU promotion gates
 
