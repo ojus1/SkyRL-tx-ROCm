@@ -481,6 +481,56 @@ duration must be below 100 ms; output must be finite with relative L2 below
 unpromoted until the private child artifact and profiler telemetry receive an
 independent audit.
 
+### ROCm 7.2.4 fully-IID result
+
+The gate passed from clean commit `fef0a442` on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. The manifest's probe, delegated
+replay/runtime probe, and profiler SHA-256 values all match the committed
+sources. Lowering took 0.282275 s and compilation took 1.992297 s. StableHLO
+and optimized HLO each contained exactly one custom call targeted only at
+`__gpu$xla.gpu.triton`, one forward marker, no dQ/dK-dV marker, and no outer
+`while`. Their SHA-256 values were
+`cee355417f5e3220893f3f4ddd85299cfdb055e46e9fe3d6b4e8de4ce9fb3b62`
+and `1e22fcc17ce391dd39a6c8016c4852d49c9da783c13ab25605f770f5f536e112`.
+
+Compiler analysis reported 6,293,504 B of arguments, 4,194,304 B of output,
+and 33,024 B of temporary storage (10,520,832 B combined). The only candidate
+invocation took 14.230550 ms. Its BF16 output SHA-256 was
+`e3454e82a4c4d3b3775b9045fdb3535c81a234a47fd8958847fc3f67a85ef048`.
+Against the complete independent FP32 host oracle, relative L2 was
+0.001852000, cosine was 0.999966025, mean absolute error was 0.000029012, and
+maximum absolute error was 0.001300991. Final counters were exactly one
+forward attempt/completion and zero lowered-callable invocations. The input
+construction used the same signed-magnitude distribution independently for
+every Q, K, and V feature; no accelerator RNG or reference was used.
+
+The profiler completed in 30.002400 s with return code zero. It recorded 20
+baseline, one preflight, and 279 measured samples. Observed physical VRAM
+peaked at 765,743,104 B, junction temperature at 48 C, and power at 129 W;
+swap remained zero and host-available memory stayed at or above
+62,372,548,608 B. Temperature and power first became jointly readable 4.018 s
+after measured sampling began, within the 5 s grace period and well before the
+candidate; neither sensor was missing afterwards. The longest measured sample
+gap was 141.925 ms, so these are observed run maxima and the 14 ms dispatch was
+not continuously sampled.
+
+All seven child journal checkpoints, child preflight/postflight, profiler
+driver checks, and a separate operator postcheck were clean; `/dev/kfd` and
+the AMD render node were unowned and the card returned to runtime suspend.
+All artifacts are mode `0600`:
+
+- `/tmp/query-bounded-gqa-t512-iid-boot54ccf56c-run1.jsonl`
+- `/tmp/query-bounded-gqa-t512-iid-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/query-bounded-gqa-t512-iid-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`682ad68ff4542dc44827621c6667039253b2330ac56ac58b4b48a67c4ea52ce0`,
+`768ff3035a0b1ff0dbcdb6540b72d8af024e7c1c068915cc807dd9cb9f384b66`,
+and `73e0e0941b8c037ba57166437d077a75122d53eb21f858ed12347b36a352205a`.
+This promotes only one all-valid, forward-only T=512 candidate with fully IID
+per-feature bounded-grid inputs. It does not promote replay, padding,
+backward, other lengths, latency distributions, or model integration.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
