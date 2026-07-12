@@ -113,6 +113,40 @@ def round_up_seq_len(seq_len: int) -> int:
     return rounded
 
 
+def resolve_sft_step_protocol(
+    *,
+    one_update_gate: bool,
+    warmup_steps: int | None,
+    measured_steps: int | None,
+) -> tuple[int, int]:
+    """Resolve the steady-state benchmark or the exact one-update safety gate.
+
+    The gate deliberately rejects user-supplied step counts instead of silently
+    overriding them.  This makes ``--one-update-gate`` an auditable guarantee:
+    exactly one cold forward/backward/optimizer update is attempted, and no
+    steady-state throughput claim is produced from it.
+    """
+
+    if one_update_gate:
+        if warmup_steps is not None or measured_steps is not None:
+            raise ValueError(
+                "--one-update-gate cannot be combined with --warmup-steps or "
+                "--measured-steps"
+            )
+        return 0, 1
+
+    resolved_warmup = 2 if warmup_steps is None else warmup_steps
+    resolved_measured = 5 if measured_steps is None else measured_steps
+    if resolved_warmup < 1:
+        raise ValueError(
+            "--warmup-steps must be at least 1 so cold JIT is never measured "
+            "as steady state"
+        )
+    if resolved_measured < 5:
+        raise ValueError("--measured-steps must be at least 5")
+    return resolved_warmup, resolved_measured
+
+
 def _run_text(*args: str, cwd: Path | None = None) -> str | None:
     try:
         return subprocess.check_output(

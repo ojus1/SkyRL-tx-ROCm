@@ -4,7 +4,9 @@ This intentionally bypasses Cookbook's lifecycle/checkpoint loop while keeping
 the same Tinker ``forward_backward`` + Adam ``optim_step`` operations. Timings
 include the local HTTP/database/future path, so this is an end-to-end training
 step benchmark rather than a pure kernel benchmark. It is not a rendered-chat
-quality benchmark.
+quality benchmark. ``--one-update-gate`` is a separate safety protocol: it
+attempts exactly one cold update, unloads immediately, and emits no steady-state
+throughput summary.
 """
 
 from __future__ import annotations
@@ -35,12 +37,32 @@ from tinker_cookbook.supervised.common import (
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
+ROCM_DIR = Path(__file__).resolve().parent
+if str(ROCM_DIR) not in sys.path:
+    sys.path.insert(0, str(ROCM_DIR))
+
+from bench_support import resolve_sft_step_protocol  # noqa: E402
+
 MODEL = "Qwen/Qwen3.5-4B"
 SCHEMA_VERSION = 1
 REPO = Path(__file__).resolve().parents[1]
 WORKSPACE = REPO.parent
-_SENSITIVE_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH", "COOKIE")
-_SENSITIVE_ARGUMENT_FLAGS = ("--header", "--proxy-header", "--user", "--proxy-user", "-u")
+_SENSITIVE_WORDS = (
+    "TOKEN",
+    "KEY",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "AUTH",
+    "COOKIE",
+)
+_SENSITIVE_ARGUMENT_FLAGS = (
+    "--header",
+    "--proxy-header",
+    "--user",
+    "--proxy-user",
+    "-u",
+)
 
 
 def _utc_now() -> str:
@@ -108,7 +130,9 @@ def _redacted_argv(values: list[str]) -> list[str]:
             result.append(value)
         if value == "-H":
             redact_next = True
-        elif value.startswith("-") and any(word in value.upper() for word in _SENSITIVE_WORDS):
+        elif value.startswith("-") and any(
+            word in value.upper() for word in _SENSITIVE_WORDS
+        ):
             redact_next = "=" not in value
     return result
 
@@ -127,7 +151,9 @@ def _round_up_seq_len(seq_len: int) -> int:
 
 def _run_text(*args: str, cwd: Path | None = None) -> str | None:
     try:
-        return subprocess.check_output(args, cwd=cwd, text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(
+            args, cwd=cwd, text=True, stderr=subprocess.DEVNULL
+        ).strip()
     except (OSError, subprocess.CalledProcessError):
         return None
 
@@ -153,7 +179,9 @@ def _package_version(name: str) -> str | None:
 
 
 def _model_revision(model: str) -> str | None:
-    default_hf_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
+    default_hf_home = (
+        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
+    )
     hf_home = Path(os.environ.get("HF_HOME", default_hf_home))
     hub_cache = Path(os.environ.get("HF_HUB_CACHE", hf_home / "hub"))
     reference = hub_cache / f"models--{model.replace('/', '--')}" / "refs/main"
@@ -164,11 +192,13 @@ def _model_revision(model: str) -> str | None:
 
 
 def _safe_accelerator_environment() -> dict[str, str]:
-    prefixes = ("JAX_", "XLA_", "HSA_", "HIP_", "ROCM_", "AMD_")
+    prefixes = ("JAX_", "XLA_", "HSA_", "HIP_", "ROCM_", "ROCR_", "PJRT_", "AMD_")
+    exact_names = {"GPU_DEVICE_ORDINAL"}
     return {
         key: value
         for key, value in sorted(os.environ.items())
-        if key.startswith(prefixes) and not any(word in key.upper() for word in _SENSITIVE_WORDS)
+        if (key.startswith(prefixes) or key in exact_names)
+        and not any(word in key.upper() for word in _SENSITIVE_WORDS)
     }
 
 
@@ -209,7 +239,9 @@ def _build_datum(context: int) -> tinker.Datum:
     return datum
 
 
-def _summary(durations: list[float], context: int, padded_context: int) -> dict[str, float | int]:
+def _summary(
+    durations: list[float], context: int, padded_context: int
+) -> dict[str, float | int]:
     ordered = sorted(durations)
     median = statistics.median(ordered)
     mad = statistics.median(abs(value - median) for value in ordered)
@@ -252,12 +284,26 @@ async def _unload_adapter(service_client: tinker.ServiceClient, training_client)
 
 
 async def _run(args: argparse.Namespace, output) -> None:
+    total_steps = args.warmup_steps + args.measured_steps
+    if args.one_update_gate and (args.warmup_steps, args.measured_steps) != (0, 1):
+        raise RuntimeError(
+            "one-update gate requires the canonical (warmup_steps, measured_steps) "
+            f"tuple (0, 1), got {(args.warmup_steps, args.measured_steps)!r}"
+        )
+
+    adam = tinker.AdamParams(
+        learning_rate=args.learning_rate,
+        beta1=args.adam_beta1,
+        beta2=args.adam_beta2,
+        eps=args.adam_eps,
+    )
     datum = _build_datum(args.context)
     padded_context = _round_up_seq_len(args.context)
     manifest = {
         "record_type": "manifest",
         "schema_version": SCHEMA_VERSION,
         "suite": "synthetic_nll",
+        "protocol": "one_update_gate" if args.one_update_gate else "steady_state",
         "warning": "End-to-end local Tinker step benchmark; not rendered-chat SFT quality evidence.",
         "run_id": args.run_id,
         "wall_time": _utc_now(),
@@ -270,7 +316,8 @@ async def _run(args: argparse.Namespace, output) -> None:
         "effective_padded_context": padded_context,
         "batch_size": 1,
         "warmup_steps": args.warmup_steps,
-        "measured_steps": args.measured_steps,
+        "measured_steps": 0 if args.one_update_gate else args.measured_steps,
+        "updates_requested": total_steps,
         "inter_step_delay_seconds": args.inter_step_delay_seconds,
         "lora_rank": args.lora_rank,
         "seed": args.seed,
@@ -287,7 +334,9 @@ async def _run(args: argparse.Namespace, output) -> None:
             "tinker": _package_version("tinker"),
             "tinker_cookbook": _package_version("tinker-cookbook"),
             "torch": _package_version("torch"),
-            "benchmark_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "benchmark_script_sha256": hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
         },
         "environment": _safe_accelerator_environment(),
         "repositories": {
@@ -300,7 +349,10 @@ async def _run(args: argparse.Namespace, output) -> None:
 
     service_client = tinker.ServiceClient(
         base_url=args.base_url,
-        user_metadata={"recipe_name": "qwen35_rocm_synthetic_nll_benchmark", "run_id": args.run_id},
+        user_metadata={
+            "recipe_name": "qwen35_rocm_synthetic_nll_benchmark",
+            "run_id": args.run_id,
+        },
     )
     training_client = await service_client.create_lora_training_client_async(
         base_model=MODEL,
@@ -308,20 +360,15 @@ async def _run(args: argparse.Namespace, output) -> None:
         seed=args.seed,
         user_metadata={"suite": "synthetic_nll", "run_id": args.run_id},
     )
-    adam = tinker.AdamParams(
-        learning_rate=args.learning_rate,
-        beta1=args.adam_beta1,
-        beta2=args.adam_beta2,
-        eps=args.adam_eps,
-    )
 
     durations: list[float] = []
-    total_steps = args.warmup_steps + args.measured_steps
     primary_error: BaseException | None = None
     cleanup_error: BaseException | None = None
     try:
         for step in range(total_steps):
-            if step == 0:
+            if args.one_update_gate:
+                phase = "one_update_gate"
+            elif step == 0:
                 phase = "cold_compile"
             elif step < args.warmup_steps:
                 phase = "warmup"
@@ -330,7 +377,9 @@ async def _run(args: argparse.Namespace, output) -> None:
 
             wall_start_ns = time.time_ns()
             monotonic_start_ns = time.perf_counter_ns()
-            fwd_bwd_future = await training_client.forward_backward_async([datum], loss_fn="cross_entropy")
+            fwd_bwd_future = await training_client.forward_backward_async(
+                [datum], loss_fn="cross_entropy"
+            )
             optim_future = await training_client.optim_step_async(adam)
             enqueue_end_ns = time.perf_counter_ns()
             fwd_bwd_result = await fwd_bwd_future.result_async()
@@ -343,14 +392,20 @@ async def _run(args: argparse.Namespace, output) -> None:
             logprobs = [item["logprobs"] for item in fwd_bwd_result.loss_fn_outputs]
             mean_nll = compute_mean_nll(logprobs, [datum.loss_fn_inputs["weights"]])
             numeric_values = (duration, enqueue_seconds, mean_nll)
-            if not all(math.isfinite(value) for value in numeric_values) or duration <= 0:
-                raise FloatingPointError(f"non-finite or non-positive step metrics: {numeric_values}")
+            if (
+                not all(math.isfinite(value) for value in numeric_values)
+                or duration <= 0
+            ):
+                raise FloatingPointError(
+                    f"non-finite or non-positive step metrics: {numeric_values}"
+                )
             record = {
                 "record_type": "step",
                 "run_id": args.run_id,
                 "step": step,
                 "phase": phase,
                 "cold_jit": step == 0,
+                "one_update_gate": args.one_update_gate,
                 "requested_context": args.context,
                 "effective_padded_context": padded_context,
                 "batch_size": 1,
@@ -391,6 +446,18 @@ async def _run(args: argparse.Namespace, output) -> None:
         output.flush()
     except BaseException as caught:
         cleanup_error = caught
+        cleanup_record = {
+            "record_type": "cleanup",
+            "run_id": args.run_id,
+            "wall_start_ns": cleanup_start_ns,
+            "wall_end_ns": time.time_ns(),
+            "model_id": str(training_client._guaranteed_model_id()),
+            "adapter_unloaded": False,
+            "error_type": type(caught).__name__,
+            "error": str(caught),
+        }
+        output.write(_json_dumps(cleanup_record, separators=(",", ":")) + "\n")
+        output.flush()
 
     if primary_error is not None:
         if cleanup_error is not None:
@@ -399,14 +466,33 @@ async def _run(args: argparse.Namespace, output) -> None:
     if cleanup_error is not None:
         raise cleanup_error
 
-    final = {
+    final: dict[str, Any] = {
         "record_type": "summary",
         "run_id": args.run_id,
         "wall_time": _utc_now(),
         "requested_context": args.context,
         "effective_padded_context": padded_context,
-        **_summary(durations, args.context, padded_context),
     }
+    if args.one_update_gate:
+        if durations:
+            raise RuntimeError(
+                "one-update gate unexpectedly collected steady-state durations"
+            )
+        final.update(
+            {
+                "protocol": "one_update_gate",
+                "updates_completed": 1,
+                "cold_step_only": True,
+                "steady_state_throughput_available": False,
+            }
+        )
+    else:
+        final.update(
+            {
+                "protocol": "steady_state",
+                **_summary(durations, args.context, padded_context),
+            }
+        )
     output.write(_json_dumps(final, separators=(",", ":")) + "\n")
     output.flush()
     print(_json_dumps(final, indent=2, sort_keys=True))
@@ -416,8 +502,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8001")
     parser.add_argument("--context", type=int, required=True)
-    parser.add_argument("--warmup-steps", type=int, default=2)
-    parser.add_argument("--measured-steps", type=int, default=5)
+    parser.add_argument("--warmup-steps", type=int)
+    parser.add_argument("--measured-steps", type=int)
+    parser.add_argument(
+        "--one-update-gate",
+        action="store_true",
+        help=(
+            "attempt exactly one cold forward/backward/Adam update and unload; "
+            "cannot be combined with explicit step counts"
+        ),
+    )
     parser.add_argument("--inter-step-delay-seconds", type=float, default=0.0)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -433,17 +527,29 @@ def main() -> None:
         parser.error(
             "--context must be in [2, 16384] until watchdog-bounded 32K attention is implemented"
         )
-    if args.warmup_steps < 1:
-        parser.error("--warmup-steps must be at least 1 so cold JIT is never measured as steady state")
-    if args.measured_steps < 5:
-        parser.error("--measured-steps must be at least 5")
+    try:
+        args.warmup_steps, args.measured_steps = resolve_sft_step_protocol(
+            one_update_gate=args.one_update_gate,
+            warmup_steps=args.warmup_steps,
+            measured_steps=args.measured_steps,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.one_update_gate and args.inter_step_delay_seconds != 0:
+        parser.error("--inter-step-delay-seconds is meaningless with --one-update-gate")
     if (
         not math.isfinite(args.inter_step_delay_seconds)
         or not 0 <= args.inter_step_delay_seconds <= 60
     ):
         parser.error("--inter-step-delay-seconds must be finite and in [0, 60]")
-    if args.lora_rank <= 0 or not math.isfinite(args.learning_rate) or args.learning_rate < 0:
-        parser.error("--lora-rank must be positive and --learning-rate must be nonnegative")
+    if (
+        args.lora_rank <= 0
+        or not math.isfinite(args.learning_rate)
+        or args.learning_rate < 0
+    ):
+        parser.error(
+            "--lora-rank must be positive and --learning-rate must be nonnegative"
+        )
     if (
         not math.isfinite(args.adam_beta1)
         or not math.isfinite(args.adam_beta2)

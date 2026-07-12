@@ -1,7 +1,7 @@
 # SkyRL Tinker on ROCm
 
 This directory contains the reproducible local setup and smoke benchmark used
-for an AMD Radeon RX 7900 XTX (`gfx1100`) with ROCm 7.2 and Python 3.12.
+for an AMD Radeon RX 7900 XTX (`gfx1100`) with ROCm 7.2.4 and Python 3.12.
 
 ## Environments
 
@@ -79,6 +79,14 @@ an exact 402-leaf Qwen3.5 LoRA Adam probe passed repeated GPU updates with
 command buffers disabled, while the earlier full-model failure occurred on
 the second replay of the same optimizer executable.
 
+The ROCm 7.2.4 post-reboot floor was re-established before any full-model
+probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for
+`[1.25] + 2`, and a separate BF16 `16x16` all-ones matrix multiply plus
+`value_and_grad(sum)` returned exact FP32 loss `4096.0` and gradient extrema
+`16.0/16.0`. These shell checks have no saved artifacts and their process wall
+times include startup, so they are correctness/safety evidence rather than
+kernel benchmarks.
+
 Run the synthetic end-to-end SFT control from the separate Cookbook
 environment:
 
@@ -109,10 +117,11 @@ forces the BFC allocator, fixed preallocation, `XLA_CLIENT_MEM_FRACTION=0.85`,
 and abstract checkpoint construction. The launcher rejects inherited allocator,
 fraction, preallocation, or device-selection settings that conflict with that
 contract. Allocation and one direct load passed, but a later repeated backend
-setup hit an AMDGPU illegal opcode. Treat this mode as experimentally unstable,
-not production-ready. All guarded Qwen3.5 full-model entrypoints now refuse
-further ROCm work when the current boot journal contains a fatal AMDGPU event;
-reboot before any new guarded diagnostic.
+setup on the prior driver/boot hit an AMDGPU illegal opcode. After the ROCm
+7.2.4 upgrade and reboot, bounded setup-only and compile-only gates passed, as
+recorded below. This remains an experimental capacity path, not a
+production-ready training configuration. Every guarded Qwen3.5 full-model
+entrypoint still refuses any boot whose journal contains a fatal AMDGPU event.
 
 The allocation probe defaults to CPU and is safe to run without an accelerator
 acknowledgement:
@@ -174,9 +183,42 @@ After that passes, advance one fresh process at a time:
    one-warmup/five-measured protocol with
    `--inter-step-delay-seconds 5`.
 
-The purpose-built one-update path is not yet present. Until it is independently
-reviewed, allocation/load/compile success establishes feasibility only and does
-not move the validated training frontier.
+On ROCm 7.2.4, the staged full-model setup and compilation gates passed in
+fresh guarded processes. Context-64 setup-only took 96.173134 s and stopped
+before lowering. The context-64 XLA compile took 39.642890/6.228467/52.449389 s
+for setup/lowering/compilation with 196,247,088 B compiled temporary memory.
+The context-2,048 Pallas compile took 39.177387/6.350830/94.074129 s with
+11,390,298,880 B compiled temporary memory. Its physical VRAM peak was
+23,003,750,400 B, maximum junction temperature was 79 C, and swap remained
+zero. The returned callable and optimizer were not invoked:
+`model_pass_executable_invocations == optimizer_step_invocations == 0`.
+Exact artifacts are listed in [`RESULTS.md`](RESULTS.md), including
+`/tmp/postrocm-backend-setup-1783872188.jsonl`,
+`/tmp/postrocm-compile-t64-1783872326.jsonl`, and
+`/tmp/postrocm-compile-t2048-pallas-1783872544.jsonl` with their corresponding
+`.telemetry.jsonl` and `.telemetry.jsonl.summary.json` files.
+
+The independently reviewed exact-one-update protocol is available through the
+same client. It rejects explicit warmup/measured counts, performs exactly one
+cold forward/backward/Adam update, records cleanup success or failure, unloads,
+and emits no steady-state throughput claim:
+
+```bash
+TINKER_API_KEY=tml-dummy ../tinker-cookbook/.venv/bin/python \
+  rocm/bench_sft.py \
+  --base-url http://127.0.0.1:8001 \
+  --context 64 \
+  --one-update-gate \
+  --run-id one-update-t64 \
+  --output /tmp/one-update-t64.sft.jsonl
+```
+
+Its fail-closed protocol, cleanup paths, direct-script invocation, and normal
+1+5 compatibility have passed CPU/mocked review; hardware validation still
+begins at context 64 under telemetry. Compile success alone does not move the
+training frontier. Context-2,048 execution remains blocked until the lower
+context hardware gate passes and Pallas is numerically qualified: isolated
+`dq`/`dk` relative-L2 error is about 1.1%, above the 1% promotion threshold.
 
 The fixed-rollout GRPO learner harness follows the Cookbook's causal shift,
 group-mean advantage, mask-removal, `importance_sampling`, and Adam call order
@@ -233,6 +275,15 @@ profiler:
 .venv/bin/python rocm/probe_jax_optimizer.py \
   --platform gpu --allow-gpu --command-buffer-mode disable --steps 3
 ```
+
+The exact post-upgrade replay passed all three updates for 402 LoRA leaves and
+34,512,896 BF16 parameter elements. Lowering took 3.266979 s, the cold
+compile/update 16.688593 s, and the two ordinary replays 0.077036/0.105031 s;
+all state and sentinel checks were finite and every checksum changed. These are
+isolated optimizer timings, not full-model SFT throughput. Artifacts are
+`/tmp/postrocm-opt-1783872102.probe.jsonl`,
+`/tmp/postrocm-opt-1783872102.telemetry.jsonl`, and
+`/tmp/postrocm-opt-1783872102.telemetry.jsonl.summary.json`.
 
 ROCm causal self-attention at 512 tokens or longer cannot silently use the
 quadratic XLA fallback. The currently validated Pallas geometry is opt-in with

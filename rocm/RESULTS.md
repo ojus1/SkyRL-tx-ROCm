@@ -8,16 +8,85 @@ fatal AMDGPU journal monitoring.
 
 ## Current safety configuration
 
-- ROCm 7.2 and JAX/JAXlib/ROCm plugin/PJRT 0.10.2.
+- ROCm 7.2.4 and JAX/JAXlib/ROCm plugin/PJRT 0.10.2.
 - `XLA_FLAGS=--xla_gpu_enable_command_buffer=`. Command-buffer replay is
   disabled because the second full-model Adam replay previously produced an
   HSA invalid-packet/illegal-opcode failure; repeated updates pass with it off.
-- JAX preallocation is disabled and the Pallas attention path is opt-in.
+- The validated growth-mode training baseline disables JAX preallocation and
+  keeps Pallas attention opt-in. Fixed-85% BFC preallocation is used only by
+  the explicitly guarded capacity probes described below.
 - Junction temperature is capped at 90 C, VRAM at 23 GiB, minimum available
   host memory at 4 GiB, and swap use at zero.
 - The AMD display connectors must be disconnected and `/dev/kfd` unowned
   before launch. A 60-second cold-start sensor grace accommodates a
   runtime-suspended headless GPU.
+
+## Post-upgrade ROCm 7.2.4 qualification
+
+After installing ROCm 7.2.4 and AMDGPU 30.30.4, rebooting into the newly built
+6.16.13 DKMS module, and moving the display to the Intel iGPU, qualification
+advanced in bounded fresh processes with command buffers disabled. The first
+two probes also disabled JAX preallocation: a one-element JIT `float32` add
+mapped `[1.25] + 2` to exactly `[3.25]` on `rocm:0`, and a separate BF16
+`16x16` all-ones matrix multiply plus `value_and_grad(sum)` returned exactly
+FP32 loss `4096.0` and gradient minimum/maximum `16.0/16.0`. These two shell
+probes did not write artifacts; their process wall times included startup and
+are not kernel-performance measurements. After each, the entire-boot guard and
+fatal-journal query were clean, `/dev/kfd` was unowned, and the device returned
+to runtime suspend.
+
+The exact 402-leaf Qwen3.5 rank-8/two-slot LoRA AdamW replay then passed three
+ordinary GPU dispatches with command buffers disabled. It covered 34,512,896
+BF16 parameter elements (69,025,792 B). Lowering took 3.266979 s; the cold
+compile/update took 16.688593 s and replays took 0.077036 and 0.105031 s. Every
+step changed its sentinel checksum, all sentinels and final parameter/optimizer
+states were finite, and each gradient norm was `4.056726455688477`. Peak
+physical VRAM was 1,804,165,120 B, peak process RSS/PSS/USS was
+3,554,209,792/3,170,508,800/2,797,559,808 B, maximum junction temperature was
+56 C, maximum power was 137 W, and swap remained zero. The guarded process
+exited with status 0, no fatal driver event, and restored idle KFD/runtime-PM
+state. Artifacts:
+
+- `/tmp/postrocm-opt-1783872102.probe.jsonl`
+- `/tmp/postrocm-opt-1783872102.telemetry.jsonl`
+- `/tmp/postrocm-opt-1783872102.telemetry.jsonl.summary.json`
+
+The fixed-85% BFC full-model gates then progressed without executing an SFT
+update:
+
+| Gate | Exact result | Physical peak / safety |
+|---|---|---|
+| Context-64 setup only | Setup 96.173134 s; allocator live/peak/pool 8,691,296,256 / 8,829,511,424 / 21,892,169,728 B | VRAM 22,608,961,536 B; junction 61 C; power 137 W; swap 0 B |
+| Context-64 XLA compile only | Setup/lower/compile 39.642890 / 6.228467 / 52.449389 s; compiled temporary 196,247,088 B; allocator peak-live 10,076,861,696 B | VRAM 22,655,623,168 B; junction 73 C; power 206 W; swap 0 B |
+| Context-2,048 Pallas compile only | Setup/lower/compile 39.177387 / 6.350830 / 94.074129 s; compiled temporary 11,390,298,880 B; allocator peak-live 12,522,268,672 B | VRAM 23,003,750,400 B; junction 79 C; power 311 W; swap 0 B |
+
+The setup-only gate stopped before lowering. Both compile gates returned
+`status: passed`; compilation may itself dispatch bounded autotuning kernels,
+but the returned model-pass callable was never invoked. In particular, the
+context-2,048 artifact records
+`model_pass_executable_invocations: 0` and
+`optimizer_step_invocations: 0`. Every wrapper returned status 0, swap did not
+grow, the full current-boot fatal-journal scan stayed empty, and KFD/VRAM
+returned to idle after each process. Artifacts:
+
+- `/tmp/postrocm-backend-setup-1783872188.jsonl`
+- `/tmp/postrocm-backend-setup-1783872188.telemetry.jsonl`
+- `/tmp/postrocm-backend-setup-1783872188.telemetry.jsonl.summary.json`
+- `/tmp/postrocm-compile-t64-1783872326.jsonl`
+- `/tmp/postrocm-compile-t64-1783872326.telemetry.jsonl`
+- `/tmp/postrocm-compile-t64-1783872326.telemetry.jsonl.summary.json`
+- `/tmp/postrocm-compile-t2048-pallas-1783872544.jsonl`
+- `/tmp/postrocm-compile-t2048-pallas-1783872544.telemetry.jsonl`
+- `/tmp/postrocm-compile-t2048-pallas-1783872544.telemetry.jsonl.summary.json`
+
+This advances context 2,048 to **compile-only capacity**, not validated
+training. The exact-one-update client protocol has now passed independent
+source review plus CPU/mocked tests, but has not yet run on hardware. Its first
+hardware gate is context 64 under telemetry; it is not permission to invoke the
+context-2,048 executable. The 2,048-token Pallas backward path must also pass
+its numerical promotion criterion: the isolated `dq`/`dk` relative-L2 errors
+remain about 1.1%, above the 1% threshold. Neither compile success nor bounded
+autotuning qualifies that attention implementation for training.
 
 ## Full Qwen3.5-4B SFT control
 
@@ -276,10 +345,11 @@ did not clear potentially suspect driver state. This is an important confounder
 and is why the new guard scans the entire current-boot journal.
 The observed failure occurred during repeated fresh-process fixed-arena setup;
 the earlier same-boot event means that path is not established as the original
-cause. Command buffers were disabled but were not sufficient protection. No further GPU work is
-permitted in this boot. The next post-reboot diagnostic must stop after finely
-flushed backend-constructor/model-creation/state-barrier markers; no 2K model
-step or integrated megakernel run is authorized by these results.
+cause. Command buffers were disabled but were not sufficient protection. No
+further GPU work was permitted in that boot. The ROCm 7.2.4 post-reboot
+setup/compile qualification is recorded above; it does not retroactively prove
+the cause of this event or authorize a 2K model step or integrated megakernel
+run.
 
 ## Fixed-rollout GRPO learner control
 

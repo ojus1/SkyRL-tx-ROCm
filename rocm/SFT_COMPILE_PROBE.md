@@ -35,8 +35,9 @@ optimizer/adapter state, and the combined final state before marking each phase
 complete. After the July 12 illegal-opcode event, every guarded Qwen3.5
 full-model entrypoint also refuses a current boot whose kernel journal contains
 a fatal AMDGPU event; rebooting is the only way to clear that quarantine.
-`--stop-after-backend-ready` provides the next post-reboot setup-only diagnostic
-and exits before lowering.
+`--stop-after-backend-ready` provides a setup-only diagnostic and exits before
+lowering. That diagnostic subsequently passed after the ROCm 7.2.4 upgrade and
+reboot; it remains useful for isolating setup from compilation.
 
 ROCm effective (bucketed) context 512 and above must explicitly select
 `--attention-backend pallas`; the code refuses the quadratic XLA fallback.
@@ -44,6 +45,44 @@ The isolated 2,048-token Pallas path passed the hardware safety gate, but its
 `dq`/`dk` relative L2 remained about 1.1%, above the 1% numerical promotion
 threshold. A successful compile therefore proves capacity only, not numerical
 promotion for training.
+
+## ROCm 7.2.4 hardware results
+
+The post-upgrade qualification advanced one fresh guarded process at a time.
+All three wrappers returned status 0, the current-boot fatal-driver scan stayed
+empty, swap did not grow, and `/dev/kfd` plus physical VRAM returned to idle
+after exit.
+
+| Gate | Setup / lower / compile | Compiled temporary | Allocator peak-live | Physical VRAM peak | Junction / power max |
+|---|---:|---:|---:|---:|---:|
+| Context-64 setup only | 96.173134 / n/a / n/a s | n/a | 8,829,511,424 B | 22,608,961,536 B | 61 C / 137 W |
+| Context-64 XLA compile only | 39.642890 / 6.228467 / 52.449389 s | 196,247,088 B | 10,076,861,696 B | 22,655,623,168 B | 73 C / 206 W |
+| Context-2,048 Pallas compile only | 39.177387 / 6.350830 / 94.074129 s | 11,390,298,880 B | 12,522,268,672 B | 23,003,750,400 B | 79 C / 311 W |
+
+The setup-only JSONL contains `backend_ready` and `stopped` but no `lowered` or
+`compiled` record. Both compile-only JSONLs contain a final `compiled` record
+with `status: passed`. Most importantly, the context-2,048 record reports
+`model_pass_executable_invocations: 0` and
+`optimizer_step_invocations: 0`: neither the returned full-model callable nor
+the optimizer ran. Compilation may have executed only the bounded
+autotuning/profiling work described above. Artifacts:
+
+- `/tmp/postrocm-backend-setup-1783872188.jsonl`
+- `/tmp/postrocm-backend-setup-1783872188.telemetry.jsonl`
+- `/tmp/postrocm-backend-setup-1783872188.telemetry.jsonl.summary.json`
+- `/tmp/postrocm-compile-t64-1783872326.jsonl`
+- `/tmp/postrocm-compile-t64-1783872326.telemetry.jsonl`
+- `/tmp/postrocm-compile-t64-1783872326.telemetry.jsonl.summary.json`
+- `/tmp/postrocm-compile-t2048-pallas-1783872544.jsonl`
+- `/tmp/postrocm-compile-t2048-pallas-1783872544.telemetry.jsonl`
+- `/tmp/postrocm-compile-t2048-pallas-1783872544.telemetry.jsonl.summary.json`
+
+This is compile-only capacity evidence. `bench_sft.py --one-update-gate` has
+passed independent source review and CPU/mocked protocol tests, but its first
+hardware validation must occur at context 64 under telemetry. It does not yet
+authorize invoking the 2,048-token executable. Separate Pallas numerical
+qualification also remains required: the approximately 1.1% isolated `dq`/`dk`
+relative-L2 result still exceeds the 1% promotion threshold.
 
 ## Safety contract
 
@@ -82,8 +121,8 @@ The safe default is:
 .venv/bin/python rocm/probe_sft_compile.py
 ```
 
-It emits `manifest` and `refused` records only. After a reboot, the next GPU
-diagnostic is setup-only—not a compile—and must run under telemetry:
+It emits `manifest` and `refused` records only. The setup-only reproducer must
+run under telemetry:
 
 ```bash
 .venv/bin/python rocm/profile_rocm.py \
@@ -97,14 +136,15 @@ diagnostic is setup-only—not a compile—and must run under telemetry:
     --output /tmp/qwen35-backend-setup.jsonl
 ```
 
-Do not return to the full context-2,048 compile until the setup-only sequence
-has passed cleanly after reboot and received a new review. At that later gate,
-effective context 2,048 requires explicit Pallas and still carries the numerical
-qualification above.
+The setup-only sequence and subsequent context-2,048 Pallas compile-only gate
+have now passed cleanly after reboot. This does not authorize invoking the
+compiled callable. The reviewed exact-one-update client must first pass its
+context-64 hardware gate, and effective context 2,048 still carries the Pallas
+numerical qualification above.
 
 Setup-only success produces `manifest`, the flushed `setup_stage` sequence,
 `backend_ready`, and `stopped`; it produces no `lowered` or `compiled` record.
-A later full compile success additionally produces `lowered` and `compiled`.
+Compile-only success additionally produces `lowered` and `compiled`.
 A guarded Python failure produces an `error` record and a nonzero exit. A fatal
 driver event can terminate the process before it can emit that final error
 record. Compiler memory reports are accounting, not physical peak VRAM;
