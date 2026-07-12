@@ -16,7 +16,9 @@ Geometry and checkpoint byte totals refer to `Qwen/Qwen3.5-4B` revision
 
 Measured facts are identified as such. FLOP counts, time projections, and
 memory savings are estimates until verified with profiler traces and XLA buffer
-assignments.
+assignments. Every throughput percentage or speedup range in this document is
+an engineering estimate, not a measured result, unless it is explicitly
+labelled as measured.
 
 ## Rejected design: one whole-layer or whole-model dispatch
 
@@ -58,6 +60,9 @@ bounded work estimate and an independently measured duration.
 - Training loss integration: `skyrl/backends/jax.py:334-411`.
 - Portable grouped-quantization semantics:
   `skyrl/tx/kernels/quantized_lora.py` (reference only, not a GPU speed path).
+- Portable full-attention QKV-stage equations and explicit precision-policy
+  VJP: `skyrl/tx/kernels/qwen3_5_qkv_lora.py` (unwired experiment only; its
+  portable backward increases remat work and is not a memory/speed path).
 
 Line numbers describe the worktree when this document was written; symbols are
 the stable integration points.
@@ -204,6 +209,60 @@ Base transpose GEMMs in backward have the same bound. Gate/up recomputation
 and its transpose GEMM must remain separate underlying dispatches. Require an
 observed duration below 100 ms for every new custom dispatch; otherwise shrink
 its token/query/vocabulary superblock.
+
+## Whole-model projection launch accounting
+
+The source topology has exactly 200 LoRA-bearing dense projections:
+
+- 8 full-attention layers times QKV, O, gate/up, and down gives 32;
+- 24 GDN layers times QKV, z, a, b, output, gate/up, and down gives 168.
+
+The current batch-size-one path nominally issues a frozen-base GEMM plus the
+two rank-8 LoRA GEMMs for each projection, or 600 dense GEMMs per forward. A
+training execution with rematerialized projection work and its VJPs is about
+2,200 dense GEMMs. These are operation-level launch counts, not profiler
+measurements: XLA may fuse small operations, and a library call may enqueue
+more than one device kernel.
+
+The proposed stage map combines the four GDN input branches into one logical
+dense group. It therefore has 128 fused groups: 32 in the full-attention layers
+and 96 in the GDN layers. For launch budgeting with `M<=2048`, the assumed
+target schedule models forward as
+`128 * (1 + ceil(T/2048))` underlying launches and a rematerialized training
+execution as `128 * (5 + 3*ceil(T/2048))`. The fixed term covers the fused
+LoRA/epilogue and VJP work; the sequence-dependent term is the bounded base
+projection work. These formulas assume the implementation succeeds in
+collapsing that fixed work to the stated launch count; they are a design target,
+not an audited enqueue trace.
+
+| Tokens | Current forward | Bounded fused forward | Current training | Bounded fused training |
+|---:|---:|---:|---:|---:|
+| 64 | 600 | 256 | about 2,200 | 1,024 |
+| 512 | 600 | 256 | about 2,200 | 1,024 |
+| 8,192 | 600 | 640 | about 2,200 | 2,176 |
+| 32,768 | 600 | 2,176 | about 2,200 | 6,784 |
+
+This table counts dense projection work only. It excludes the GDN core, full
+attention, tied head, norms, convolutions, and reductions. At long context the
+bounded design deliberately trades more launches for watchdog safety; its gain
+must come from eliminating intermediates, reducing weight/activation traffic,
+and using better epilogues rather than from a lower launch count.
+
+The following end-to-end BF16 throughput uplifts are estimates to test, not
+measurements or commitments:
+
+| Bucket | Estimated BF16 fusion uplift |
+|---:|---:|
+| 64 | 5-15% |
+| 512 | 3-10% |
+| 8,192 | 5-20% |
+| 32,768 | Enablement-first; no defensible speed range before the GDN and tied-head paths are measured |
+
+A fully optimized native W4 long-context path has an estimated realistic
+throughput range of 1.2-1.5x versus BF16. That estimate assumes compact weights
+remain canonical, IU4 work is useful rather than conversion-bound, and the
+bounded stage overhead is controlled. The exact training backward specified
+below has no IU4 matrix-rate advantage, so training may fall below that range.
 
 ## Operation and custom-VJP boundaries
 
@@ -373,13 +432,50 @@ Q/K head `hv//2` without a materialized repeat.
 Use three bounded stages:
 
 1. Parallel per-64-token WY preparation and 64x64 correction solve, producing
-   only U, W, and minimal gamma data.
-2. State/output execution for 8-16 chunks per dispatch, carrying the 2 MiB FP32
-   state through HBM at each 512-1,024-token boundary.
+   only U, W, and minimal gamma data for one superblock.
+2. State/output execution for 8-16 chunks per dispatch, consuming that
+   superblock's U/W immediately and carrying the 2 MiB FP32 state through HBM
+   at each 512-1,024-token boundary.
 3. Reverse-superblock custom VJP using the exact recurrence above.
 
 Saving FP32 state every 1,024 tokens costs about 34 MiB at 16K and 66 MiB at
 32K, instead of saving one state for every 64-token chunk.
+
+The launch-count reason to replace the current scan is larger than the dense
+projection count. The existing chunk equations contain about five
+matrix-producing operations per 64-token chunk per GDN layer. Across 24 GDN
+layers their nominal forward count is therefore
+`5 * ceil(T/64) * 24`. A 1,024-token schedule with one preparation dispatch and
+one state/output dispatch per superblock instead uses
+`2 * ceil(T/1024) * 24` forward dispatches:
+
+| Tokens | Current GDN scan matrix launches | Two-dispatch superblocks |
+|---:|---:|---:|
+| 64 | about 120 | 48 |
+| 512 | about 960 | 48 |
+| 8,192 | about 15,360 | 384 |
+| 32,768 | about 61,440 | 1,536 |
+
+These are launch-accounting estimates, not traced device-kernel counts, and
+they exclude projection, normalization, convolution, and backward work. The
+backward should recompute preparation for one superblock and then run one
+reverse dispatch; retaining full-sequence U/W merely to reduce recomputation is
+not the intended design.
+
+U and W are both FP32 `[B,T,32,128]` tensors. Materializing them for a whole
+active layer versus streaming at most one 1,024-token superblock gives:
+
+| Tokens | Full-sequence U+W | Streamed U+W scratch |
+|---:|---:|---:|
+| 64 | 2 MiB | 2 MiB |
+| 512 | 16 MiB | 16 MiB |
+| 8,192 | 256 MiB | at most 32 MiB |
+| 32,768 | 1,024 MiB | at most 32 MiB |
+
+The scratch is per active layer and is reused across superblocks. The 992 MiB
+32K logical difference must not be multiplied by 24 or added blindly to every
+other opportunity: per-layer rematerialization, aliasing, and allocator reuse
+determine the realized peak.
 
 ### 9. GDN gated norm, output projection, and residual
 
@@ -398,12 +494,23 @@ tensor. `M=128` is the first proposed fused-head bucket, not the current setting
 its BF16/FP32 logical logits would be 60.625/121.25 MiB.
 
 The tied embedding is approximately 1.184 GiB, larger than cache. With token
-chunk 64 it is nominally streamed at least 256 times at 16K (about 303.1 GiB)
-and 512 times at 32K (about 606.3 GiB) per forward, before backward or remat.
-Fusion does not itself remove those repeated vocabulary reads; it permits a
-larger token chunk without a larger logits buffer. `M=128` halves those counts
-to 128/256 (about 151.6/303.1 GiB). After that path is validated, test 256
-tokens (325.5 GFLOP, estimated 54 ms at 6 TFLOP/s).
+chunk 64 it is reread once per token chunk in forward. Training nominally reads
+it about three times per chunk across forward, rematerialized forward, and the
+input-gradient VJP. The table below is estimated logical traffic, not measured
+HBM traffic; it applies `ceil(T/M)` and includes group-64 scale bytes for W8/W4:
+
+| Tied-head route | 64 tokens | 512 tokens | 8,192 tokens | 32,768 tokens |
+|---|---:|---:|---:|---:|
+| BF16, `M=64` | 3.55 GiB | 28.42 GiB | 454.69 GiB | 1,818.75 GiB |
+| BF16, `M=256` | 3.55 GiB | 7.10 GiB | 113.67 GiB | 454.69 GiB |
+| W8 group-64, `M=256` | 1.83 GiB | 3.66 GiB | 58.61 GiB | 234.45 GiB |
+| W4 group-64, `M=256` | 0.94 GiB | 1.89 GiB | 30.19 GiB | 120.78 GiB |
+
+Fusion does not itself remove vocabulary reads; it permits a larger token
+chunk without a larger logits buffer. `M=128` remains the first fused-head
+bucket. After it is validated, test `M=256`: its work is 325.5 GFLOP and its
+duration is estimated at 54 ms at the conservative 6 TFLOP/s planning rate.
+The W8/W4 rows are bandwidth opportunities, not end-to-end speedup claims.
 
 Forward should use split-vocabulary online max/sum and emit only target
 logprobs. A watchdog-safe, deterministic backward can make each vocabulary
@@ -437,10 +544,67 @@ buffer assignments and fresh-process allocator telemetry.
 | Current per-loss-chunk BF16 logits (`M=64`) | 30.3125 MiB | 30.3125 MiB |
 | Proposed fused-head BF16 logits (`M=128`) | 60.625 MiB | 60.625 MiB |
 
-GDN still needs U/W, totaling about 512 MiB at 16K and 1 GiB at 32K, unless a
-later on-the-fly design proves faster. Fusing preparation and state stages can
-avoid roughly 1.6/3.3 GiB of other logical FP32 intermediates at 16K/32K, but
-the actual peak delta will be smaller if XLA already reuses buffers.
+Full-sequence GDN preparation creates 512 MiB/1 GiB of U/W at 16K/32K. The
+streamed superblock design above caps its logical U/W scratch at 32 MiB by
+recomputing in backward. Fusing preparation and state stages can also avoid
+roughly 1.6/3.3 GiB of other logical FP32 intermediates at 16K/32K. None of
+these logical figures are additive peak claims: the actual delta can be much
+smaller when XLA aliases or reuses the same storage.
+
+### O8 layer-boundary accounting
+
+O8 means that each completed decoder-layer residual is quantized once, stored
+as signed INT8 codes plus a per-token or small-block scale, and dequantized to
+the model dtype before the next layer consumes it. The custom VJP treats the
+round/clip operation with the declared straight-through rule and returns the
+incoming cotangent to the pre-quantized boundary; codes and stopped-gradient
+scales are not trainable. It is not permission to quantize an in-progress
+residual sum, attention/GDN state, or the GDN U/W workspace.
+
+To realize any checkpoint saving while preserving the STE gradient, wrap the
+whole next-layer/recompute boundary in one `custom_vjp` that takes the BF16
+layer input. Its forward quantizes and dequantizes that input, evaluates the
+next layer from the dequantized value, and stores only `(codes, scales)` in
+place of the BF16 input among its activation residuals. Ordinary layer
+operands and metadata remain available to compute their required cotangents.
+Its backward dequantizes the compact residual, recomputes the layer, applies
+the layer VJP, and returns the resulting cotangent to the original BF16 input
+under the declared STE rule.
+
+Do not expose integer codes as the output of one independently differentiated
+quantizer and the input to a separate checkpointed dequantizer/layer. JAX
+integer arrays carry `float0` cotangents, so that arrangement cannot bridge
+autodiff back to the BF16 input. A quantize/dequantize identity outside the
+custom-VJP recompute boundary followed by rematerializing a layer whose
+argument is BF16 also makes XLA retain the BF16 layer input and realizes no O8
+boundary saving.
+
+Ignoring the small scale metadata, replacing retained BF16 values across all
+32 `[1,T,2560]` decoder boundaries has this logical upper bound:
+
+| Tokens | BF16-to-O8 saving across 32 boundaries |
+|---:|---:|
+| 64 | about 5 MiB |
+| 512 | about 40 MiB |
+| 8,192 | about 640 MiB |
+| 32,768 | about 2,560 MiB |
+
+These figures assume all 32 boundaries would otherwise contribute to the live
+training set. Rematerialization may retain fewer, scales reduce the saving
+slightly, and allocator reuse may make the measured peak delta much smaller.
+The 2.5 GiB 32K opportunity must not be added to every hidden-state row in the
+table above.
+
+## Host-offload floor
+
+Host offload is an enablement fallback, not a speed optimization. At 32K,
+moving a 5 GiB retained set to host and later bringing it back transfers 5 GiB
+in each direction. Even an optimistic effective 20-25 GiB/s link implies an
+estimated 0.4-0.5 seconds of aggregate transfer time per offload/reload event,
+before synchronization, allocation, or staging overhead. Pinned memory and
+overlap can hide some wall time but cannot remove this byte floor. Offloading
+many layer boundaries independently is therefore not viable; first reduce or
+stream the GDN/tied-head working sets and quantify the remaining retained set.
 
 ## Quantization routes for `gfx1100`
 
@@ -450,12 +614,15 @@ The official ROCm precision table lists INT8, FP16, and BF16 matrix-core support
 for RDNA3, including the RX 7900 XTX class, but no native FP8 or floating-point
 FP4 matrix-core support. Integer four-bit is a separate case: the official
 RDNA3 ISA lists `V_WMMA_I32_16X16X16_IU4`, and AMD's RX 7900 XTX WMMA guide
-documents both signed/unsigned four-bit inputs with INT32 accumulation. The
-installed Composable Kernel headers also contain gfx11 IU4 WMMA paths. rocWMMA
-supports `gfx1100` as a wave32 target and exposes INT8 fragments; hipBLASLt
-advertises INT8 types at the library API. Every exact
-transpose/layout/scale/epilogue combination still needs an algorithm-support
-query or a custom HIP kernel and benchmark on this installed stack.
+documents both signed/unsigned four-bit inputs with INT32 accumulation. A local
+compile-only audit proved that Clang emits the gfx1100 IU8 and IU4 instructions
+when their builtins are called directly. It did not enumerate the GPU or launch
+a kernel. The installed rocWMMA wraps IU8 but has no matching public IU4
+wrapper. The installed Composable Kernel source names an experimental IU4
+selector but lacks the corresponding `wmma_type`/intrinsic implementation, so
+it is not a ready IU4 path. hipBLASLt advertises INT8 types at the library API,
+but every exact transpose/layout/scale/epilogue combination still needs an
+algorithm-support query or a custom HIP kernel and benchmark.
 
 Consequently, "8-bit" means signed INT8 here, not FP8. W8A8 can use native
 INT8-to-INT32 matrix instructions. W8A16 must dequantize weights into a
@@ -474,6 +641,12 @@ Primary hardware references:
 - [hipBLASLt precision support](https://rocm.docs.amd.com/projects/hipBLASLt/en/develop/reference/data-type-support.html)
 - [AMD GPUOpen: RDNA3 WMMA on RX 7900 XTX](https://gpuopen.com/learn/wmma_on_rdna3/)
 - [AMD RDNA3 shader ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna3-shader-instruction-set-architecture-feb-2023_0.pdf)
+
+The installed-stack evidence and exact fragment ABI are recorded in
+[`QUANTIZED_FFI.md`](QUANTIZED_FFI.md). Its compile-only proof is
+[`compile_quant_wmma_gfx1100.sh`](compile_probes/compile_quant_wmma_gfx1100.sh).
+Compiler/ISA feasibility is proven; layout correctness, quality, occupancy,
+and speed are not.
 
 ### Frozen-model memory estimates
 
@@ -504,14 +677,12 @@ not a later optimization.
 
 Quantize ordinary frozen projections first while keeping the tied
 embedding/head BF16. That isolates quality changes and still saves 3.2-4.9 GiB.
-The tied matrix is then the highest-leverage bandwidth experiment: at the
-current 64-token loss bucket its 1.184 GiB BF16 representation is nominally
-read about 303/606 GiB at 16K/32K per forward. W8 approximately halves that
-weight traffic to about 156/313 GiB; group-64 W4 reduces it to about 81/161 GiB
-after scales. Those are logical traffic bounds, not end-to-end speedup
-predictions. Because the matrix is tied, quantizing it changes both token lookup
-and the vocabulary head; duplicating a BF16 embedding just for lookup would
-reduce the memory saving and must be reported explicitly.
+The tied matrix is then the highest-leverage bandwidth experiment; the
+three-pass training traffic estimates for BF16/W8/W4 and `M=64/256` are in the
+final-head section above. Those are logical traffic bounds, not end-to-end
+speedup predictions. Because the matrix is tied, quantizing it changes both
+token lookup and the vocabulary head; duplicating a BF16 embedding just for
+lookup would reduce the memory saving and must be reported explicitly.
 
 ### Ranked implementation routes
 
@@ -539,19 +710,23 @@ reduce the memory saving and must be reported explicitly.
    saving. Treat them as memory routes until profiling proves a speed gain.
 4. **W4A4O16 native IU4.** Dynamically quantize each activation K group to
    signed four-bit, feed packed W4/A4 fragments to the native IU4-to-INT32 WMMA,
-   rescale each group in FP32, and emit BF16. This is the only ranked route with
-   a higher published matrix-instruction ceiling than BF16 on RX 7900 XTX, but
-   it is also the highest-risk projection path numerically. Validate tied head,
-   MLP, attention projections, and backward straight-through behavior
-   independently; do not turn on model-wide A4 in its first experiment. Start
-   base `dX` from the dequantized W4 straight-through reference; a native IU4
-   transpose path also quantizes `dY` to A4 and is a later, separate gate.
+   rescale each group in FP32, and emit BF16. The installed implementation route
+   is a custom HIP kernel using the compile-proven Clang builtin; neither the
+   installed rocWMMA nor CK supplies a complete IU4 wrapper. This is the only
+   ranked route with a higher published matrix-instruction ceiling than BF16 on
+   RX 7900 XTX, but it is also the highest-risk projection path numerically.
+   Validate tied head, MLP, attention projections, and backward
+   straight-through behavior independently; do not turn on model-wide A4 in
+   its first experiment. Start base `dX` from the dequantized W4
+   straight-through reference; a native IU4 transpose path also quantizes `dY`
+   to A4 and is a later, separate gate.
 5. **O8 layer-boundary checkpoints.** Quantize only after the residual addition
-   and store a per-token or small-block scale, then dequantize before the next
-   layer. At 32K, one `[1,T,2560]` boundary falls from 160 MiB BF16 to about
-   80 MiB plus scales. Do not store attention softmax data, Q/K normalization
-   statistics, GDN U/W, or recurrent state in O8. The benefit must be measured
-   with rematerialization enabled because XLA may not retain every boundary.
+   and store signed codes plus a per-token or small-block scale, then dequantize
+   before the next layer. Its explicit straight-through VJP and the upper-bound
+   5/40/640/2,560 MiB savings across all 32 boundaries are specified above. Do
+   not store attention softmax data, Q/K normalization statistics, GDN U/W, or
+   recurrent state in O8. The benefit must be measured with rematerialization
+   enabled because XLA may not retain every boundary.
 6. **Blockwise INT8 Adam moments.** The exact two-adapter, rank-8 shape has
    34,512,896 trainable LoRA elements. Its two BF16 moment arrays occupy about
    131.7 MiB; two INT8 moment arrays would use about 65.8 MiB plus scales, saving
@@ -563,6 +738,25 @@ reduce the memory saving and must be reported explicitly.
    softmax, recurrence, and optimizer dynamics for modest additional memory
    beyond the ranked routes. User acceptance makes them valid experiments, not
    valid defaults without the same model-level gates.
+
+### Adapter-slot and optimizer-state arithmetic
+
+The 34,512,896-element figure includes two equal adapter slots. If only one is
+active, removing the inactive half saves about 131.7 MiB across its BF16
+parameters, BF16 gradients, and two BF16 Adam moments. This is a pure capacity
+win when checkpoint/serving semantics do not require the spare slot, and is
+larger than quantizing all moments from BF16 to INT8.
+
+| State change | Logical saving before scale metadata |
+|---|---:|
+| Remove one of two inactive adapter slots: params + grads + two moments | 131.7 MiB |
+| Quantize both adapters' two BF16 Adam moments to INT8 | 65.8 MiB |
+| Quantize both adapters' two BF16 Adam moments to packed W4 | 98.7 MiB |
+
+The W4 moment number is capacity arithmetic, not a recommendation or speed
+estimate. Both quantized optimizer routes still require FP32 dequantization,
+update, bias correction, and model-level convergence gates; scales make their
+real savings slightly smaller.
 
 If projection input codes are materialized for reuse, a 32K-by-2,560 tensor is
 80 MiB in A8 plus 2.5 MiB of group-64 BF16 scales, or 40 MiB in packed A4 plus
@@ -630,7 +824,7 @@ first experiment would make quality regressions impossible to attribute.
 | W8A16 dequantized base GEMM | Weak Pallas prototype | HIP required for a production fused load/dequant path |
 | W8A8 base GEMM | No dependable Pallas INT8-matrix path | HIP/rocWMMA or a proven hipBLASLt algorithm |
 | W4A16/W4A8 base GEMM | Weak unpack/dequant prototype | HIP; dequantize to BF16 or unpack to INT8 |
-| W4A4 base GEMM | Portable oracle only | HIP native IU4 WMMA or a proven installed CK path |
+| W4A4 base GEMM | Portable oracle only | Custom HIP using the compile-proven native IU4 builtin; installed rocWMMA/CK are incomplete for IU4 |
 | O8 checkpoint boundary | Suitable correctness prototype | HIP optional after measured benefit |
 | Whole layer/model single dispatch | Rejected | Rejected |
 

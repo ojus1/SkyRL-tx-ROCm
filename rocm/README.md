@@ -138,4 +138,8 @@ The fused-stage, GDN/FlashQLA adaptation, native-GQA, tied-head, W8/W4/A8/A4,
 activation-checkpoint, and custom-VJP design is in
 [`MEGAKERNELS.md`](MEGAKERNELS.md). The quantized LoRA implementation currently
 in `skyrl/tx/kernels/quantized_lora.py` is a CPU semantic oracle only; it is not
-selected by model code and is not a GPU performance path.
+selected by model code and is not a GPU performance path. The native gfx1100
+IU8/IU4 compile proof and production FFI requirements are in
+[`QUANTIZED_FFI.md`](QUANTIZED_FFI.md). Likewise,
+`skyrl/tx/kernels/qwen3_5_qkv_lora.py` is an unwired equation/precision
+experiment; its portable custom VJP is explicitly not a memory or speed path.

@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-
 _PROBE_PATH = Path(__file__).parents[3] / "rocm" / "probe_pallas_attention.py"
 _SPEC = importlib.util.spec_from_file_location("probe_pallas_attention", _PROBE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
