@@ -110,6 +110,42 @@ The local artifacts are:
 - `/tmp/t1024-sft-1783857150.telemetry.jsonl`
 - `/tmp/t1024-sft-1783857150.telemetry.jsonl.summary.json`
 
+## Fixed-rollout GRPO learner control
+
+Revision `31800cf001c0c982e56231f386182f0cb02c163c` completed one cold
+and five measured `importance_sampling` forward/backward/Adam steps for one
+deterministic two-rollout group at context 64. Each rollout had 16 action
+tokens, rewards `[0,1]`, advantages `[-0.5,+0.5]`, rank-8 LoRA, and a scalar
+synthetic old log-probability of -5. No sampling, grading, checkpoint export,
+or sampler synchronization was performed.
+
+| Result | Measured value |
+|---|---:|
+| Cold learner step | 44.267 s |
+| Server-reported train JIT | 28.36 s |
+| Measured median / p95 step | 0.9258 / 0.9436 s |
+| Median learner throughput | 138.26 tokens/s |
+| Median action-token throughput | 34.57 tokens/s |
+| Maximum system VRAM used | 18,067,034,112 B (16.83 GiB) |
+| Maximum process RSS / PSS / USS | 17.10 / 16.82 / 16.57 GiB |
+| Maximum / p95 junction temperature | 77 / 68 C |
+| Maximum / p95 GPU power | 318 / 145 W |
+| Maximum host memory used | 16.95 GiB |
+| Maximum swap used | 0 B |
+
+All policy metrics and optimizer gradient norms remained finite, the adapter
+unloaded, the fatal-journal query was empty, and KFD/VRAM returned to idle. The
+scalar synthetic old log-probability is deliberately not sampled from the
+model: action importance ratios spanned roughly `9e-5` to `148`, and gradient
+norms ranged from 15.3 to 35.5. This is learner-path and numerical-finiteness
+evidence, not a realistic ratio/KL distribution or policy-quality result.
+
+Local private artifacts are:
+
+- `/tmp/grpo-t64-g2-1783857586.grpo.jsonl`
+- `/tmp/grpo-t64-g2-1783857586.telemetry.jsonl`
+- `/tmp/grpo-t64-g2-1783857586.telemetry.jsonl.summary.json`
+
 ## Isolated evidence and known failures
 
 - The bounded correctness probe completed 512-token BF16 Pallas attention for
@@ -148,9 +184,11 @@ The local artifacts are:
 
 ## Validation frontier
 
-The post-fix full-model validation frontier is currently context 1,024.
-Contexts above 1,024, GRPO, quantized model execution, and fused-kernel execution remain
-unverified. The Pallas gradient result remains just outside its initial
-promotion gate, so it is still opt-in despite the clean integrated run. The
-staged gates in [`MEGAKERNELS.md`](MEGAKERNELS.md) must be followed; no
-quantized or custom-kernel path is enabled by default.
+The post-fix full-model SFT validation frontier is currently context 1,024. A
+fixed-rollout GRPO learner control is verified at context 64; real sampling,
+fixed-real-rollout replay, KL/reward comparison, and end-to-end GRPO remain
+unverified. Contexts above 1,024, quantized model execution, and fused-kernel
+execution also remain unverified. The Pallas gradient result remains just
+outside its initial promotion gate, so it is still opt-in despite the clean
+integrated runs. The staged gates in [`MEGAKERNELS.md`](MEGAKERNELS.md) must be
+followed; no quantized or custom-kernel path is enabled by default.
