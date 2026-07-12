@@ -442,6 +442,45 @@ but deliberately factorized seeded inputs and one ordinary replay. It does not
 promote fully IID per-feature inputs, padding, backward, a GPU reference,
 larger buckets, latency distributions, or model integration.
 
+## Exact T=512 fully-IID forward gate
+
+`rocm/probe_query_bounded_gqa_iid.py` is the next separate forward-only rung.
+Its Q, K, and V scalars are independently drawn by host PCG64 from the same
+nonzero BF16 grid, uniformly over signed magnitudes 1 through 48 divided by
+128. It builds a complete independent FP32 dense causal-GQA oracle on the host,
+then permits exactly one checked candidate invocation. There is no replay,
+padding case, backward work, GPU reference, device-side error reduction, or
+model integration. The NumPy emulation of the kernel's BF16 probability path
+is informational and cannot authorize execution or success.
+
+The default mode imports no JAX and emits an abstract refusal. The guarded
+ROCm path must run in a fresh profiler-controlled process:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-t512-iid.telemetry.jsonl \
+  --card card1 \
+  --interval 0.1 \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 5 \
+  --max-junction-temp-c 70 \
+  --max-gpu-power-watts 315 \
+  --max-vram-gib 2 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_iid.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-t512-iid.jsonl
+```
+
+The probe delegates the already-audited exact one-forward-call StableHLO,
+optimized-HLO, and compiled-memory release gates. Its synchronized candidate
+duration must be below 100 ms; output must be finite with relative L2 below
+1%, cosine at least 0.9999, and maximum absolute error at most 0.02. It remains
+unpromoted until the private child artifact and profiler telemetry receive an
+independent audit.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
