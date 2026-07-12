@@ -120,8 +120,11 @@ The CPU Jaxpr gates prove two forward `pallas_call` primitives and six
 forward-plus-VJP primitives for a two-chunk numerical test. A separate 32K
 abstract trace proves 64 forward boundaries and 192 boundaries in the pullback
 trace (64 saved-forward, 64 dQ, and 64 dK/dV calls). This is necessary but not
-sufficient evidence for ROCm. Before any GPU execution, a compile-only ROCm
-gate must inspect optimized HLO/LLVM and assert all of the following:
+sufficient evidence for ROCm. Before invoking any returned attention
+executable, a guarded compile-only ROCm gate must inspect optimized HLO/LLVM
+and assert all of the following. The gate itself is GPU work because
+`compile()` may dispatch bounded autotuning/profiling kernels; only the
+returned attention executable remains uninvoked:
 
 1. Exactly 64 forward, 64 dQ, and 64 dK/dV custom calls exist at 32K.
 2. No GPU `while` or single wrapper custom call encloses all query ranges.
@@ -155,13 +158,68 @@ separate failure mode already observed in the optimizer path.
 
 All tests use `JAX_PLATFORMS=cpu` and `interpret=True`.
 
+## Fail-closed 512-token compile-only gate
+
+`rocm/probe_query_bounded_gqa_compile.py` is the first GPU promotion gate. It
+has one immutable signature: Qwen3.5-4B BF16 `B=1, T=512, Hq=16, Hkv=4,
+D=256`, including the forward output and an arbitrary-cotangent VJP returning
+`dQ`, `dK`, and `dV`. The probe passes only `ShapeDtypeStruct` inputs to
+`lower()` and `compile()`. It never constructs user Q/K/V/mask/cotangent
+arrays, calls the lowered callable, or calls the compiled executable.
+Nevertheless, `compile()` may dispatch bounded GPU autotuning/profiling kernels
+and allocate compiler-managed buffers. This is GPU work, not a CPU-safe source
+inspection.
+
+The default path imports no JAX and emits an abstract refusal manifest:
+
+```bash
+.venv/bin/python rocm/probe_query_bounded_gqa_compile.py \
+  --output /tmp/query-bounded-gqa-abstract.jsonl
+```
+
+ROCm compilation requires both acknowledgements, a new artifact path, and the
+telemetry wrapper. Use fresh paths for both artifacts:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-t512-compile.telemetry.jsonl \
+  --baseline-seconds 2 \
+  --timeout 300 \
+  --sensor-grace-seconds 60 \
+  --max-junction-temp-c 80 \
+  --max-vram-gib 4 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_compile.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-t512-compile.jsonl
+```
+
+The file is created exclusively with mode `0600`; an existing path is never
+overwritten. Each stage is flushed before the next operation. The ROCm path
+reuses the isolated Pallas probe's bounded environment: device zero only, BFC
+growth allocation capped at a 0.75 fraction, unified-memory and allocator
+bypasses rejected, and command buffers forced off. It also holds
+`guarded_qwen35_rocm_process` across backend initialization and compilation and
+rechecks the current boot journal before releasing the guard.
+
+The final artifact contains StableHLO and optimized-HLO hashes, custom-call
+counts, and exact named Pallas attribution for the one forward, one dQ, and one
+dK/dV boundary, plus compiler memory and cost analysis where available. Each
+dialect must expose exactly three Pallas/Triton calls, each expected name must
+belong to exactly one of those calls, every call must have exactly one expected
+name, and no outer HLO `while` may remain. A mismatch fails closed after
+preserving the metadata. "Compile-only" means that the returned model callable
+is not invoked; it does not mean no GPU kernels run during compilation, nor is
+it evidence of numerical correctness or runtime watchdog safety.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
 all gates pass in fresh, profiler-controlled processes:
 
 1. Compile only the Qwen shape at T=512 and inspect the generated artifacts as
-   described above. Compilation must not initialize a running benchmark.
+   described above. The returned attention executable must not be invoked.
 2. Run forward-only at 512, 1K, 2K, 4K, 8K, 16K, 24K, and 32K, comparing finite
    outputs and sampled rows to a bounded reference.
 3. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
