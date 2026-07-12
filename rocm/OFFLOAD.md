@@ -123,3 +123,61 @@ This case contains no optimizer update, model, overlap, or production-sized
 state. It promotes nothing until its committed source, private child artifact,
 telemetry, and post-exit cleanup receive independent audits. A passing result
 only authorizes larger 64 MiB and exact 131.65625 MiB transfer gates.
+
+### ROCm 7.2.4 smoke8 result
+
+The smoke gate passed from clean commit `bf910f26` on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. The manifest's probe, offload-manager,
+and safety-helper SHA-256 values match the committed sources. Both exact 4 MiB
+BF16 leaves were placed in `pinned_host` memory with their recorded shardings,
+Variable identities, and unselected count sentinel unchanged. After a final
+stage-back, their complete host SHA-256 values matched the deterministic
+oracles exactly; the terminal re-offload restored the exact pinned-host phase.
+
+The timed 8 MiB H2D stage-back took 2.143351 ms (3.64499 GiB/s), and D2H
+re-offload took 1.344391 ms (5.81118 GiB/s). Their combined 3.487742 ms round
+trip corresponds to 4.47998 GiB/s. The following already-synchronized tuple
+barriers took only 17.187 us and 9.240 us, proving that the manager methods did
+not leave material transfer work outstanding.
+
+JAX allocator accounting changed from 8,388,864 B at the device-resident
+plateau to 256 B at every offloaded plateau. Every stage/re-offload transition
+moved exactly 8,388,608 B, exceeding the 95% gate. The BFC pool stayed at
+16,777,216 B and was reused without growth. Conversely, sysfs physical VRAM
+stayed exactly 728,764,416 B across every 500 ms plateau; GTT rose by only
+8,192 B after the first offload and then stayed constant. This proves reusable
+allocator capacity, not physical-page release. The distinction matters: BFC
+retention is compatible with avoiding an in-process allocator OOM even though
+system VRAM accounting does not fall.
+
+The profiler completed in 36.952576 s with return code zero. It recorded 40
+baseline, one preflight, and 679 measured samples at a nominal 50 ms interval.
+Observed maxima were 728,764,416 B physical VRAM, 50 C junction temperature,
+and 129 W power. Host-available memory stayed at or above 62,265,901,056 B and
+swap remained zero. Temperature and power first became jointly readable 4.490
+s after measured sampling began, within the 15 s grace, and neither was
+missing afterwards. The longest measured-sample gap was 85.758 ms.
+
+All eight child journal checkpoints, preflight/postflight, profiler driver
+checks, and a separate operator postcheck were clean; `/dev/kfd` and the AMD
+render node were unowned and the card returned to runtime suspend. All
+artifacts are mode `0600`:
+
+- `/tmp/optimizer-moment-offload-smoke8-boot54ccf56c-run1.jsonl`
+- `/tmp/optimizer-moment-offload-smoke8-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/optimizer-moment-offload-smoke8-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`d7d17a15795abfdf4813bf29fbb6ac136ed593beeb90f895be1d6b3998c5c720`,
+`63e73fcfd3d461014c22d1e598974fc90c574c427b0f43bac9f0a92f3f33bbb8`,
+and `0379201bcf3481ce8f6f05f4f31ef2afc8cd992d4d259fafd703e455c960e4f8`.
+
+At the same measured small-transfer rates, the full 131.65625 MiB moment tree
+would take approximately 35.27 ms H2D plus 22.12 ms D2H, or 57.40 ms per
+round trip. That is a work-linear inference, not a production estimate:
+larger transfers may use PCIe more efficiently, while 804 leaves add manager
+validation overhead. The earlier 20--25 GiB/s assumption is not supported by
+this smoke result. Offload remains an emergency capacity lever, not a speed
+optimization, and should not be wired unless a 64 MiB gate and the exact
+804-leaf gate pass and SFT/GRPO is demonstrably within about 132 MiB of an
+allocator boundary.
