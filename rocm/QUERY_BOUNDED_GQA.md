@@ -1,8 +1,8 @@
 # Query-bounded native GQA prototype
 
-Status: CPU/Pallas-interpret correctness plus exact T=512 guarded ROCm compile
-and one single-forward runtime promotion. Only the deterministic analytic input
-below has executed; the prototype is not connected to the model dispatcher.
+Status: CPU/Pallas-interpret correctness plus exact T=512 guarded ROCm compile,
+analytic single-forward, and factorized nonzero candidate/replay promotion. The
+prototype is not connected to the model dispatcher.
 
 The prototype in `skyrl/tx/kernels/query_bounded_gqa.py` is the next safe
 attention architecture for Qwen3.5-4B's `B=1, Hq=16, Hkv=4, D=256` training
@@ -344,7 +344,7 @@ This promotes only one all-valid analytic forward at T=512. It does not
 promote replay, nonzero Q/K, random inputs, padding, a GPU reference, backward,
 larger buckets, or model integration.
 
-## Pending exact T=512 nonzero replay gate
+## Exact T=512 nonzero replay gate
 
 `rocm/probe_query_bounded_gqa_replay.py` is a separate next-rung probe. Its
 default path imports no JAX and emits only an abstract refusal. The guarded
@@ -391,8 +391,56 @@ and final postflight.
 
 This probe has no GPU reference, device-side error reduction, command-buffer
 replay, backward work, padding case, recompilation, or model integration. It
-has not run on the accelerator yet and promotes nothing until its artifacts
-and telemetry receive an independent audit.
+promotes nothing until its artifacts and telemetry receive an independent
+audit.
+
+### ROCm 7.2.4 replay result
+
+The gate passed from clean commit `3361d15d` on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. The artifact's probe and delegated
+runtime-probe SHA-256 values match the committed source. Lowering took
+0.274011 s and compilation took 2.054230 s. StableHLO and optimized HLO each
+contained exactly one custom call, targeted only
+`__gpu$xla.gpu.triton`, with one forward marker, no dQ/dK-dV marker, and no
+outer `while`. Their SHA-256 values were
+`cee355417f5e3220893f3f4ddd85299cfdb055e46e9fe3d6b4e8de4ce9fb3b62`
+and `2a56b206f4c424e18ba9c415ca172782e2622682bca5b830094d0e5671489643`.
+
+Compiler analysis reported 6,293,504 B of arguments, 4,194,304 B of output,
+and 33,024 B of temporary storage (10,520,832 B combined). The candidate took
+6.275332 ms and the ordinary replay took 0.993285 ms. Both produced the same
+BF16 bytes, with output SHA-256
+`764e3416be5ae78a889dff83748da180e0377b4081ce8ac9a26a5ccffaf4ab2f`.
+Against the independent FP32 host oracle, both had relative L2 0.002079095,
+cosine 0.999966979, mean absolute error 0.000062428, and maximum absolute error
+0.001205862. Final counters were exactly two forward attempts/completions, one
+candidate attempt/completion, one replay attempt/completion, and zero lowered
+callable invocations.
+
+The profiler completed in 28.703052 s with return code zero. Observed physical
+VRAM peaked at 765,743,104 B and swap remained zero. Temperature and power
+became readable 3.920438 s after measured sampling began, before backend-ready,
+and all subsequent samples remained readable through compile and both
+launches; their observed maxima were 49 C and 130 W. Candidate and replay began
+9.825239 s and 14.974710 s after the first readable sensor sample. These are
+sampled maxima, not continuous guarantees: the nominal interval was 100 ms,
+the longest gap was 151.834 ms, and neither sub-7-ms dispatch was guaranteed to
+contain a sample.
+
+All seven child journal checkpoints, its preflight/postflight, and the
+profiler's periodic/final driver checks were clean. A separate, unarchived
+point-in-time operator postcheck found `/dev/kfd` and the AMD render node
+unowned and the card in runtime suspend. All artifacts are mode `0600`:
+
+- `/tmp/query-bounded-gqa-t512-replay-boot54ccf56c-run1.jsonl`
+- `/tmp/query-bounded-gqa-t512-replay-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/query-bounded-gqa-t512-replay-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+Independent audits approved the 29-record child artifact and 286-sample
+telemetry. This promotes only all-valid, forward-only T=512 with dense nonzero
+but deliberately factorized seeded inputs and one ordinary replay. It does not
+promote fully IID per-feature inputs, padding, backward, a GPU reference,
+larger buckets, latency distributions, or model integration.
 
 ## GPU promotion gates
 
@@ -403,8 +451,8 @@ all gates pass in fresh, profiler-controlled processes:
    described above. The returned attention executable must not be invoked.
 2. Run the exact single-forward T=512 analytic gate above. Do not add a replay,
    random input, GPU reference, padding case, or backward work to that process.
-3. In fresh later gates, qualify T=512 replay and the broader forward-only
-   input matrix before advancing through 1K, 2K, 4K, 8K, 16K, 24K, and 32K.
+3. In fresh later gates, qualify the remaining T=512 forward-only input matrix
+   before advancing through 1K, 2K, 4K, 8K, 16K, 24K, and 32K.
 4. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
    gradients where the reference fits.
 5. Repeat padding boundaries including valid lengths 1, `T-1`, and `T`.
