@@ -228,3 +228,66 @@ dispatch overhead is not represented by 64 synthetic leaves. Offload cannot
 be a speed win because it adds both transfers. It remains blocked from trainer
 wiring until the exact 804-leaf gate passes and an end-to-end workload is
 within roughly 132 MiB of an allocator boundary.
+
+### ROCm 7.2.4 exact131 result
+
+The shape-exact gate passed from committed source `feb8b2da` on the same clean
+boot. Its pinned inventory matches `rocm/probe_jax_optimizer.py` at commit
+`81618319` and Qwen3.5-4B revision `851bf6e8`: 402 rank-8 LoRA parameter
+leaves, 34,512,896 elements, two BF16 moment slots, 804 selected leaves, and
+138,051,584 payload bytes (131.65625 MiB). A single host oracle after the final
+stage-back matched all 804 independently coded, distinct SHA-256 values and
+the unselected count sentinel exactly.
+
+The three measured H2D stage-back times were 77.887499, 80.074582, and
+84.596413 ms. Median H2D was therefore 80.074582 ms at only 1.60564 GiB/s.
+The measured D2H re-offloads were 73.210473, 75.604686, and 74.527993 ms;
+median D2H was 74.527993 ms at 1.72513 GiB/s. The median directional times sum
+to 154.602575 ms; the median of the three paired cycle totals was
+155.679268 ms. This is almost four times the 38.99 ms byte-only projection
+from the 64-leaf gate. The 804 small arrays and their per-leaf
+placement/validation cost dominate. The one-time initial offload took
+100.482938 ms and is informational rather than part of the recurring handle
+gate. The largest recurring method still passed the
+100 ms safety gate at 84.596413 ms, and the largest post-method barrier was
+only 0.599498 ms, so the methods were synchronously complete.
+
+Every one of 11 allocator transitions passed the 95% gate. Steady staged
+transitions moved 138,264,320 allocator bytes (131.85913 MiB) between 256 B
+and 138,264,576 B. This is 212,736 B above the exact payload because hundreds
+of separately accounted arrays incur BFC/runtime per-buffer or residual
+allocation overhead; it must not be described as extra payload-byte saving.
+The initial release was 138,297,344 B because construction had a slightly
+larger transient plateau. The BFC pool stayed at 266,338,304 B (254 MiB), so
+this still proves reusable in-process allocator capacity rather than physical
+page release.
+
+The profiler completed in 62.460877 s with return code zero. Maximum physical
+VRAM was 978,370,560 B, maximum junction temperature 53 C, maximum power 130 W,
+minimum host-available memory 61,436,305,408 B, and swap stayed zero. Required
+sensors appeared 7.497 s after measured sampling began, within the 15 s grace,
+and none was later missing. All 15 journal checkpoints and both safety flights
+were clean; `/dev/kfd` was unowned after exit and the card returned to runtime
+suspend.
+
+All artifacts are mode `0600`:
+
+- `/tmp/optimizer-moment-offload-exact131-boot54ccf56c-run1.jsonl`
+- `/tmp/optimizer-moment-offload-exact131-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/optimizer-moment-offload-exact131-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`fbd430a39c6824603522bb7bd132912dd09c94778602d3d52e6510d6c79347cd`,
+`0be99640de41eb3fe7144e45580ec6a007e34244248f02eab4a713dbb45e57c6`,
+and `b3d00e3e641f6a04742a04b506d6d334061cc92c4a913b1e69b6fe949727f329`.
+
+The exact synthetic transfer gate is now technically qualified, but the
+production decision is negative by default: saving about 131.9 MiB of logical
+allocator capacity (only about 0.536% of the 23.984 GiB card) does not justify
+adding roughly 156 ms to every optimizer step on this
+804-leaf representation. Trainer wiring should remain disabled. If a future
+workload is narrowly OOM by this amount, a packed contiguous moment arena must
+first recover the much higher 64-leaf bandwidth, then pass optimizer-equivalence
+and end-to-end step-time gates. Persistent INT8 optimizer moments may be a
+better capacity trade because they avoid PCIe transfers, but require their own
+accuracy and kernel benchmarks.
