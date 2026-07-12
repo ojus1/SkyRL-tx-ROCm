@@ -678,6 +678,88 @@ nonconstant value accumulation. It does not validate nonzero QK logits or
 scale, padding, another chunk or length, replay, backward, model integration,
 or sustained throughput. Those remain separate fresh-process gates.
 
+## C=256 analytic final-chunk length ladder through 32K
+
+`rocm/probe_query_bounded_gqa_chunk_length.py` extends the audited analytic
+case through exactly one fresh process at each of
+`T={1024,2048,4096,8192,16384,24576,32768}`. Every rung uses the final
+256-query range, zero Q/K, an all-valid mask, high-contrast nonlinear V, and
+an independent host FP32 global-prefix oracle. Sequential promotion is
+mandatory; a passing rung authorizes only the next one.
+
+Every independently audited rung lowered and compiled exactly one
+`__gpu$xla.gpu.triton` call with marker `q{T-256}`, exact preserved
+`query_start=T-256` and `query_size=256` metadata, no other bounded-attention
+marker, no outer `while`, and zero alias bytes. Compiler memory remained the
+exact `2,097,152 + 4100*T` argument bytes, 2,097,152 output bytes, and 16,640
+temporary bytes. Each executable was invoked once.
+
+| T | Query marker | Arguments MiB | Candidate ms | Relative L2 | Cosine | Peak VRAM MiB |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | q768 | 6.004 | 6.556177 | 0.001534396 | 0.999998450 | 710.699 |
+| 2,048 | q1792 | 10.008 | 7.292170 | 0.001534178 | see note | 726.691 |
+| 4,096 | q3840 | 18.016 | 8.361281 | 0.001532413 | 0.999998826 | 730.707 |
+| 8,192 | q7936 | 34.031 | 9.700540 | 0.001534719 | 0.999998822 | 762.699 |
+| 16,384 | q16128 | 66.062 | 13.386882 | 0.001453649 | 0.999998944 | 826.695 |
+| 24,576 | q24320 | 98.094 | 17.007953 | 0.001318760 | 0.999999130 | 954.699 |
+| 32,768 | q32512 | 130.125 | 19.581098 | 0.001221016 | 0.999999255 | 954.688 |
+
+The T=2048 artifact's million-element FP32 diagnostic reduction reported
+cosine 1.000010133. Independent audit showed this was a 10.13-ppm reduction
+artifact: its relative L2 implies true cosine at least 0.999998823. Before
+T=4096, commit `26b84570` changed dot products and norms to FP64, retained raw
+cosine, and clipped the gated value to [-1,1]. The reporting-only revision was
+reviewed without rerunning T=2048; all later values in the table are the exact
+FP64 reports. Maximum absolute error was 0.0009765625 through 16K and
+0.0009765923 at 24K/32K, far below the 0.02 gate.
+
+Across the complete ladder, the largest sampled physical VRAM was
+1,001,074,688 B, largest junction temperature 59 C, largest power sample
+217 W, minimum host-available memory 60,949,962,752 B, and swap remained
+zero. Every profiler returned zero, every required child journal checkpoint
+and safety flight was clean, every process exited, `/dev/kfd` and the render
+node became unowned, and the card returned to runtime suspend. Candidate
+latency remained below the 75 ms promotion ceiling at every length.
+
+All artifacts are private mode `0600`. The child/telemetry/summary SHA-256
+triples are:
+
+- T=1024:
+  `d6361de3ea1934a0cf0d53814452c5e22b235fbe0a69267c212990cf884a3b38`,
+  `8451d5b1e7877efd29155d63cb2baa100b8d95fe983efda17a2779e092a1b1c6`,
+  `be5e310e62dfeff65076f397e2995d45fd835b8e8b167771f509eb412d35e654`.
+- T=2048:
+  `022b141a72bfae723673905138e978d6bb7c6f8ae66778d924333e281da9a4c1`,
+  `771b9a970a1de2dea78e21dcfb4ac1c951ca6e6499772d89514ceeab7d3c28e4`,
+  `6cdde6ffe2fdfa28259ea9c444b9bf0722d34cf38f4b8ab681ce3456993e6284`.
+- T=4096:
+  `4646210a2c898dcfdc505dbefedb077326fc252918daa8d738fa2d287b4ef75c`,
+  `344c9a9223b66afe3047bb21f6e39f67dfe642ecdab0cb0690e0370b8e28698a`,
+  `0e174c41b5ba32fc9b45ee8a3ca11f37afd6dfac87d2191f470b90a563e444d7`.
+- T=8192:
+  `dae93da4bd6897f11a2b347b8b779db44d52422fd04d9947c9031612f7e7a441`,
+  `8803d6f7fe43831a266ee0f43b4c71cad5ff804de392923945ce076550e629f5`,
+  `40ee288ed1f52ba987b744cb4f1fd098747ed9a7260c28aad7ccaf4788c8709e`.
+- T=16384:
+  `3ffbc1eb24c94896182a9298f4dec024233fe036f87307e348568179c3eef6c7`,
+  `c20049df35c1cf0fe8fd8d68c67f4099a342ee0534df321bed66e0d641a23ac9`,
+  `75e94adbd2857240acc6692977fbd8182e164cab6b331f4f6434125b1adc9e40`.
+- T=24576:
+  `cf5aee3f05069cf3cec22b3524deeab5561f74f88f383b590f47d9c07599e72c`,
+  `73ad9ac2d5ee6898c992eb75fb85f9c947a113634e2c58ef37c8449b4c2b424a`,
+  `f04eef9c5bc9588ed6f93c8b0d3b702d592de29a34a19fbf3a771f3398720b26`.
+- T=32768:
+  `3fc9bbede1f9d88c940228092cde51da7a74d77755e5604c2d05403c6cf7b5a4`,
+  `d295f781211f453242e31338caedce08eca69ba95a945b0001d8c21c02261a77`,
+  `2594d6fb3b91ebfd033d8a8234740a3edff0ba8a43f48757ad26269058755bc7`.
+
+This promotes the analytic final-C256 chunk only through 32K. It proves global
+causal offsets, grouped-head V mapping, bounded one-dispatch latency, and exact
+memory scaling for that input family. It does **not** promote nonzero Q/K
+logits or scale behavior, padding, earlier query chunks, the full static call
+schedule, replay, backward, model integration, SFT, or GRPO. Those require
+separate fresh-process gates; this ladder authorizes no additional GPU work.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
