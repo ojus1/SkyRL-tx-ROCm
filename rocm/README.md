@@ -56,3 +56,79 @@ Forward/backward, the optimizer step, and checkpoint saves are verified. A
 post-checkpoint generation probe on JAX 0.10.2 hit
 `HSA_STATUS_ERROR_INVALID_PACKET_FORMAT` while loading a LoRA sampler on
 `gfx1100`. Local sampling on this exact combination remains unverified.
+
+## Qwen3.5-4B training experiments
+
+The Qwen3.5 path is deliberately stricter than the original smoke test. Keep
+the display attached to the iGPU and ensure that no process owns `/dev/kfd`.
+The launcher refuses an active AMD display connector, a second ROCm server,
+an occupied port, an unsafe/reused run directory, or an existing KFD owner:
+
+```bash
+./rocm/start_qwen35.sh t64-control
+```
+
+It pins `JAX_PLATFORMS=rocm`, disables JAX preallocation, enables per-layer
+rematerialization, uses rank-8/two-slot LoRA and 64-token loss chunks, and
+disables all XLA GPU command buffers. The latter is required on this machine:
+an exact 402-leaf Qwen3.5 LoRA Adam probe passed repeated GPU updates with
+command buffers disabled, while the earlier full-model failure occurred on
+the second replay of the same optimizer executable.
+
+Run the synthetic end-to-end SFT control from the separate Cookbook
+environment:
+
+```bash
+TINKER_API_KEY=tml-dummy ../tinker-cookbook/.venv/bin/python \
+  rocm/bench_sft.py \
+  --base-url http://127.0.0.1:8001 \
+  --context 64 \
+  --warmup-steps 1 \
+  --measured-steps 5 \
+  --run-id t64-control \
+  --output /tmp/qwen35-t64-control.sft.jsonl
+```
+
+This benchmark uses deterministic synthetic tokens. It measures the local
+HTTP/database/future path plus forward, backward, and Adam; it is throughput
+and stability evidence, not SFT quality evidence.
+
+Use the telemetry wrapper for every GPU experiment. It writes private JSONL
+and summary files, watches fatal AMDGPU journal events once per second, and
+terminates wrapped/deliberately included process trees on configured limits:
+
+```bash
+server_pid="$(fuser 8001/tcp 2>/dev/null | xargs)"
+TINKER_API_KEY=tml-dummy .venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/qwen35-profile.jsonl \
+  --include-pid "server=$server_pid" \
+  --terminate-included-on-safety \
+  --max-junction-temp-c 90 \
+  --max-vram-gib 23 \
+  --min-host-available-gib 4 \
+  --timeout 900 \
+  -- ../tinker-cookbook/.venv/bin/python rocm/bench_sft.py \
+       --context 64 --warmup-steps 1 --measured-steps 5 \
+       --run-id profiled-t64 --output /tmp/profiled-t64.sft.jsonl
+```
+
+The exact optimizer replay probe defaults to CPU. GPU use requires two
+explicit acknowledgements and should only be run in a fresh process with the
+profiler:
+
+```bash
+.venv/bin/python rocm/probe_jax_optimizer.py \
+  --platform gpu --allow-gpu --command-buffer-mode disable --steps 3
+```
+
+ROCm causal self-attention at 512 tokens or longer cannot silently use the
+quadratic XLA fallback. The currently validated Pallas geometry is opt-in with
+`SKYRL_ROCM_PALLAS_ATTENTION=1` and hard-capped at 16,384 tokens. Inputs above
+16K remain refused until query-bounded forward and backward kernels replace the
+monolithic launch. Do not bypass this cap to attempt 32K.
+
+The fused-stage, GDN/FlashQLA adaptation, native-GQA, tied-head, W8/W4/A8/A4,
+activation-checkpoint, and custom-VJP design is in
+[`MEGAKERNELS.md`](MEGAKERNELS.md). The quantized LoRA implementation currently
+in `skyrl/tx/kernels/quantized_lora.py` is a CPU semantic oracle only; it is not
+selected by model code and is not a GPU performance path.
