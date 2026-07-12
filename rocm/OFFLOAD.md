@@ -80,3 +80,46 @@ The unwired manager performs batched tree transfers, but actual pinned-host
 support, physical VRAM release, PCIe throughput, transfer/compute overlap, and
 step-time impact have not yet been measured on this ROCm system. No production
 offload or performance benefit is claimed until those gates pass.
+
+## Guarded gfx1100 smoke gate
+
+`rocm/probe_optimizer_moment_offload.py` starts with one deliberately small
+case: two distinct 4 MiB BF16 `nnx.OptState` leaves under exact `mu` and `nu`
+paths. Its default mode imports no JAX or Flax and emits only an abstract
+refusal. The guarded case performs an initial offload, one timed stage-back and
+re-offload, then an untimed stage-back for a complete host bitwise oracle and a
+final re-offload:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/optimizer-moment-offload-smoke8.telemetry.jsonl \
+  --card card1 \
+  --interval 0.05 \
+  --baseline-seconds 2 \
+  --timeout 60 \
+  --sensor-grace-seconds 5 \
+  --max-junction-temp-c 70 \
+  --max-gpu-power-watts 200 \
+  --max-vram-gib 2 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_optimizer_moment_offload.py \
+       --platform rocm --allow-gpu --case smoke8 \
+       --output /tmp/optimizer-moment-offload-smoke8.jsonl
+```
+
+Each timed manager method and its following synchronization barrier must finish
+below 100 ms and 10 ms respectively. The artifact reports effective binary
+GiB/s, exact placement/identity/sharding/phase proofs, and the final selected
+leaf SHA-256 values. It keeps three accounting claims separate:
+
+- pinned-host placement and a bitwise round trip;
+- reusable JAX allocator capacity, requiring at least 95% of the selected
+  8 MiB to move out of and back into `bytes_in_use` on every transition;
+- physical sysfs VRAM/GTT plateaus, sampled every 50 ms for 500 ms and reported
+  as informational because BFC may retain pages after buffers become reusable.
+
+This case contains no optimizer update, model, overlap, or production-sized
+state. It promotes nothing until its committed source, private child artifact,
+telemetry, and post-exit cleanup receive independent audits. A passing result
+only authorizes larger 64 MiB and exact 131.65625 MiB transfer gates.
