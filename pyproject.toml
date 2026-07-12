@@ -15,7 +15,7 @@ dependencies = [
     "datasets>=4.0.0",
     "pillow>=11.3.0",
     "rich>=14.1.0",
-    "safetensors>=0.6.2",
+    "safetensors>=0.8.0",
     "tokenizers>=0.21.2",
     "transformers>=5.6.1,<=5.8.0",
     "typer>=0.17.4",
@@ -381,4 +381,3 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["skyrl", "skyrl_gym"]
-

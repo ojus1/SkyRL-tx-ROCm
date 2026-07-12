@@ -1,4 +1,6 @@
 import os
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,12 +8,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import safetensors.numpy
 import torch
 from cloudpathlib import CloudPath, implementation_registry
 from cloudpathlib.local import local_s3_implementation
 from flax import nnx
 from jax.tree_util import DictKey
 from peft import PeftModel
+from safetensors import safe_open as real_safe_open
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from skyrl.tinker.types import LoraConfig
@@ -57,9 +61,7 @@ def test_fuse_checkpoint_arrays_numpy_matches_runtime_layout(batch_shape):
     group_sizes = (4, 2, 2)
     num_groups = 3
     arrays = [
-        np.arange(np.prod((*batch_shape, num_groups * size)), dtype=np.float32).reshape(
-            *batch_shape, num_groups * size
-        )
+        np.arange(np.prod((*batch_shape, num_groups * size)), dtype=np.float32).reshape(*batch_shape, num_groups * size)
         + component * 1_000
         for component, size in enumerate(group_sizes)
     ]
@@ -98,11 +100,428 @@ def test_fuse_checkpoint_arrays_numpy_does_not_dispatch_to_jax(monkeypatch):
         ([np.ones((2, 4)), np.ones((2, 3))], (2, 1), "last dim"),
     ],
 )
-def test_fuse_checkpoint_arrays_numpy_rejects_invalid_layout(
-    arrays, group_sizes, error
-):
+def test_fuse_checkpoint_arrays_numpy_rejects_invalid_layout(arrays, group_sizes, error):
     with pytest.raises(ValueError, match=error):
         _fuse_checkpoint_arrays_numpy(arrays, group_sizes)
+
+
+class _TinyCheckpointLeaf(nnx.Module):
+    def __init__(self, shape: tuple[int, ...]):
+        self.kernel = nnx.Param(jnp.zeros(shape, dtype=jnp.float32))
+
+
+class _TinyCheckpointModel(nnx.Module):
+    def __init__(self, *, name: str = "proj", shape: tuple[int, ...] = (2, 3)):
+        setattr(self, name, _TinyCheckpointLeaf(shape))
+
+
+class _TinyTwoCheckpointModel(nnx.Module):
+    def __init__(self):
+        self.first = _TinyCheckpointLeaf((2, 3))
+        self.second = _TinyCheckpointLeaf((2, 3))
+
+
+class _TinyExpertModel(nnx.Module):
+    def __init__(self):
+        self.experts = _TinyCheckpointLeaf((2, 2, 3))
+
+
+class _TinyExpertConfig:
+    def get_num_experts(self):
+        return 2
+
+
+class _TinyFusedLoraLeaf(nnx.Module):
+    def __init__(self):
+        self.lora_A = nnx.Param(jnp.zeros((2, 3), dtype=jnp.float32))
+        self.lora_B = nnx.Param(jnp.zeros((2, 6), dtype=jnp.float32))
+
+
+class _TinyFusedLoraModel(nnx.Module):
+    def __init__(self):
+        self.fused = _TinyFusedLoraLeaf()
+
+
+class _TinyAdapterLeaf(nnx.Module):
+    def __init__(self):
+        self.lora_A = nnx.Param(jnp.zeros((3, 2, 4), dtype=jnp.float32))
+        self.lora_B = nnx.Param(jnp.zeros((3, 4, 3), dtype=jnp.float32))
+
+
+class _TinyAdapterModel(nnx.Module):
+    def __init__(self):
+        self.proj = _TinyAdapterLeaf()
+
+
+class _TrackedSafetensorReader:
+    def __init__(self, reader, shard: str, events: list[tuple]):
+        self._reader = reader
+        self._shard = shard
+        self._events = events
+
+    def keys(self):
+        return self._reader.keys()
+
+    def get_tensor(self, key: str):
+        array = self._reader.get_tensor(key)
+        self._events.append(("load", self._shard, key))
+        payload = array
+        while isinstance(payload.base, np.ndarray):
+            payload = payload.base
+        weakref.finalize(
+            payload,
+            self._events.append,
+            ("release", self._shard, key),
+        )
+        return array
+
+
+def _instrument_safe_open(monkeypatch, events: list[tuple]) -> None:
+    @contextmanager
+    def tracked_safe_open(filename, framework, **kwargs):
+        shard = Path(filename).name
+        events.append(("open", shard, framework, kwargs.copy()))
+        with real_safe_open(filename, framework=framework, **kwargs) as reader:
+            try:
+                yield _TrackedSafetensorReader(reader, shard, events)
+            finally:
+                events.append(("close", shard))
+
+    monkeypatch.setattr(models, "safe_open", tracked_safe_open)
+
+
+def _assert_pread_readers_closed(events: list[tuple]) -> None:
+    opens = [event for event in events if event[0] == "open"]
+    closes = [event for event in events if event[0] == "close"]
+    assert opens
+    assert all(framework == "numpy" and kwargs == {"backend": "pread"} for _, _, framework, kwargs in opens)
+    assert sorted(shard for _, shard, _, _ in opens) == sorted(shard for _, shard in closes)
+
+
+def _write_tiny_safetensor(path: Path, tensors: dict[str, np.ndarray]) -> None:
+    safetensors.numpy.save_file(
+        {key: np.ascontiguousarray(value) for key, value in tensors.items()},
+        path,
+    )
+
+
+def _load_tiny_checkpoint(
+    checkpoint_dir: Path,
+    model: nnx.Module,
+    *,
+    prefix: str = "",
+    config=None,
+    **kwargs,
+) -> None:
+    models.load_safetensors(
+        checkpoint_dir,
+        config or SimpleNamespace(),
+        model,
+        prefix=prefix,
+        **kwargs,
+    )
+
+
+def test_load_safetensors_streams_a_real_tiny_checkpoint(tmp_path, monkeypatch):
+    expected = np.arange(6, dtype=np.float32).reshape(2, 3)
+    _write_tiny_safetensor(
+        tmp_path / "model-00001.safetensors",
+        {"proj.weight": expected.T},
+    )
+    model = _TinyCheckpointModel()
+    events: list[tuple] = []
+    _instrument_safe_open(monkeypatch, events)
+
+    _load_tiny_checkpoint(tmp_path, model)
+
+    np.testing.assert_array_equal(np.asarray(model.proj.kernel[...]), expected)
+    _assert_pread_readers_closed(events)
+
+
+def test_load_safetensors_blocks_and_releases_before_loading_next_payload(tmp_path, monkeypatch):
+    first = np.arange(6, dtype=np.float32).reshape(2, 3)
+    second = first + 100
+    _write_tiny_safetensor(
+        tmp_path / "model.safetensors",
+        {"first.weight": first.T, "second.weight": second.T},
+    )
+    model = _TinyTwoCheckpointModel()
+    events: list[tuple] = []
+    _instrument_safe_open(monkeypatch, events)
+    original_device_put = jax.device_put
+    original_block_until_ready = jax.block_until_ready
+
+    def tracked_device_put(value, *args, **kwargs):
+        events.append(("device_put",))
+        # Do not let the CPU backend retain the reader-owned input via zero-copy.
+        return original_device_put(np.array(value, copy=True), *args, **kwargs)
+
+    def tracked_block_until_ready(value):
+        result = original_block_until_ready(value)
+        events.append(("block_done",))
+        return result
+
+    monkeypatch.setattr(jax, "device_put", tracked_device_put)
+    monkeypatch.setattr(jax, "block_until_ready", tracked_block_until_ready)
+
+    _load_tiny_checkpoint(tmp_path, model)
+
+    first_load = events.index(("load", "model.safetensors", "first.weight"))
+    first_device_put = events.index(("device_put",), first_load)
+    first_block_done = events.index(("block_done",), first_device_put)
+    first_release = events.index(("release", "model.safetensors", "first.weight"))
+    second_load = events.index(("load", "model.safetensors", "second.weight"))
+    assert first_load < first_device_put < first_block_done < first_release < second_load, events
+    np.testing.assert_array_equal(np.asarray(model.first.kernel[...]), first)
+    np.testing.assert_array_equal(np.asarray(model.second.kernel[...]), second)
+    _assert_pread_readers_closed(events)
+
+
+def test_load_safetensors_normalizes_prefix_lazily(tmp_path):
+    expected = np.arange(6, dtype=np.float32).reshape(2, 3) + 10
+    _write_tiny_safetensor(
+        tmp_path / "adapter.safetensors",
+        {"base_model.model.proj.weight": expected.T},
+    )
+    model = _TinyCheckpointModel()
+
+    _load_tiny_checkpoint(tmp_path, model, prefix="base_model.model.")
+
+    np.testing.assert_array_equal(np.asarray(model.proj.kernel[...]), expected)
+
+
+def test_load_safetensors_materializes_only_current_fused_components(tmp_path, monkeypatch):
+    first = np.arange(8, dtype=np.float32).reshape(2, 4)
+    second = np.arange(4, dtype=np.float32).reshape(2, 2) + 100
+    _write_tiny_safetensor(
+        tmp_path / "fused.safetensors",
+        {"first.weight": first.T, "second.weight": second.T},
+    )
+    model = _TinyCheckpointModel(name="fused", shape=(2, 6))
+    expected = _fuse_checkpoint_arrays_numpy([first, second], (2, 1))
+    original_fuse = models._fuse_checkpoint_arrays_numpy
+    events: list[str] = []
+
+    def checked_numpy_fuse(arrays, group_sizes):
+        assert all(isinstance(array, np.ndarray) for array in arrays)
+        events.append("numpy_fuse")
+        return original_fuse(arrays, group_sizes)
+
+    original_device_put = jax.device_put
+
+    def tracked_device_put(*args, **kwargs):
+        events.append("device_put")
+        return original_device_put(*args, **kwargs)
+
+    monkeypatch.setattr(
+        models,
+        "get_fused_info",
+        lambda _model: {"fused": (("first", "second"), (2, 1))},
+    )
+    monkeypatch.setattr(models, "_fuse_checkpoint_arrays_numpy", checked_numpy_fuse)
+    monkeypatch.setattr(jax, "device_put", tracked_device_put)
+
+    _load_tiny_checkpoint(tmp_path, model)
+
+    assert events == ["numpy_fuse", "device_put"]
+    np.testing.assert_array_equal(np.asarray(model.fused.kernel[...]), expected)
+
+
+def test_load_safetensors_preserves_expert_stack_values(tmp_path):
+    expected = np.arange(12, dtype=np.float32).reshape(2, 2, 3)
+    _write_tiny_safetensor(
+        tmp_path / "experts.safetensors",
+        {
+            "experts.0.kernel": expected[0].T,
+            "experts.1.kernel": expected[1].T,
+        },
+    )
+    model = _TinyExpertModel()
+
+    _load_tiny_checkpoint(tmp_path, model, config=_TinyExpertConfig())
+
+    np.testing.assert_array_equal(np.asarray(model.experts.kernel[...]), expected)
+
+
+def test_load_safetensors_preserves_fused_lora_a_and_b_values(tmp_path, monkeypatch):
+    shared_a = np.arange(6, dtype=np.float32).reshape(2, 3)
+    first_b = np.arange(8, dtype=np.float32).reshape(2, 4) + 100
+    second_b = np.arange(4, dtype=np.float32).reshape(2, 2) + 200
+    _write_tiny_safetensor(
+        tmp_path / "adapter.safetensors",
+        {
+            "first.lora_A.weight": shared_a.T,
+            "second.lora_A.weight": shared_a.T,
+            "first.lora_B.weight": first_b.T,
+            "second.lora_B.weight": second_b.T,
+        },
+    )
+    model = _TinyFusedLoraModel()
+    monkeypatch.setattr(
+        models,
+        "get_fused_info",
+        lambda _model: {"fused": (("first", "second"), (2, 1))},
+    )
+
+    _load_tiny_checkpoint(tmp_path, model, skip_lora=False)
+
+    np.testing.assert_array_equal(np.asarray(model.fused.lora_A[...]), shared_a)
+    np.testing.assert_array_equal(
+        np.asarray(model.fused.lora_B[...]),
+        _fuse_checkpoint_arrays_numpy([first_b, second_b], (2, 1)),
+    )
+
+
+def test_load_safetensors_preserves_adapter_slot_values(tmp_path):
+    expected_a = np.arange(4, dtype=np.float32).reshape(2, 2) + 300
+    expected_b = np.arange(6, dtype=np.float32).reshape(2, 3) + 400
+    _write_tiny_safetensor(
+        tmp_path / "adapter.safetensors",
+        {
+            "proj.lora_A.weight": expected_a.T,
+            "proj.lora_B.weight": expected_b.T,
+        },
+    )
+    model = _TinyAdapterModel()
+
+    _load_tiny_checkpoint(
+        tmp_path,
+        model,
+        skip_lora=False,
+        adapter_index=1,
+        rank=2,
+    )
+
+    np.testing.assert_array_equal(np.asarray(model.proj.lora_A[...][1, :, :2]), expected_a)
+    np.testing.assert_array_equal(np.asarray(model.proj.lora_B[...][1, :2, :]), expected_b)
+    assert np.count_nonzero(np.asarray(model.proj.lora_A[...][0])) == 0
+    assert np.count_nonzero(np.asarray(model.proj.lora_A[...][2])) == 0
+    assert np.count_nonzero(np.asarray(model.proj.lora_B[...][0])) == 0
+    assert np.count_nonzero(np.asarray(model.proj.lora_B[...][2])) == 0
+
+
+def test_adapter_arrayref_write_blocks_host_conversion_and_parent_update(monkeypatch):
+    from skyrl.tx.layers.stacked import ArrayRef
+
+    parent = nnx.Param(jnp.zeros((2, 3, 2, 4), dtype=jnp.float32))
+    param = ArrayRef(parent, 1)
+    tensor = np.arange(4, dtype=np.float32).reshape(2, 2)
+    blocked_shapes = []
+    original_block_until_ready = jax.block_until_ready
+
+    def tracked_block_until_ready(value):
+        result = original_block_until_ready(value)
+        blocked_shapes.append(value.shape)
+        return result
+
+    monkeypatch.setattr(jax, "block_until_ready", tracked_block_until_ready)
+
+    models._write_checkpoint_adapter_slice(
+        param,
+        tensor,
+        (1, slice(None), slice(None, 2)),
+    )
+
+    assert blocked_shapes == [(2, 2), (3, 2, 4), (3, 2, 4)]
+    np.testing.assert_array_equal(
+        np.asarray(parent[...][1, 1, :, :2]),
+        tensor,
+    )
+    assert np.count_nonzero(np.asarray(parent[...][0])) == 0
+
+
+def test_load_safetensors_rejects_duplicate_normalized_keys_deterministically(tmp_path, monkeypatch):
+    value = np.arange(6, dtype=np.float32).reshape(3, 2)
+    _write_tiny_safetensor(tmp_path / "z-shard.safetensors", {"proj.weight": value})
+    _write_tiny_safetensor(
+        tmp_path / "a-shard.safetensors",
+        {"base_model.model.proj.weight": value + 1},
+    )
+    model = _TinyCheckpointModel()
+    events: list[tuple] = []
+    _instrument_safe_open(monkeypatch, events)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Duplicate safetensors key after prefix normalization 'proj.weight': "
+            "a-shard.safetensors:'base_model.model.proj.weight' and "
+            "z-shard.safetensors:'proj.weight'"
+        ),
+    ):
+        _load_tiny_checkpoint(tmp_path, model, prefix="base_model.model.")
+
+    _assert_pread_readers_closed(events)
+
+
+def test_load_safetensors_preserves_missing_key_failure(tmp_path):
+    _write_tiny_safetensor(
+        tmp_path / "model.safetensors",
+        {"different.weight": np.ones((3, 2), dtype=np.float32)},
+    )
+
+    with pytest.raises(RuntimeError, match="Missing key while loading .*: proj.weight"):
+        _load_tiny_checkpoint(tmp_path, _TinyCheckpointModel())
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_type", "error"),
+    [
+        ("missing", RuntimeError, "Missing key while loading .*: second.weight"),
+        ("shape", AssertionError, "shape mismatch for second.weight"),
+        ("device_put", RuntimeError, "injected second device_put failure"),
+    ],
+)
+def test_load_safetensors_closes_pread_readers_after_partial_load_failure(
+    tmp_path, monkeypatch, failure, error_type, error
+):
+    first = np.arange(6, dtype=np.float32).reshape(2, 3)
+    second = first + 100
+    tensors = {"first.weight": first.T}
+    if failure == "shape":
+        tensors["second.weight"] = np.ones((4, 2), dtype=np.float32)
+    elif failure == "device_put":
+        tensors["second.weight"] = second.T
+    _write_tiny_safetensor(tmp_path / "model.safetensors", tensors)
+    model = _TinyTwoCheckpointModel()
+    events: list[tuple] = []
+    _instrument_safe_open(monkeypatch, events)
+
+    if failure == "device_put":
+        original_device_put = jax.device_put
+        call_count = 0
+
+        def fail_second_device_put(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("injected second device_put failure")
+            return original_device_put(*args, **kwargs)
+
+        monkeypatch.setattr(jax, "device_put", fail_second_device_put)
+
+    with pytest.raises(error_type, match=error):
+        _load_tiny_checkpoint(tmp_path, model)
+
+    assert ("load", "model.safetensors", "first.weight") in events
+    if failure != "missing":
+        assert ("load", "model.safetensors", "second.weight") in events
+    _assert_pread_readers_closed(events)
+
+
+def test_load_safetensors_never_uses_eager_load_file(tmp_path, monkeypatch):
+    expected = np.arange(6, dtype=np.float32).reshape(2, 3) + 20
+    _write_tiny_safetensor(tmp_path / "model.safetensors", {"proj.weight": expected.T})
+
+    def fail_eager_load(*_args, **_kwargs):
+        raise AssertionError("eager safetensors load_file path was used")
+
+    monkeypatch.setattr(safetensors.numpy, "load_file", fail_eager_load)
+    model = _TinyCheckpointModel()
+
+    _load_tiny_checkpoint(tmp_path, model)
+
+    np.testing.assert_array_equal(np.asarray(model.proj.kernel[...]), expected)
 
 
 def test_residency_probe_forces_command_buffer_disable_last():
@@ -112,17 +531,14 @@ def test_residency_probe_forces_command_buffer_disable_last():
     )
 
     effective = _force_xla_flag(
-        "--unrelated=1 --xla_gpu_enable_command_buffer=CUBLAS "
-        "--xla_gpu_enable_command_buffer=",
+        "--unrelated=1 --xla_gpu_enable_command_buffer=CUBLAS " "--xla_gpu_enable_command_buffer=",
         _DISABLE_COMMAND_BUFFERS,
     )
 
     assert effective.split() == ["--unrelated=1", _DISABLE_COMMAND_BUFFERS]
 
 
-@pytest.mark.parametrize(
-    "name", ["ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"]
-)
+@pytest.mark.parametrize("name", ["ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"])
 def test_residency_probe_rejects_a_different_visible_gpu(monkeypatch, name):
     import argparse
 
@@ -157,9 +573,7 @@ def test_residency_probe_gpu_preflight_requires_headless_unowned_kfd(tmp_path):
         stat_fn=lambda _path: SimpleNamespace(st_mode=stat.S_IFCHR),
         access_fn=lambda *_args: True,
         which_fn=lambda _name: "/usr/bin/fuser",
-        run_fn=lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=1, stdout="", stderr=""
-        ),
+        run_fn=lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="", stderr=""),
     )
 
     assert preflight == {
@@ -192,9 +606,7 @@ def test_residency_probe_gpu_preflight_rejects_existing_kfd_owner(tmp_path):
             stat_fn=lambda _path: SimpleNamespace(st_mode=stat.S_IFCHR),
             access_fn=lambda *_args: True,
             which_fn=lambda _name: "/usr/bin/fuser",
-            run_fn=lambda *_args, **_kwargs: SimpleNamespace(
-                returncode=0, stdout="1234", stderr=""
-            ),
+            run_fn=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="1234", stderr=""),
         )
 
 
@@ -209,9 +621,7 @@ def test_residency_probe_accepts_exact_preallocate85_environment(monkeypatch):
     monkeypatch.setenv("XLA_CLIENT_MEM_FRACTION", "0.85")
     monkeypatch.setenv("SKYRL_QWEN35_MEMORY_MODE", "preallocate85")
 
-    _configure_environment(
-        argparse.Namespace(platform="rocm", allocator_mode="preallocate85")
-    )
+    _configure_environment(argparse.Namespace(platform="rocm", allocator_mode="preallocate85"))
 
     assert os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] == "bfc"
     assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
@@ -243,9 +653,7 @@ def test_residency_probe_accepts_exact_preallocate85_environment(monkeypatch):
         ),
     ],
 )
-def test_residency_probe_rejects_conflicting_allocator_environment(
-    monkeypatch, allocator_mode, environment, error
-):
+def test_residency_probe_rejects_conflicting_allocator_environment(monkeypatch, allocator_mode, environment, error):
     import argparse
 
     from rocm.probe_model_residency import _configure_environment
@@ -263,9 +671,7 @@ def test_residency_probe_rejects_conflicting_allocator_environment(
         monkeypatch.setenv(name, value)
 
     with pytest.raises(RuntimeError, match=error):
-        _configure_environment(
-            argparse.Namespace(platform="rocm", allocator_mode=allocator_mode)
-        )
+        _configure_environment(argparse.Namespace(platform="rocm", allocator_mode=allocator_mode))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -323,10 +729,7 @@ def test_abstract_checkpoint_load_matches_eager_model(tmp_path, dtype):
         return Qwen3_5ForCausalLM(config, dtype=dtype, rngs=nnx.Rngs(0))
 
     def is_base_parameter(path):
-        return not any(
-            name in path
-            for name in ("lora_A", "lora_B", "lora_scaling", "lora_ranks")
-        )
+        return not any(name in path for name in ("lora_A", "lora_B", "lora_scaling", "lora_ranks"))
 
     with jax.set_mesh(mesh), nnx.use_eager_sharding(True):
         eager_model = model_factory()

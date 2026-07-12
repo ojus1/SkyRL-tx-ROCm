@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +18,7 @@ import safetensors.numpy
 from cloudpathlib import CloudPath
 from flax import nnx
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from transformers import PretrainedConfig
 
 from skyrl.tinker.types import LoraConfig
@@ -153,9 +156,7 @@ def _get_shared_lora_A(arrays: list[np.ndarray]) -> np.ndarray:
     return arrays[0]
 
 
-def _fuse_checkpoint_arrays_numpy(
-    arrays: list[np.ndarray], group_sizes: tuple[int, ...]
-) -> np.ndarray:
+def _fuse_checkpoint_arrays_numpy(arrays: list[np.ndarray], group_sizes: tuple[int, ...]) -> np.ndarray:
     """Interleave checkpoint projections without staging host weights on an accelerator.
 
     ``FusedLoRALinear.fuse`` is the runtime JAX operation.  Calling it while
@@ -181,9 +182,7 @@ def _fuse_checkpoint_arrays_numpy(
     reshaped = []
     for array, group_size in zip(arrays, group_sizes):
         if array.shape[:-1] != tuple(batch_shape):
-            raise ValueError(
-                f"checkpoint batch shape {array.shape[:-1]} does not match {tuple(batch_shape)}"
-            )
+            raise ValueError(f"checkpoint batch shape {array.shape[:-1]} does not match {tuple(batch_shape)}")
         if array.shape[-1] != num_groups * group_size:
             raise ValueError(
                 f"checkpoint last dim {array.shape[-1]} != num_groups({num_groups}) * group_size({group_size})"
@@ -192,10 +191,97 @@ def _fuse_checkpoint_arrays_numpy(
     return np.concatenate(reshaped, axis=-1).reshape(*batch_shape, -1)
 
 
+@dataclass(frozen=True)
+class _SafetensorLocation:
+    reader: Any
+    shard: Path
+    source_key: str
+
+
+class _LazySafetensorIndex:
+    """Metadata-only checkpoint index backed by scoped ``safe_open`` readers."""
+
+    def __init__(self, locations: dict[str, _SafetensorLocation]) -> None:
+        self._locations = locations
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._locations
+
+    def load(self, key: str) -> np.ndarray:
+        """Materialize one tensor without retaining it in the index."""
+        location = self._locations[key]
+        return location.reader.get_tensor(location.source_key)
+
+
+def _normalize_safetensor_key(key: str, prefix: str) -> str:
+    """Preserve the existing optional-prefix semantics without silent aliases."""
+    normalized = key.removeprefix(prefix) if prefix else key
+    if not normalized:
+        raise RuntimeError(f"Safetensors key {key!r} becomes empty after removing prefix {prefix!r}")
+    return normalized
+
+
+@contextmanager
+def _open_lazy_safetensor_index(
+    checkpoint_dir: str | os.PathLike,
+    *,
+    prefix: str,
+) -> Iterator[_LazySafetensorIndex]:
+    """Open sorted shards and index keys without materializing tensor payloads."""
+    shard_paths = sorted(Path(checkpoint_dir).glob("*.safetensors"), key=lambda path: path.name)
+    with ExitStack() as stack:
+        locations: dict[str, _SafetensorLocation] = {}
+        for shard in shard_paths:
+            reader = stack.enter_context(safe_open(str(shard), framework="numpy", backend="pread"))
+            for source_key in sorted(reader.keys()):
+                normalized_key = _normalize_safetensor_key(source_key, prefix)
+                previous = locations.get(normalized_key)
+                if previous is not None:
+                    raise RuntimeError(
+                        "Duplicate safetensors key after prefix normalization "
+                        f"{normalized_key!r}: "
+                        f"{previous.shard.name}:{previous.source_key!r} and "
+                        f"{shard.name}:{source_key!r}"
+                    )
+                locations[normalized_key] = _SafetensorLocation(
+                    reader=reader,
+                    shard=shard,
+                    source_key=source_key,
+                )
+        yield _LazySafetensorIndex(locations)
+
+
 def get_expert_key(path: tuple, expert_idx: int) -> str:
     "Get the safetensors key for an expert weight model path."
     path = tuple(s if s != "experts" else f"experts.{expert_idx}" for s in path)
     return ".".join(map(str, path))
+
+
+def _place_checkpoint_tensor(param: nnx.Variable, tensor: np.ndarray) -> None:
+    """Synchronously place one host tensor before its payload is released."""
+    placed = jax.device_put(
+        tensor.astype(param.dtype, copy=False),
+        param.sharding,
+    )
+    jax.block_until_ready(placed)
+    param.set_raw_value(placed)
+    # ArrayRef.set_raw_value also updates its stacked parent asynchronously.
+    jax.block_until_ready(param[...])
+
+
+def _write_checkpoint_adapter_slice(
+    param: nnx.Variable,
+    tensor: np.ndarray,
+    adapter_idx: tuple,
+) -> None:
+    """Synchronously convert and write one adapter slice, including ArrayRef."""
+    arr = param[...]
+    converted = jnp.array(tensor, dtype=arr.dtype)
+    jax.block_until_ready(converted)
+    updated = arr.at[adapter_idx].set(converted)
+    jax.block_until_ready(updated)
+    param[...] = updated
+    jax.block_until_ready(param[...])
 
 
 def load_safetensors(
@@ -217,57 +303,58 @@ def load_safetensors(
 
     fused_info = get_fused_info(model)
 
-    tensors = {}
-    for file in Path(checkpoint_dir).glob("*.safetensors"):
-        tensors.update(safetensors.numpy.load_file(file))
-    tensors = {k.removeprefix(prefix): v for k, v in tensors.items()}
-
-    # unstack_state converts stacked paths (layers._stacked.xxx) to per-layer paths
-    # (layers.0.xxx) with ArrayRef write-through, matching checkpoint key format
-    for path, param in nnx.to_flat_state(unstack_state(model)):
-        if filter_fn is not None and not filter_fn(path):
-            continue
-        key = get_param_key(path)
-        # Skip LoRA parameters if requested
-        if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path or "lora_ranks" in path):
-            continue
-        # Skip connector parameters
-        if skip_lora and is_connector_path(path):
-            continue
-        if "experts" in path:
-            num_experts = config.get_num_experts()
-            assert num_experts is not None
-            expert_keys = [get_expert_key(path, i) for i in range(num_experts)]
-            missing_keys = [expert_key for expert_key in expert_keys if expert_key not in tensors]
-            if missing_keys:
-                raise RuntimeError(f"Missing keys while loading from {checkpoint_dir}: {missing_keys}")
-            tensor = np.stack([tensors[expert_key].T for expert_key in expert_keys], axis=0)
-        elif path[-2] in fused_info:
-            components, group_sizes = fused_info[path[-2]]
-            keys = [get_param_key((*path[:-2], name, path[-1])) for name in components]
-            missing_keys = [k for k in keys if k not in tensors]
-            if missing_keys:
-                raise RuntimeError(f"Missing keys while loading from {checkpoint_dir}: {missing_keys}")
-            weights = [tensors[k].T for k in keys]
-            if path[-1] == "lora_A":
-                tensor = _get_shared_lora_A(weights)
+    with _open_lazy_safetensor_index(checkpoint_dir, prefix=prefix) as tensors:
+        # unstack_state converts stacked paths (layers._stacked.xxx) to per-layer paths
+        # (layers.0.xxx) with ArrayRef write-through, matching checkpoint key format
+        for path, param in nnx.to_flat_state(unstack_state(model)):
+            if filter_fn is not None and not filter_fn(path):
+                continue
+            key = get_param_key(path)
+            # Skip LoRA parameters if requested
+            if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path or "lora_ranks" in path):
+                continue
+            # Skip connector parameters
+            if skip_lora and is_connector_path(path):
+                continue
+            if "experts" in path:
+                num_experts = config.get_num_experts()
+                assert num_experts is not None
+                expert_keys = [get_expert_key(path, i) for i in range(num_experts)]
+                missing_keys = [expert_key for expert_key in expert_keys if expert_key not in tensors]
+                if missing_keys:
+                    raise RuntimeError(f"Missing keys while loading from {checkpoint_dir}: {missing_keys}")
+                expert_weights = [tensors.load(expert_key) for expert_key in expert_keys]
+                tensor = np.stack([weight.T for weight in expert_weights], axis=0)
+                del expert_weights
+            elif path[-2] in fused_info:
+                components, group_sizes = fused_info[path[-2]]
+                keys = [get_param_key((*path[:-2], name, path[-1])) for name in components]
+                missing_keys = [k for k in keys if k not in tensors]
+                if missing_keys:
+                    raise RuntimeError(f"Missing keys while loading from {checkpoint_dir}: {missing_keys}")
+                weights = [tensors.load(k).T for k in keys]
+                if path[-1] == "lora_A":
+                    tensor = _get_shared_lora_A(weights)
+                else:
+                    tensor = _fuse_checkpoint_arrays_numpy(weights, group_sizes)
+                del weights
+            elif key not in tensors:
+                raise RuntimeError(f"Missing key while loading from {checkpoint_dir}: {key}")
             else:
-                tensor = _fuse_checkpoint_arrays_numpy(weights, group_sizes)
-        elif key not in tensors:
-            raise RuntimeError(f"Missing key while loading from {checkpoint_dir}: {key}")
-        else:
-            tensor = tensors[key] if "embed_tokens" in key else tensors[key].T
-        adapter_idx = get_adapter_slice(path, adapter_index, rank)
-        if adapter_idx is not None:
-            # Load into specific adapter slot via ArrayRef write-through
-            arr = param[...]
-            param[...] = arr.at[adapter_idx].set(jnp.array(tensor, dtype=arr.dtype))
-        else:
-            if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
-                tensor = tensor.reshape(param.shape)
-            assert param.shape == tensor.shape, f"shape mismatch for {key}"
-            # ArrayRef.set_raw_value writes through to the stacked parent variable
-            param.set_raw_value(jax.device_put(tensor.astype(param.dtype, copy=False), param.sharding))
+                loaded_tensor = tensors.load(key)
+                tensor = loaded_tensor if "embed_tokens" in key else loaded_tensor.T
+                del loaded_tensor
+            adapter_idx = get_adapter_slice(path, adapter_index, rank)
+            if adapter_idx is not None:
+                # Load into specific adapter slot via ArrayRef write-through
+                _write_checkpoint_adapter_slice(param, tensor, adapter_idx)
+            else:
+                if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+                    tensor = tensor.reshape(param.shape)
+                assert param.shape == tensor.shape, f"shape mismatch for {key}"
+                # ArrayRef.set_raw_value writes through to the stacked parent variable
+                _place_checkpoint_tensor(param, tensor)
+            del tensor
 
 
 def _state_path_string(path: tuple) -> str:
@@ -320,18 +407,14 @@ def assert_model_fully_materialized(model: nnx.Module) -> None:
     ]
     if abstract_paths:
         preview = ", ".join(abstract_paths[:8])
-        raise RuntimeError(
-            f"checkpoint construction left {len(abstract_paths)} abstract state leaves: {preview}"
-        )
+        raise RuntimeError(f"checkpoint construction left {len(abstract_paths)} abstract state leaves: {preview}")
 
 
 def _validate_qwen3_5_abstract_load(config: ModelConfig, model_class: Callable[..., nnx.Module]) -> None:
     from skyrl.tx.models.qwen3_5 import Qwen3_5ForCausalLM
 
     if model_class is not Qwen3_5ForCausalLM:
-        raise ValueError(
-            "abstract_model_load currently supports only the SkyRL Qwen3.5 causal-LM model class"
-        )
+        raise ValueError("abstract_model_load currently supports only the SkyRL Qwen3.5 causal-LM model class")
 
     source_text_config = getattr(config, "text_config", None)
     if getattr(source_text_config, "model_type", None) != "qwen3_5_text":
@@ -345,10 +428,7 @@ def _validate_qwen3_5_abstract_load(config: ModelConfig, model_class: Callable[.
     if layer_types is not None:
         unsupported = sorted(set(layer_types) - {"full_attention", "linear_attention"})
         if unsupported:
-            raise ValueError(
-                "abstract_model_load does not support Qwen3.5 layer types "
-                f"{unsupported}"
-            )
+            raise ValueError("abstract_model_load does not support Qwen3.5 layer types " f"{unsupported}")
 
 
 def load_qwen3_5_safetensors_abstract(

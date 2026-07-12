@@ -8624,7 +8624,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], marker = "extra == 'ray'", specifier = "==2.56.0" },
     { name = "rich", specifier = ">=14.1.0" },
     { name = "s3fs", marker = "extra == 'skyrl-train'" },
-    { name = "safetensors", specifier = ">=0.6.2" },
+    { name = "safetensors", specifier = ">=0.8.0" },
     { name = "setuptools", marker = "extra == 'skyrl-train'" },
     { name = "skyrl", extras = ["skyrl-train"], marker = "extra == 'fsdp'" },
     { name = "skyrl", extras = ["skyrl-train"], marker = "extra == 'megatron'" },
