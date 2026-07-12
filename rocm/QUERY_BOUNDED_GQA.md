@@ -625,6 +625,59 @@ metadata. This result promotes only compilation of the exact C=256/T=512 last
 chunk. It does not authorize executing it or qualify any runtime, other
 query-start, longer length, padding, backward path, or model integration.
 
+### ROCm 7.2.4 C=256 analytic runtime result
+
+The independently audited one-shot runtime gate passed from committed source
+`25c91623` on the same clean boot. It compiled the exact last chunk at
+`query_start=256`, then invoked one checked executable exactly once. Q and K
+were zero, the mask was all-valid, and V used deterministic high-contrast
+nonlinear BF16 values spanning -10.375 through 10.375 and varying across token,
+KV head, and feature. The independent host oracle was the inclusive global
+FP32 prefix mean for positions 256 through 511 with `query_head // 4` GQA
+mapping.
+
+The one synchronized candidate took 6.337533 ms, below both the 75 ms
+promotion ceiling and 100 ms hard limit. Its output relative L2 was
+0.001540165, cosine 0.999984086, maximum absolute error 0.001953125, and mean
+absolute error 0.000335445; every value was finite and shape/dtype/byte counts
+were exact. As a sensitivity control, using the exclusive prefix instead
+would produce relative L2 0.07911505, cosine 0.99686277, and maximum error
+0.04070252, failing the gate decisively. Feature and KV-head permutations also
+fail the CPU gate.
+
+StableHLO and optimized HLO again contained exactly one total/Pallas custom
+call with the exact q256 marker, ROCm Triton target, and query metadata, with
+no other query-bounded marker or outer `while`. Their SHA-256 values were
+`f604694d4de7d8e2c24b1e6dd94adf1cd566736bf99d78d464e91d2d821b8e57`
+and `bce513f87faffbbf5a60c5664956cd80a5c90951f42e5c3b975addae9f63c45a`.
+Compiler memory was the exact 4,196,352 B of arguments, 2,097,152 B of output,
+zero alias bytes, and 16,640 B of temporary storage.
+
+The profiler completed in 34.915053 s with return code zero. Across 40
+baseline, one preflight, and 644 measured samples, maximum physical VRAM was
+745,201,664 B, maximum junction temperature 50 C, maximum power 130 W, minimum
+host-available memory 62,074,712,064 B, and swap stayed zero. Sensors appeared
+within 4.408 s and none was later missing. All eight journal checkpoints and
+both safety flights were clean; `/dev/kfd` was unowned after exit and the card
+returned to runtime suspend.
+
+All artifacts are mode `0600`:
+
+- `/tmp/query-bounded-gqa-c256-t512-runtime-boot54ccf56c-run1.jsonl`
+- `/tmp/query-bounded-gqa-c256-t512-runtime-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/query-bounded-gqa-c256-t512-runtime-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`9bcd4acc151aec402696ba8bbc1176b2efba1c38d3c23cc6920a9b712c99c0c6`,
+`0bda6e8c69f54f9f97787f16c2a8da40458d6ee2576fbfd4178e5bb0b56f992b`,
+and `027b212ac371ef128e7ba14b58415f8e2235ceecce3f9870a65b80e4c8e6c87a`.
+
+This promotes only one BF16 batch-1, all-valid, zero-Q/K C=256 forward chunk
+at T=512. It validates global causal offset, GQA value-head mapping, and
+nonconstant value accumulation. It does not validate nonzero QK logits or
+scale, padding, another chunk or length, replay, backward, model integration,
+or sustained throughput. Those remain separate fresh-process gates.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
