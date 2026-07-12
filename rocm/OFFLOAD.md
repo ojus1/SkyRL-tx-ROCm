@@ -181,3 +181,50 @@ this smoke result. Offload remains an emergency capacity lever, not a speed
 optimization, and should not be wired unless a 64 MiB gate and the exact
 804-leaf gate pass and SFT/GRPO is demonstrably within about 132 MiB of an
 allocator boundary.
+
+### ROCm 7.2.4 mid64 result
+
+The independently audited 64 MiB rung passed from committed source
+`a82bf8fb` on the same clean boot. It covered 64 distinct 1 MiB BF16
+`nnx.OptState` leaves split evenly below exact `mu` and `nu` paths. The exact
+sequence was one initial offload, an excluded warmup pair, three measured
+stage/re-offload pairs, and a final stage/oracle/re-offload. All 64 regenerated
+host SHA-256 values and the count sentinel matched after the final stage-back.
+
+Median H2D stage-back was 9.723314 ms (6.42785 GiB/s), with a 9.885403 ms
+maximum. Median D2H re-offload was 9.231478 ms (6.77031 GiB/s), with a
+9.263938 ms maximum. The median directional times sum to 18.954792 ms. The
+largest of all ten post-method barriers was 51.47 us.
+
+All 11 logical allocator transitions moved exactly 67,108,864 B and alternated
+`bytes_in_use` between 67,109,120 B and 256 B. The BFC pool stayed at
+132,120,576 B. Physical VRAM instead stayed around 805 MiB and GTT around
+21.38 MiB, again proving allocator-reusable capacity rather than return of
+physical pages to the OS.
+
+The profiler completed in 59.667262 s with return code zero. Maximum physical
+VRAM, junction temperature, and power were 844,136,448 B, 52 C, and 137 W;
+minimum host-available memory was 57.60 GiB and swap remained zero. All sensors
+appeared within 7.332 s of measured sampling, none was later missing, every one
+of 15 child journal checkpoints and both safety flights was clean, `/dev/kfd`
+was unowned after exit, and the card returned to runtime suspend.
+
+All three artifacts are mode `0600`:
+
+- `/tmp/optimizer-moment-offload-mid64-boot54ccf56c-run1.jsonl`
+- `/tmp/optimizer-moment-offload-mid64-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/optimizer-moment-offload-mid64-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`349f5dbd22abb9da1be4df4601b02084b83a5f15a157fbd99eec5f90e2ba912e`,
+`23aa1ea815d737cf5c535de8a21fba1640f62b46de99165b74f2bf0e4bfb0b40`,
+and `6780cb5c4e4aa7b11a344846ca93bbb0df3064b6a9aaa0b2bbd50971ca575c27`.
+
+Scaling the measured medians by bytes alone projects the exact 131.65625 MiB
+tree at about 20.00 ms H2D plus 18.99 ms D2H, or 38.99 ms per optimizer step.
+That supersedes the smoke8-only projection but is still not an exact-state
+measurement: the production-shaped tree has 804 leaves, whose validation and
+dispatch overhead is not represented by 64 synthetic leaves. Offload cannot
+be a speed win because it adds both transfers. It remains blocked from trainer
+wiring until the exact 804-leaf gate passes and an end-to-end workload is
+within roughly 132 MiB of an allocator boundary.
