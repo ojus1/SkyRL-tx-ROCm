@@ -271,6 +271,7 @@ async def _run(args: argparse.Namespace, output) -> None:
         "batch_size": 1,
         "warmup_steps": args.warmup_steps,
         "measured_steps": args.measured_steps,
+        "inter_step_delay_seconds": args.inter_step_delay_seconds,
         "lora_rank": args.lora_rank,
         "seed": args.seed,
         "optimizer": {
@@ -367,6 +368,10 @@ async def _run(args: argparse.Namespace, output) -> None:
             output.flush()
             if phase == "measured":
                 durations.append(duration)
+            if step + 1 < total_steps and args.inter_step_delay_seconds:
+                # Excluded from step timing. This is a thermal-safety control
+                # for staged long-context validation, not a throughput mode.
+                await asyncio.sleep(args.inter_step_delay_seconds)
     except BaseException as caught:
         primary_error = caught
 
@@ -413,6 +418,7 @@ def main() -> None:
     parser.add_argument("--context", type=int, required=True)
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--measured-steps", type=int, default=5)
+    parser.add_argument("--inter-step-delay-seconds", type=float, default=0.0)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
@@ -431,6 +437,11 @@ def main() -> None:
         parser.error("--warmup-steps must be at least 1 so cold JIT is never measured as steady state")
     if args.measured_steps < 5:
         parser.error("--measured-steps must be at least 5")
+    if (
+        not math.isfinite(args.inter_step_delay_seconds)
+        or not 0 <= args.inter_step_delay_seconds <= 60
+    ):
+        parser.error("--inter-step-delay-seconds must be finite and in [0, 60]")
     if args.lora_rank <= 0 or not math.isfinite(args.learning_rate) or args.learning_rate < 0:
         parser.error("--lora-rank must be positive and --learning-rate must be nonnegative")
     if (

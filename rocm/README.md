@@ -93,6 +93,11 @@ This benchmark uses deterministic synthetic tokens. It measures the local
 HTTP/database/future path plus forward, backward, and Adam; it is throughput
 and stability evidence, not SFT quality evidence.
 
+For staged long-context capacity checks, `--inter-step-delay-seconds 5` inserts
+an untimed cooling interval between updates. Runs using it remain valid for
+per-step latency and peak-memory checks, but not for continuous-duty throughput
+or thermal comparisons.
+
 The fixed-rollout GRPO learner harness follows the Cookbook's causal shift,
 group-mean advantage, mask-removal, `importance_sampling`, and Adam call order
 without performing sampling or grading. Its smallest nondegenerate control is:
