@@ -18,6 +18,7 @@ _ACCELERATOR_ENV = (
     "HIP_VISIBLE_DEVICES",
     "JAX_PLATFORMS",
     "ROCR_VISIBLE_DEVICES",
+    "SKYRL_ROCM_PALLAS_ATTENTION",
     "XLA_CLIENT_MEM_FRACTION",
     "XLA_FLAGS",
     "XLA_PYTHON_CLIENT_ALLOCATOR",
@@ -61,12 +62,14 @@ def test_default_is_cpu_forced_refusal_without_jax_import():
     assert manifest["requested_context"] == 2048
     assert manifest["effective_context"] == 2048
     assert manifest["batch_size"] == 1
+    assert manifest["attention_backend"] == "xla"
     assert manifest["fixed_preallocation_fraction"] == 0.85
     assert manifest["command_buffers_disabled"] is True
     assert manifest["environment"]["JAX_PLATFORMS"] == "cpu"
     assert manifest["environment"]["XLA_PYTHON_CLIENT_ALLOCATOR"] == "bfc"
     assert manifest["environment"]["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
     assert manifest["environment"]["XLA_CLIENT_MEM_FRACTION"] == "0.85"
+    assert manifest["environment"]["SKYRL_ROCM_PALLAS_ATTENTION"] is None
     assert (
         manifest["environment"]["XLA_FLAGS_effective"]
         == "--xla_gpu_enable_command_buffer="
@@ -88,6 +91,10 @@ def test_default_is_cpu_forced_refusal_without_jax_import():
         ),
         (("--allow-gpu",), "only valid with --platform rocm"),
         (("--allow-download",), "only valid with --platform rocm"),
+        (
+            ("--attention-backend", "pallas"),
+            "only valid with --platform rocm",
+        ),
         (("--context", "0"), "--context must be in"),
         (("--context", "2049"), "contexts above 2048 require"),
         (
@@ -144,6 +151,91 @@ def test_context_bucketing_is_reported_without_compilation():
     manifest = json.loads(result.stdout.splitlines()[0])
     assert manifest["requested_context"] == 1537
     assert manifest["effective_context"] == 2048
+
+
+def test_long_rocm_compile_requires_explicit_pallas_before_preflight(tmp_path):
+    result = _run(
+        "--platform",
+        "rocm",
+        "--allow-gpu",
+        "--context",
+        "2048",
+        "--output",
+        str(tmp_path / "compile.jsonl"),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "effective contexts >=512 require --attention-backend pallas" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("context", "backend", "accepted"),
+    [
+        (384, "xla", True),
+        (385, "xla", False),
+        (385, "pallas", True),
+        (16_384, "pallas", True),
+        (16_385, "pallas", False),
+        (64, "pallas", False),
+    ],
+)
+def test_attention_backend_validates_effective_context_boundaries(
+    tmp_path, context, backend, accepted
+):
+    from rocm.probe_sft_compile import _parse_args
+
+    arguments = [
+        "--platform",
+        "rocm",
+        "--allow-gpu",
+        "--context",
+        str(context),
+        "--attention-backend",
+        backend,
+        "--output",
+        str(tmp_path / f"{context}-{backend}.jsonl"),
+    ]
+    if context > 2048:
+        arguments.append("--allow-large-context")
+
+    if accepted:
+        args = _parse_args(arguments)
+        assert args.attention_backend == backend
+    else:
+        with pytest.raises(SystemExit) as error:
+            _parse_args(arguments)
+        assert error.value.code == 2
+
+
+def test_rocm_pallas_selection_is_fixed_before_jax_import(monkeypatch):
+    import argparse
+
+    from rocm.probe_sft_compile import _configure_environment
+
+    for name in _ACCELERATOR_ENV:
+        monkeypatch.delenv(name, raising=False)
+    effective = _configure_environment(
+        argparse.Namespace(platform="rocm", attention_backend="pallas")
+    )
+
+    assert os.environ["SKYRL_ROCM_PALLAS_ATTENTION"] == "1"
+    assert effective["SKYRL_ROCM_PALLAS_ATTENTION"] == "1"
+
+
+def test_rocm_pallas_selection_rejects_inherited_conflict(monkeypatch):
+    import argparse
+
+    from rocm.probe_sft_compile import _configure_environment
+
+    for name in _ACCELERATOR_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SKYRL_ROCM_PALLAS_ATTENTION", "0")
+
+    with pytest.raises(RuntimeError, match="conflicts with required value '1'"):
+        _configure_environment(
+            argparse.Namespace(platform="rocm", attention_backend="pallas")
+        )
 
 
 def test_output_is_private_exclusive_jsonl(tmp_path):

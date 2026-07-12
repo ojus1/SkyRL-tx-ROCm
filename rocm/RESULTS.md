@@ -228,6 +228,18 @@ These two gates establish allocation and residency feasibility only. They do
 not execute forward/backward, prove compiled temporary placement, or move the
 validated full-model frontier beyond context 1,024.
 
+The first context-2,048 compile-control invocation then completed exact backend
+setup but deliberately stopped during lowering: the attention selector refused
+the quadratic XLA fallback because the probe had not explicitly selected the
+Pallas route. No model-pass callable or optimizer step ran. Peak physical VRAM
+was 22,612,500,480 B, junction temperature was 59 C, swap did not grow, and the
+process returned cleanly to idle without a driver event. The probe now exposes
+an exact attention selector: effective contexts below 512 use `xla`, while
+512--16,384 require explicit `pallas`. This handled control failure is not a
+compile pass. Artifacts are
+`/tmp/bfc85-compile-t2048-1783864343.{jsonl,telemetry.jsonl}` with the telemetry
+summary alongside them.
+
 ## Fixed-rollout GRPO learner control
 
 Revision `31800cf001c0c982e56231f386182f0cb02c163c` completed one cold

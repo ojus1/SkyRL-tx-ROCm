@@ -37,6 +37,8 @@ _DISABLE_COMMAND_BUFFERS = "--xla_gpu_enable_command_buffer="
 _MEMORY_FRACTION = "0.85"
 _MAX_CONTEXT = 32_768
 _DEFAULT_CONTEXT = 2_048
+_PALLAS_REQUIRED_CONTEXT = 512
+_PALLAS_MAX_CONTEXT = 16_384
 
 
 def _utc_now() -> str:
@@ -78,6 +80,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="JaxBackendImpl model construction route used before lowering",
     )
     parser.add_argument(
+        "--attention-backend",
+        choices=("xla", "pallas"),
+        default="xla",
+        help="explicit attention route; effective ROCm contexts >=512 require pallas",
+    )
+    parser.add_argument(
         "--allow-download",
         action="store_true",
         help="allow fetching the pinned model revision when it is absent locally",
@@ -95,12 +103,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--allow-gpu is only valid with --platform rocm")
     if args.platform == "abstract" and args.allow_download:
         parser.error("--allow-download is only valid with --platform rocm")
+    if args.platform == "abstract" and args.attention_backend != "xla":
+        parser.error("--attention-backend pallas is only valid with --platform rocm")
     if args.platform == "rocm" and args.output is None:
         parser.error("--platform rocm requires --output for a clean JSONL artifact")
     if args.context <= 0 or args.context > _MAX_CONTEXT:
         parser.error(f"--context must be in [1, {_MAX_CONTEXT}]")
     if args.context > _DEFAULT_CONTEXT and not args.allow_large_context:
         parser.error("contexts above 2048 require --allow-large-context")
+    effective_context = _round_up_seq_len(args.context)
+    if args.platform == "rocm":
+        if effective_context >= _PALLAS_REQUIRED_CONTEXT and args.attention_backend != "pallas":
+            parser.error(
+                "ROCm effective contexts >=512 require --attention-backend pallas; "
+                "the quadratic XLA fallback is refused"
+            )
+        if args.attention_backend == "pallas" and not (
+            _PALLAS_REQUIRED_CONTEXT <= effective_context <= _PALLAS_MAX_CONTEXT
+            and effective_context % 64 == 0
+        ):
+            parser.error(
+                "--attention-backend pallas requires a 64-aligned effective context "
+                "in [512, 16384]"
+            )
     if args.output is not None and args.output.exists():
         parser.error(f"refusing to overwrite existing output: {args.output}")
     return args
@@ -167,6 +192,9 @@ def _configure_environment(args: argparse.Namespace) -> dict[str, str | None]:
         for name in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"):
             _validate_exact_or_unset(name, "0")
             os.environ[name] = "0"
+        pallas_value = "1" if args.attention_backend == "pallas" else "0"
+        _validate_exact_or_unset("SKYRL_ROCM_PALLAS_ATTENTION", pallas_value)
+        os.environ["SKYRL_ROCM_PALLAS_ATTENTION"] = pallas_value
 
     original_xla_flags = os.environ.get("XLA_FLAGS", "")
     os.environ["JAX_PLATFORMS"] = requested_platform
@@ -180,6 +208,9 @@ def _configure_environment(args: argparse.Namespace) -> dict[str, str | None]:
         "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
         "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES"),
         "GPU_DEVICE_ORDINAL": os.environ.get("GPU_DEVICE_ORDINAL"),
+        "SKYRL_ROCM_PALLAS_ATTENTION": os.environ.get(
+            "SKYRL_ROCM_PALLAS_ATTENTION"
+        ),
         "XLA_PYTHON_CLIENT_ALLOCATOR": os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"],
         "XLA_PYTHON_CLIENT_PREALLOCATE": os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"],
         "XLA_CLIENT_MEM_FRACTION": os.environ["XLA_CLIENT_MEM_FRACTION"],
@@ -567,6 +598,7 @@ def _run_rocm(
             "checkpoint_path": checkpoint_path,
             "resolved_revision": resolved_revision,
             "construction": args.construction,
+            "attention_backend": args.attention_backend,
             "backend_config": config_kwargs,
             "active_adapter": {
                 "index": adapter_index,
@@ -671,6 +703,7 @@ def _execute(
             "effective_context": effective_context,
             "batch_size": 1,
             "construction": args.construction,
+            "attention_backend": args.attention_backend,
             "fixed_preallocation_fraction": float(_MEMORY_FRACTION),
             "command_buffers_disabled": _DISABLE_COMMAND_BUFFERS
             in shlex.split(os.environ["XLA_FLAGS"]),

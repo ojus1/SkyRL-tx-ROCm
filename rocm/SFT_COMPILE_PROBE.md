@@ -3,7 +3,8 @@
 `probe_sft_compile.py` isolates the next context-2,048 capacity gate without
 sending a Tinker request or executing the lowered model pass. Its default path
 forces `JAX_PLATFORMS=cpu`, emits a refusal record, and exits before importing
-JAX. No ROCm run was performed while implementing or testing the probe.
+JAX. The initial implementation was CPU-reviewed before the staged ROCm gates;
+subsequent hardware results are recorded in `RESULTS.md`.
 
 The explicit ROCm path reproduces the normal batch-one SFT lifecycle up to the
 first model pass:
@@ -27,6 +28,13 @@ first model pass:
 
 The compiled callable is never invoked, and `optim_step` is never called.
 Every record carries `model_pass_executable_invocations: 0`.
+
+ROCm effective (bucketed) context 512 and above must explicitly select
+`--attention-backend pallas`; the code refuses the quadratic XLA fallback.
+The isolated 2,048-token Pallas path passed the hardware safety gate, but its
+`dq`/`dk` relative L2 remained about 1.1%, above the 1% numerical promotion
+threshold. A successful compile therefore proves capacity only, not numerical
+promotion for training.
 
 ## Safety contract
 
@@ -76,6 +84,7 @@ run in a fresh process under telemetry:
   --min-host-available-gib 8 --max-swap-gib 0.001 -- \
   .venv/bin/python rocm/probe_sft_compile.py \
     --platform rocm --allow-gpu --context 2048 \
+    --attention-backend pallas \
     --output /tmp/qwen35-sft-compile-t2048.jsonl
 ```
 
