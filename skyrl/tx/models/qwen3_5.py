@@ -50,9 +50,16 @@ def recurrent_gated_delta_rule(
     beta: jax.Array,
     initial_state: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    dtype = query.dtype
+    output_dtype = query.dtype
     query = l2norm(query, axis=-1)
     key = l2norm(key, axis=-1)
+
+    # Match the Transformers/FLA reference: normalize in the input dtype, then
+    # keep the recurrent state and all delta-rule arithmetic in FP32. The
+    # output is cast back, while the cache remains FP32 across decode steps.
+    query, key, value, g, beta = (
+        item.astype(jnp.float32) for item in (query, key, value, g, beta)
+    )
 
     query = query * (1.0 / math.sqrt(query.shape[-1]))
 
@@ -69,16 +76,16 @@ def recurrent_gated_delta_rule(
     v_head_dim = value.shape[3]
 
     if initial_state is None:
-        initial_state = jnp.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=dtype)
+        initial_state = jnp.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
     else:
-        initial_state = initial_state.astype(dtype)
+        initial_state = initial_state.astype(jnp.float32)
 
     def step_fn(
         state: jax.Array,
         inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
     ) -> tuple[jax.Array, jax.Array]:
         q_t, k_t, v_t, g_t, beta_t = inputs
-        decay = jnp.exp(g_t).astype(dtype)[..., None, None]
+        decay = jnp.exp(g_t)[..., None, None]
         state = state * decay
         kv_mem = jnp.sum(state * k_t[..., :, None], axis=-2)
         delta = (v_t - kv_mem) * beta_t[..., None]
@@ -87,8 +94,8 @@ def recurrent_gated_delta_rule(
         return state, out_t
 
     final_state, outputs = jax.lax.scan(step_fn, initial_state, (query, key, value, g, beta))
-    outputs = jnp.swapaxes(outputs, 0, 1).astype(dtype)
-    return outputs, final_state.astype(dtype)
+    outputs = jnp.swapaxes(outputs, 0, 1).astype(output_dtype)
+    return outputs, final_state
 
 
 def chunk_gated_delta_rule(
@@ -136,9 +143,15 @@ def chunk_gated_delta_rule(
         output: [B, T, H, D_v] attention output (O)
         final_state: [B, H, D_k, D_v] final recurrent state (S)
     """
-    dtype = query.dtype
+    output_dtype = query.dtype
     query = l2norm(query, axis=-1)
     key = l2norm(key, axis=-1)
+
+    # The reference fallback and the optimized FLA contract accumulate the
+    # delta rule/state in FP32 even for BF16 model inputs.
+    query, key, value, g, beta = (
+        item.astype(jnp.float32) for item in (query, key, value, g, beta)
+    )
 
     # [B, T, H, D] -> [B, H, T, D] for easier chunk processing
     query = jnp.transpose(query, (0, 2, 1, 3))
@@ -175,10 +188,10 @@ def chunk_gated_delta_rule(
 
     # γ[j] = exp(cumsum(g)[j]): cumulative decay
     g_cumsum = jnp.cumsum(g, axis=-1)
-    gamma = jnp.exp(g_cumsum).astype(dtype)
+    gamma = jnp.exp(g_cumsum)
 
     # Γ[i,j] = γ[i]/γ[j] = exp(g_cumsum[i] - g_cumsum[j]) for i >= j (decay-aware causal mask)
-    decay_mask = jnp.tril(jnp.exp(jnp.tril(g_cumsum[..., :, None] - g_cumsum[..., None, :]))).astype(dtype)
+    decay_mask = jnp.tril(jnp.exp(jnp.tril(g_cumsum[..., :, None] - g_cumsum[..., None, :])))
 
     # L = strictLower(diag(β)(Γ ⊙ K K^T))
     L = jnp.tril((k_beta @ jnp.swapaxes(key, -1, -2)) * decay_mask, k=-1)
@@ -191,9 +204,9 @@ def chunk_gated_delta_rule(
 
     # Initialize recurrent state S
     if initial_state is None:
-        state = jnp.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=dtype)
+        state = jnp.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
     else:
-        state = initial_state.astype(dtype)
+        state = initial_state.astype(jnp.float32)
 
     def chunk_step(
         S: jax.Array,
@@ -237,9 +250,9 @@ def chunk_gated_delta_rule(
     # Reshape outputs: [C, B, H, L, D_v] -> [B, T, H, D_v]
     outputs = jnp.transpose(outputs, (1, 2, 0, 3, 4))
     outputs = outputs.reshape(batch_size, num_heads, total_seq_len, v_head_dim)
-    outputs = jnp.transpose(outputs[:, :, :seq_len, :], (0, 2, 1, 3)).astype(dtype)
+    outputs = jnp.transpose(outputs[:, :, :seq_len, :], (0, 2, 1, 3)).astype(output_dtype)
 
-    return outputs, final_state.astype(dtype)
+    return outputs, final_state
 
 
 class Qwen3_5RMSNorm(nnx.Module):
@@ -254,8 +267,15 @@ class Qwen3_5RMSNorm(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        out = x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return out * (1.0 + self.weight[...].astype(x.dtype))
+        # Match Transformers exactly: both the variance reduction and the
+        # residual-style ``1 + weight`` multiply are FP32 operations.  Casting
+        # either one to the model dtype first creates measurable BF16 drift at
+        # every decoder norm.
+        output_dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        variance = jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True)
+        normalized = x_f32 * jax.lax.rsqrt(variance + self.eps)
+        return (normalized * (1.0 + self.weight[...].astype(jnp.float32))).astype(output_dtype)
 
 
 class Qwen3_5RMSNormGated(nnx.Module):
@@ -264,15 +284,20 @@ class Qwen3_5RMSNormGated(nnx.Module):
         self.eps = eps
         self.weight = Param(
             dim,
-            dtype=dtype,
+            # The official checkpoint stores gated-norm weights in FP32 even
+            # when the rest of the model is BF16.
+            dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(nnx.initializers.ones_init(), (None,)),
             rngs=rngs,
         )
 
     def __call__(self, hidden_states: jax.Array, gate: jax.Array) -> jax.Array:
-        dtype = hidden_states.dtype
-        out = hidden_states * jax.lax.rsqrt(jnp.mean(hidden_states * hidden_states, axis=-1, keepdims=True) + self.eps)
-        return out * self.weight[...].astype(dtype) * nnx.silu(gate)
+        output_dtype = hidden_states.dtype
+        hidden_states_f32 = hidden_states.astype(jnp.float32)
+        variance = jnp.mean(hidden_states_f32 * hidden_states_f32, axis=-1, keepdims=True)
+        normalized = hidden_states_f32 * jax.lax.rsqrt(variance + self.eps)
+        gated = self.weight[...] * normalized.astype(output_dtype) * nnx.silu(gate.astype(jnp.float32))
+        return gated.astype(output_dtype)
 
 
 class Qwen3_5Attention(nnx.Module):
@@ -440,7 +465,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         )
         self.A_log = Param(
             self.num_v_heads,
-            dtype=dtype,
+            # Preserve the checkpoint's FP32 decay parameter.
+            dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(
                 lambda key, shape, dtype: jnp.log(
                     jax.random.uniform(key, shape, dtype=dtype, minval=1e-3, maxval=16.0)
@@ -468,7 +494,12 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         # [kernel, 1, channels] -> [channels, 1, kernel]
         return self.conv1d_weight[...].transpose((2, 1, 0))
 
-    def _causal_conv(self, x: jax.Array, conv_state: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
+    def _causal_conv(
+        self,
+        x: jax.Array,
+        conv_state: jax.Array | None = None,
+        attention_mask: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         # x: [B, C, T], optional conv_state: [B, C, K]
         kernel = self._get_conv_kernel()
         seq_len = x.shape[-1]
@@ -476,10 +507,28 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         if conv_state is None:
             left_pad = self.conv_kernel_size - 1
             x_full = jnp.pad(x, ((0, 0), (0, 0), (left_pad, 0)))
+
+            if attention_mask is None:
+                new_state = x_full[..., -self.conv_kernel_size :]
+            else:
+                # Each sequence needs the window ending at its final valid token,
+                # rather than the physical suffix shared by a right-padded batch.
+                state_source = jnp.pad(x, ((0, 0), (0, 0), (self.conv_kernel_size, 0)))
+                valid_lengths = jnp.sum(attention_mask, axis=-1, dtype=jnp.int32)
+                state_indices = valid_lengths[:, None, None] + jnp.arange(self.conv_kernel_size)[None, None, :]
+                state_indices = jnp.broadcast_to(
+                    state_indices,
+                    (x.shape[0], x.shape[1], self.conv_kernel_size),
+                )
+                new_state = jnp.take_along_axis(state_source, state_indices, axis=-1)
         else:
             x_full = jnp.concatenate([conv_state, x], axis=-1)
+            new_state = x_full[..., -self.conv_kernel_size :]
+            if attention_mask is not None:
+                # A masked single-token cache update is an identity transition.
+                update_mask = attention_mask[:, -1, None, None].astype(jnp.bool_)
+                new_state = jnp.where(update_mask, new_state, conv_state)
 
-        new_state = x_full[..., -self.conv_kernel_size :]
         out_full = jax.lax.conv_general_dilated(
             x_full,
             kernel,
@@ -513,9 +562,10 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         b = self.in_proj_b(hidden_states, adapter_indices=adapter_indices)
         a = self.in_proj_a(hidden_states, adapter_indices=adapter_indices)
 
-        mixed_qkv, new_conv_state = self._causal_conv(mixed_qkv, conv_state)
+        mixed_qkv, new_conv_state = self._causal_conv(mixed_qkv, conv_state, attention_mask)
 
         mixed_qkv = mixed_qkv.transpose((0, 2, 1))
+        mixed_qkv = apply_mask_to_padding_states(mixed_qkv, attention_mask)
         q_end = self.key_dim
         k_end = self.key_dim * 2
         query_flat = mixed_qkv[..., :q_end]
@@ -530,6 +580,10 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         g = -jnp.exp(self.A_log[...].astype(jnp.float32)) * jax.nn.softplus(
             a.astype(jnp.float32) + self.dt_bias[...].astype(jnp.float32)
         )
+        if attention_mask is not None:
+            transition_mask = attention_mask[..., None]
+            beta = beta * transition_mask.astype(beta.dtype)
+            g = g * transition_mask.astype(g.dtype)
 
         if self.num_v_heads // self.num_k_heads > 1:
             repeats = self.num_v_heads // self.num_k_heads
@@ -652,6 +706,28 @@ class Qwen3_5DecoderLayer(nnx.Module):
         return hidden_states, updated_kv, new_conv_state, new_recurrent_state
 
 
+def _run_training_decoder_layer(
+    layer: Qwen3_5DecoderLayer,
+    hidden_states: jax.Array,
+    attention_mask: jax.Array,
+    positions: jax.Array,
+    adapter_indices: jax.Array | None,
+) -> jax.Array:
+    """Run one decoder layer without materializing inference cache outputs."""
+    hidden_states, _, _, _ = layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        positions=positions,
+        adapter_indices=adapter_indices,
+    )
+    return hidden_states
+
+
+# NNX transforms do not accept bound methods. Keeping the layer as an explicit
+# argument also makes its parameters visible to autodiff inside the remat region.
+_remat_training_decoder_layer = nnx.remat(_run_training_decoder_layer, graph_updates=False)
+
+
 class Qwen3_5TextModel(nnx.Module):
 
     def __init__(self, config: Qwen3_5Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
@@ -714,6 +790,24 @@ class Qwen3_5TextModel(nnx.Module):
 
             has_cache = kv_cache is not None
             has_conv_cache = has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
+
+            # Cacheless training never needs the large inference-state outputs.
+            # When enabled, rematerialize each heterogeneous layer independently.
+            # Prefill/decode inference stays on the cache-producing path.
+            if is_training and not has_cache:
+                training_layer = (
+                    _remat_training_decoder_layer
+                    if self.config.gradient_checkpointing
+                    else _run_training_decoder_layer
+                )
+                hidden_states = training_layer(
+                    layer,
+                    hidden_states,
+                    attention_mask,
+                    positions,
+                    adapter_indices,
+                )
+                continue
 
             if self.layer_types[layer_idx] == "full_attention":
                 layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if has_cache else None
