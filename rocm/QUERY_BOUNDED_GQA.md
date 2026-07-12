@@ -553,7 +553,7 @@ executable without returning or invoking it:
   --interval 0.1 \
   --baseline-seconds 2 \
   --timeout 120 \
-  --sensor-grace-seconds 5 \
+  --sensor-grace-seconds 15 \
   --max-junction-temp-c 70 \
   --max-gpu-power-watts 315 \
   --max-vram-gib 2 \

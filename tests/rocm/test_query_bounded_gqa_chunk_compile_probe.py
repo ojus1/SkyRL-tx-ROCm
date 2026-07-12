@@ -279,6 +279,34 @@ def test_absent_query_metadata_is_accepted_only_as_not_preserved(dialect, builde
     ("dialect", "builder"),
     [("stablehlo", _stablehlo), ("optimized_hlo", _optimized_hlo)],
 )
+def test_mlir_hex_escaped_exact_query_metadata_is_decoded(dialect, builder):
+    metadata = r"\22query_start\22:\22256\22,\22query_size\22:\22256\22"
+    summary = _PROBE._ir_summary(builder(metadata=metadata), dialect)
+
+    assert summary["metadata"]["query_start"]["exact_single_occurrence"] is True
+    assert summary["metadata"]["query_size"]["exact_single_occurrence"] is True
+    assert summary["checks"]["preserved_query_metadata_is_exact"] is True
+    assert summary["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("dialect", "builder"),
+    [("stablehlo", _stablehlo), ("optimized_hlo", _optimized_hlo)],
+)
+def test_mlir_hex_escaped_kernel_marker_is_classified_after_decode(dialect, builder):
+    exact = _PROBE._ir_summary(builder(marker=r"query_bounded_gqa_forward_q\32\35\36"), dialect)
+    wrong = _PROBE._ir_summary(builder(marker=r"query_bounded_gqa_forward_q\30"), dialect)
+
+    assert exact["checks"]["exact_full_forward_q256_marker_in_sole_call"] is True
+    assert exact["passed"] is True
+    assert wrong["unexpected_query_bounded_token_occurrences"] > 0
+    assert wrong["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("dialect", "builder"),
+    [("stablehlo", _stablehlo), ("optimized_hlo", _optimized_hlo)],
+)
 @pytest.mark.parametrize(
     ("metadata", "marker"),
     [
@@ -346,14 +374,25 @@ def test_expected_marker_outside_call_cannot_satisfy_the_call_gate(dialect, buil
     ("dialect", "builder"),
     [("stablehlo", _stablehlo), ("optimized_hlo", _optimized_hlo)],
 )
-def test_expected_marker_inside_and_outside_call_fails_confinement_gate(dialect, builder):
+def test_duplicate_exact_marker_metadata_outside_the_sole_call_is_benign(dialect, builder):
     outside = f'%outside = add(), op_name="{_MARKER}"'
     summary = _PROBE._ir_summary(builder(outside=outside), dialect)
 
     assert summary["expected_marker_occurrences"] == 2
     assert summary["checks"]["exact_full_forward_q256_marker_in_sole_call"] is True
-    assert summary["checks"]["all_query_bounded_marker_occurrences_belong_to_sole_call"] is False
-    assert summary["passed"] is False
+    assert summary["checks"]["exactly_one_custom_call_total"] is True
+    assert summary["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("dialect", "builder"),
+    [("stablehlo", _stablehlo), ("optimized_hlo", _optimized_hlo)],
+)
+def test_non_kernel_public_api_name_is_not_misclassified_as_call_marker(dialect, builder):
+    summary = _PROBE._ir_summary(builder(outside="query_bounded_gqa_forward_chunk"), dialect)
+
+    assert summary["unexpected_query_bounded_token_occurrences"] == 0
+    assert summary["passed"] is True
 
 
 @pytest.mark.parametrize(

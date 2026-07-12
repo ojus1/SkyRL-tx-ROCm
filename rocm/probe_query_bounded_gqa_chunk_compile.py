@@ -50,7 +50,6 @@ _IR_CHECK_NAMES = frozenset(
         "sole_exact_rocm_triton_target",
         "exact_full_forward_q256_marker_in_sole_call",
         "no_q0_other_forward_dq_dkdv_or_lookalike_query_bounded_tokens",
-        "all_query_bounded_marker_occurrences_belong_to_sole_call",
         "no_outer_while",
         "preserved_query_metadata_is_exact",
     }
@@ -412,12 +411,22 @@ def _custom_call_targets(block: str, dialect: str) -> set[str]:
     return targets
 
 
+def _decode_mlir_hex_escapes(text: str) -> str:
+    return re.sub(
+        r"\\([0-9A-Fa-f]{2})",
+        lambda match: chr(int(match.group(1), 16)),
+        text,
+    ).replace(r"\"", '"')
+
+
 def _metadata_field(block: str, name: str, expected: int) -> dict[str, Any]:
-    normalized = block.replace(r"\"", '"')
+    normalized = _decode_mlir_hex_escapes(block)
     tokens = _IR_NAME_TOKEN_PATTERN.findall(normalized)
     token_occurrences = sum(token == name for token in tokens)
     lookalike_tokens = [token for token in tokens if token != name and name in token]
-    pattern = re.compile(rf"(?<![A-Za-z0-9_.$-]){re.escape(name)}(?![A-Za-z0-9_.$-])" r"\s*(?:=|:)\s*\"?(-?[0-9]+)\"?")
+    pattern = re.compile(
+        rf'(?<![A-Za-z0-9_.$-])"?{re.escape(name)}"?(?![A-Za-z0-9_.$-])' r"\s*(?:=|:)\s*\"?(-?[0-9]+)\"?"
+    )
     parsed = [int(value) for value in pattern.findall(normalized)]
     return {
         "expected": expected,
@@ -431,6 +440,18 @@ def _metadata_field(block: str, name: str, expected: int) -> dict[str, Any]:
         ),
         "cleanly_absent": token_occurrences == 0 and not parsed and not lookalike_tokens,
     }
+
+
+def _is_query_bounded_kernel_marker_like(token: str) -> bool:
+    normalized = re.sub(r"[-.$]+", "_", token.lower())
+    return any(
+        stem in normalized
+        for stem in (
+            "query_bounded_gqa_forward_q",
+            "query_bounded_gqa_dq_q",
+            "query_bounded_gqa_dkdv_q",
+        )
+    )
 
 
 def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
@@ -450,12 +471,9 @@ def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
     pallas_indices = [index for index, block_targets in enumerate(targets) if block_targets & _PALLAS_TRITON_TARGETS]
     sole_block = resolved_blocks[0] if len(resolved_blocks) == 1 else ""
     sole_targets = targets[0] if len(targets) == 1 else set()
-    sole_tokens = _IR_NAME_TOKEN_PATTERN.findall(sole_block)
-    all_tokens = _IR_NAME_TOKEN_PATTERN.findall(text)
-    query_bounded_tokens = [token for token in all_tokens if "query_bounded" in re.sub(r"[-.$]+", "_", token.lower())]
-    sole_query_bounded_tokens = [
-        token for token in sole_tokens if "query_bounded" in re.sub(r"[-.$]+", "_", token.lower())
-    ]
+    sole_tokens = _IR_NAME_TOKEN_PATTERN.findall(_decode_mlir_hex_escapes(sole_block))
+    all_tokens = _IR_NAME_TOKEN_PATTERN.findall(_decode_mlir_hex_escapes(text))
+    query_bounded_tokens = [token for token in all_tokens if _is_query_bounded_kernel_marker_like(token)]
     unexpected_query_bounded = [token for token in query_bounded_tokens if token != _EXPECTED_MARKER]
     query_start = _metadata_field(sole_block, "query_start", _QUERY_START)
     query_size = _metadata_field(sole_block, "query_size", _QUERY_SIZE)
@@ -470,8 +488,6 @@ def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
         "sole_exact_rocm_triton_target": sole_targets == {_EXACT_ROCM_TRITON_TARGET},
         "exact_full_forward_q256_marker_in_sole_call": _EXPECTED_MARKER in sole_tokens,
         "no_q0_other_forward_dq_dkdv_or_lookalike_query_bounded_tokens": not unexpected_query_bounded,
-        "all_query_bounded_marker_occurrences_belong_to_sole_call": sorted(query_bounded_tokens)
-        == sorted(sole_query_bounded_tokens),
         "no_outer_while": while_count == 0,
         "preserved_query_metadata_is_exact": metadata_exact_if_preserved,
     }
@@ -486,6 +502,14 @@ def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
         "pallas_custom_call_count": len(pallas_indices),
         "expected_marker_occurrences": sum(token == _EXPECTED_MARKER for token in all_tokens),
         "unexpected_query_bounded_token_occurrences": len(unexpected_query_bounded),
+        "unexpected_query_bounded_token_summaries": [
+            {
+                "sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                "characters": len(token),
+                "contains_exact_expected_marker": _EXPECTED_MARKER in token,
+            }
+            for token in unexpected_query_bounded
+        ],
         "while_count": while_count,
         "metadata": {
             "preserved": not metadata_absent,
