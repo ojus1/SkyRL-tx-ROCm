@@ -110,6 +110,91 @@ The local artifacts are:
 - `/tmp/t1024-sft-1783857150.telemetry.jsonl`
 - `/tmp/t1024-sft-1783857150.telemetry.jsonl.summary.json`
 
+### Context-2048 default-allocator capacity boundary
+
+The first context-2,048 full-model attempt used the default JAX device-memory
+fraction, a stricter 85 C junction cap, and five-second untimed cooling delays.
+Attention had already passed its isolated forward/backward gate, but the full
+training executable did not fit. XLA reported that rematerialization reduced
+its estimate from 10.60 GiB to 10.48 GiB but could not reach the 9.59 GiB
+target; the allocator then rejected a 10.56 GiB request. No training step ran.
+
+The failure was a handled `RESOURCE_EXHAUSTED` result: adapter cleanup
+succeeded, peak observed VRAM was 18,294,276,096 B, maximum junction
+temperature was 84 C, swap remained zero, the fatal-driver journal query was
+empty, and KFD/VRAM returned to idle. This does not move the full-model
+validation frontier beyond 1,024. It establishes memory residency/buffer
+assignment, rather than attention correctness, as the next blocker. Artifacts
+are:
+
+- `/tmp/t2048-sft-1783858067.sft.jsonl`
+- `/tmp/t2048-sft-1783858067.telemetry.jsonl`
+- `/tmp/t2048-sft-1783858067.telemetry.jsonl.summary.json`
+
+A fresh-process retry explicitly raised
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` while lowering the profiler's system-VRAM
+cap to 22 GiB. It failed on the same 10.56 GiB allocation, unloaded cleanly,
+and produced no driver event. Increasing the allocator fraction therefore does
+not solve this boundary; compact model residency and/or a smaller executable
+working set is required. Retry artifacts are
+`/tmp/t2048-fraction90-sft-1783858376.{sft.jsonl,telemetry.jsonl}` (with the
+usual `.summary.json` beside telemetry).
+
+An initialization-only server run then set
+`XLA_PYTHON_CLIENT_ALLOCATOR=platform` and received no client request. It still
+settled at 17,899,212,800 B of physical VRAM, indistinguishable from the
+default route. The process was stopped normally after observation, reached
+68 C, used no swap, and produced no fatal driver event. This installed ROCm
+JAX stack therefore does not provide a useful deallocating platform-allocator
+escape hatch. Telemetry is in
+`/tmp/t2048-platform-sft-1783858638.telemetry.jsonl`.
+
+### Model-residency accounting
+
+`rocm/probe_model_residency.py` separates abstract state size, eager model
+initialization, checkpoint loading, NNX splitting, and settling without
+compiling or executing a model pass. The exact abstract state is
+8,480,538,476 B (7.8981 GiB): 8,411,510,272 B of non-LoRA state and
+69,028,204 B of LoRA metadata/parameters. After normal initialization and
+loading, `jax.live_arrays()` reported 16,892,048,748 B because the module and
+split states both reference arrays, but pointer deduplication found exactly
+8,480,538,476 B across 1,182 unique buffers. Thus `nnx.split` aliases the base
+buffers; it does not duplicate the model.
+
+The allocator view explains the much larger physical number. With the
+requested `platform` allocator, backend-ready `bytes_in_use` was
+9,127,142,144 B while `pool_bytes` was 17,181,966,336 B and observed physical
+VRAM was 17,899,282,432 B. An experimental abstract-model/direct-load route,
+with fused checkpoint interleaving performed in NumPy rather than accidentally
+through JAX, reported settled `bytes_in_use` of 8,604,524,288 B and peak
+`bytes_in_use` of 8,674,484,224 B. That run used a different allocator setting,
+so the counter difference is confounded and is not a proven loader saving.
+The decisive counters are unchanged: the route had the same 8,480,538,476 B
+unique live state, BFC still grew its pool to 17,179,869,184 B, and physical
+VRAM still reached 17,895,243,776 B. Direct loading alone therefore does
+**not** reduce settled model state or reclaim the roughly 8 GiB pool growth.
+
+These are initialization-only measurements, not a validated backend change.
+The direct-load route is now wired behind the default-off
+`abstract_model_load` flag, but it has not passed a ROCm model forward or
+training step. The evidence rules out duplicate NNX state as the primary cause
+and makes allocator-pool geometry plus the 10.56 GiB executable arena the
+capacity problem to solve. Artifacts are:
+
+- `/tmp/residency-bfc-1783859376.{jsonl,telemetry.jsonl}`
+- `/tmp/residency-platform-1783859495.{jsonl,telemetry.jsonl}`
+- `/tmp/residency-abstract-load4-1783860134.{jsonl,telemetry.jsonl}`
+
+For the default 75% BFC limit, allocator-live state plus the requested arena is
+already impossible even with perfect placement: approximately
+`8.500 + 10.560 > 17.988 GiB`. The 90% growth-mode retry has aggregate room,
+but neither its cached free region nor its remaining extension budget is large
+enough for one 10.56 GiB allocation. The next allocator experiment is a fixed
+85% preallocated BFC arena combined with direct loading, which should create
+one 20.387 GiB region and avoid replacement holes. That is quantitative
+feasibility only; allocation-only, load-only, compile-only, and one-step gates
+must pass in separate fresh processes before another multi-step run.
+
 ## Fixed-rollout GRPO learner control
 
 Revision `31800cf001c0c982e56231f386182f0cb02c163c` completed one cold
@@ -165,6 +250,11 @@ Local private artifacts are:
   event. Output relative L2 was 0.00206; `dq`/`dk` remained 0.0113/0.0107, so
   the numerical promotion decision did not change. Telemetry is in
   `/tmp/pallas1024-reference-1783857107.telemetry.jsonl`.
+- At 2,048 tokens the isolated path also passed: median forward/backward was
+  2.942/15.347 ms, JAX peak allocation was 948,325,888 B, maximum junction was
+  67 C, and there was no driver event. Output/`dq`/`dk` relative L2 remained
+  0.00210/0.0113/0.0107. Telemetry is in
+  `/tmp/pallas2048-reference-1783857879.telemetry.jsonl`.
 - The exact synthetic Qwen3.5 LoRA optimizer tree contains 402 leaves and
   34,512,896 BF16 parameter elements. Three repeated GPU updates passed with
   command buffers disabled, with about 70 ms steady optimizer time and

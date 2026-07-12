@@ -68,9 +68,13 @@ an occupied port, an unsafe/reused run directory, or an existing KFD owner:
 ./rocm/start_qwen35.sh t64-control
 ```
 
-It pins `JAX_PLATFORMS=rocm`, disables JAX preallocation, enables per-layer
-rematerialization, uses rank-8/two-slot LoRA and 64-token loss chunks, and
-disables all XLA GPU command buffers. The latter is required on this machine:
+It resolves the tested Qwen3.5-4B revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` from the local cache and pins
+`JAX_PLATFORMS=rocm`; its default
+`SKYRL_QWEN35_MEMORY_MODE=growth` disables JAX preallocation, preserving the
+validated baseline. It also enables per-layer rematerialization, uses
+rank-8/two-slot LoRA and 64-token loss chunks, and disables all XLA GPU command
+buffers. The latter is required on this machine:
 an exact 402-leaf Qwen3.5 LoRA Adam probe passed repeated GPU updates with
 command buffers disabled, while the earlier full-model failure occurred on
 the second replay of the same optimizer executable.
@@ -97,6 +101,75 @@ For staged long-context capacity checks, `--inter-step-delay-seconds 5` inserts
 an untimed cooling interval between updates. Runs using it remain valid for
 per-step latency and peak-memory checks, but not for continuous-duty throughput
 or thermal comparisons.
+
+### Fixed-BFC allocator experiment
+
+The alternative `SKYRL_QWEN35_MEMORY_MODE=preallocate85` is default-off. It
+forces the BFC allocator, fixed preallocation, `XLA_CLIENT_MEM_FRACTION=0.85`,
+and abstract checkpoint construction. The launcher rejects inherited allocator,
+fraction, preallocation, or device-selection settings that conflict with that
+contract. Do not select this mode until the allocation-only gate below passes.
+
+The allocation probe defaults to CPU and is safe to run without an accelerator
+acknowledgement:
+
+```bash
+.venv/bin/python rocm/probe_bfc_preallocation.py --settle-seconds 0
+```
+
+The ROCm form makes one 256-byte device transfer. Its dominant effect is the
+intentional fixed 85% BFC allocation, so run it alone in a fresh process under
+the telemetry guard. Before importing JAX, the probe independently requires an
+accessible and unowned `/dev/kfd`, an AMD DRM card, and no connected
+non-Writeback AMD display; this probe has no safety override:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/qwen35-bfc85-allocation.telemetry.jsonl \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 60 \
+  --max-junction-temp-c 80 \
+  --max-vram-gib 22 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0 \
+  -- .venv/bin/python rocm/probe_bfc_preallocation.py \
+       --platform rocm --allow-gpu \
+       --fraction 0.85 --settle-seconds 5 \
+       --output /tmp/qwen35-bfc85-allocation.jsonl
+```
+
+On this 25,753,026,560-byte device, the allocation gate requires
+`pool_bytes == bytes_limit == 21,890,072,576`, physical VRAM below 21.2 GiB,
+zero swap, no fatal AMDGPU journal event, and return to idle KFD/VRAM after the
+probe exits. A mismatch stops the experiment; increasing the fraction is not a
+substitute for understanding it.
+
+After that passes, advance one fresh process at a time:
+
+1. **Load only:** run `probe_model_residency.py` with
+   `--platform rocm --allow-gpu --construction abstract-load
+   --allocator-mode preallocate85 --output <private.jsonl>` under the same
+   80 C/22 GiB telemetry limits. Require the pinned revision, exact
+   8,480,538,476-byte unique state, no duplicate base buffers, at least 0.5 GiB
+   beyond the measured 10.56 GiB arena request, and a clean shutdown.
+2. **Compile only:** run the reviewed `probe_sft_compile.py` control described
+   in [`SFT_COMPILE_PROBE.md`](SFT_COMPILE_PROBE.md). It lowers and compiles the
+   exact context-2,048 training executable but never invokes the returned full
+   model-pass callable or optimizer step. XLA may run bounded autotuning kernels,
+   so the same guard remains mandatory. Re-read allocator state and require
+   `pool_bytes - bytes_in_use >= compiled_temp_bytes + 0.5 GiB`.
+3. **One update:** issue exactly one context-2,048 forward/backward/Adam request,
+   then unload immediately and verify telemetry, the driver journal, KFD, and
+   idle VRAM. The steady-state `bench_sft.py` harness intentionally requires six
+   updates and must not be used as a substitute for this gate.
+4. **Cooled validation:** only after the one-update gate passes, run the normal
+   one-warmup/five-measured protocol with
+   `--inter-step-delay-seconds 5`.
+
+The purpose-built one-update path is not yet present. Until it is independently
+reviewed, allocation/load/compile success establishes feasibility only and does
+not move the validated training frontier.
 
 The fixed-rollout GRPO learner harness follows the Cookbook's causal shift,
 group-mean advantage, mask-removal, `importance_sampling`, and Adam call order
@@ -162,7 +235,16 @@ monolithic launch. Do not bypass this cap to attempt 32K.
 
 The fused-stage, GDN/FlashQLA adaptation, native-GQA, tied-head, W8/W4/A8/A4,
 activation-checkpoint, and custom-VJP design is in
-[`MEGAKERNELS.md`](MEGAKERNELS.md). The quantized LoRA implementation currently
+[`MEGAKERNELS.md`](MEGAKERNELS.md). The decision not to replace the learner
+with EGGROLL, the exact state/speed opportunity, and the source-level FlashQLA
+portability audit are in
+[`ES_FLASHQLA_FEASIBILITY.md`](ES_FLASHQLA_FEASIBILITY.md). The three bounded
+stage prototypes have separate promotion records:
+[`GDN_SUPERBLOCK.md`](GDN_SUPERBLOCK.md),
+[`QUERY_BOUNDED_GQA.md`](QUERY_BOUNDED_GQA.md), and
+[`TIED_LOGPROB_PROTOTYPE.md`](TIED_LOGPROB_PROTOTYPE.md).
+
+All of those implementations remain unwired. The quantized LoRA implementation
 in `skyrl/tx/kernels/quantized_lora.py` is a CPU semantic oracle only; it is not
 selected by model code and is not a GPU performance path. The native gfx1100
 IU8/IU4 compile proof and production FFI requirements are in

@@ -17,6 +17,11 @@ MAX_LORA_ADAPTERS = 4
 LORA_RANK = 8
 
 
+def test_abstract_model_load_is_explicitly_opt_in():
+    assert JaxBackendConfig().abstract_model_load is False
+    assert JaxBackendConfig(abstract_model_load=True).abstract_model_load is True
+
+
 def create_backend(max_lora_adapters: int = MAX_LORA_ADAPTERS, **config_overrides):
     """Create a JaxBackend."""
     config = JaxBackendConfig(max_lora_adapters=max_lora_adapters, max_lora_rank=32, **config_overrides)

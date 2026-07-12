@@ -12,6 +12,52 @@ if [[ $# -ne 1 || ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
 fi
 
 run_id="$1"
+model_repo="Qwen/Qwen3.5-4B"
+model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+memory_mode="${SKYRL_QWEN35_MEMORY_MODE:-growth}"
+backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64}'
+
+require_unset_or_exact() {
+  local name="$1"
+  local expected="$2"
+  local value
+  if [[ -v "$name" ]]; then
+    value="${!name}"
+    if [[ "$value" != "$expected" ]]; then
+      echo "$name=$value conflicts with SKYRL_QWEN35_MEMORY_MODE=preallocate85 (required: $expected)." >&2
+      exit 2
+    fi
+  fi
+}
+
+case "$memory_mode" in
+  growth)
+    ;;
+  preallocate85)
+    require_unset_or_exact JAX_PLATFORMS rocm
+    require_unset_or_exact XLA_PYTHON_CLIENT_ALLOCATOR bfc
+    if [[ -v XLA_PYTHON_CLIENT_PREALLOCATE ]] \
+      && [[ "${XLA_PYTHON_CLIENT_PREALLOCATE,,}" != "true" ]] \
+      && [[ "$XLA_PYTHON_CLIENT_PREALLOCATE" != "1" ]]; then
+      echo "XLA_PYTHON_CLIENT_PREALLOCATE=$XLA_PYTHON_CLIENT_PREALLOCATE conflicts with SKYRL_QWEN35_MEMORY_MODE=preallocate85." >&2
+      exit 2
+    fi
+    require_unset_or_exact XLA_CLIENT_MEM_FRACTION 0.85
+    if [[ -n "${XLA_PYTHON_CLIENT_MEM_FRACTION:-}" ]]; then
+      echo "XLA_PYTHON_CLIENT_MEM_FRACTION is deprecated and conflicts with SKYRL_QWEN35_MEMORY_MODE=preallocate85." >&2
+      exit 2
+    fi
+    require_unset_or_exact ROCR_VISIBLE_DEVICES 0
+    require_unset_or_exact HIP_VISIBLE_DEVICES 0
+    require_unset_or_exact GPU_DEVICE_ORDINAL 0
+    backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"abstract_model_load":true}'
+    ;;
+  *)
+    echo "SKYRL_QWEN35_MEMORY_MODE must be growth or preallocate85." >&2
+    exit 2
+    ;;
+esac
+
 run_root="${SKYRL_QWEN35_RUN_ROOT:-/tmp/skyrl-qwen35-runs}"
 run_dir="$run_root/$run_id"
 port="${SKYRL_QWEN35_PORT:-8001}"
@@ -98,11 +144,16 @@ if [[ "${SKYRL_ALLOW_EXISTING_KFD:-0}" != "1" ]]; then
     echo "refusing to launch because fuser is unavailable for the /dev/kfd ownership check" >&2
     exit 2
   fi
-  kfd_owners="$(fuser /dev/kfd 2>/dev/null || true)"
-  if [[ -n "${kfd_owners//[[:space:]]/}" ]]; then
+  if kfd_owners="$(fuser /dev/kfd 2>&1)"; then
     echo "refusing to launch while /dev/kfd is already owned by PID(s): $kfd_owners" >&2
     echo "Set SKYRL_ALLOW_EXISTING_KFD=1 only after verifying that sharing is intentional." >&2
     exit 2
+  else
+    fuser_status=$?
+    if ((fuser_status != 1)) || [[ -n "${kfd_owners//[[:space:]]/}" ]]; then
+      echo "could not verify exclusive /dev/kfd ownership with fuser: ${kfd_owners:-return code $fuser_status}" >&2
+      exit 2
+    fi
   fi
 fi
 
@@ -132,10 +183,45 @@ fi
 mkdir "$run_dir/checkpoints"
 
 source .venv/bin/activate
+if ! model_path="$({
+  python - "$model_repo" "$model_revision" <<'PY'
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+model_repo, revision = sys.argv[1:]
+path = Path(
+    snapshot_download(
+        model_repo,
+        revision=revision,
+        allow_patterns=("*.safetensors", "*.json", "*.txt", "*.jinja"),
+        local_files_only=True,
+    )
+).resolve()
+if path.name != revision:
+    raise RuntimeError(f"resolved revision {path.name!r}, expected {revision!r}")
+print(path)
+PY
+} 2>/dev/null)"; then
+  echo "refusing to launch because pinned $model_repo revision $model_revision is not fully cached" >&2
+  exit 2
+fi
 export LLVM_PATH=/opt/rocm/llvm
 export JAX_PLATFORMS=rocm
 export ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-0}"
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
+if [[ "$memory_mode" == "growth" ]]; then
+  # Preserve the validated baseline behavior and inherited allocator/fraction.
+  export XLA_PYTHON_CLIENT_PREALLOCATE=false
+else
+  export ROCR_VISIBLE_DEVICES=0
+  export HIP_VISIBLE_DEVICES=0
+  export GPU_DEVICE_ORDINAL=0
+  export XLA_PYTHON_CLIENT_ALLOCATOR=bfc
+  export XLA_PYTHON_CLIENT_PREALLOCATE=true
+  export XLA_CLIENT_MEM_FRACTION=0.85
+  unset XLA_PYTHON_CLIENT_MEM_FRACTION
+fi
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$HOME/.cache/skyrl-jax}"
 export HF_XET_HIGH_PERFORMANCE=1
 export SKYRL_ROCM_PALLAS_ATTENTION="${SKYRL_ROCM_PALLAS_ATTENTION:-0}"
@@ -147,9 +233,9 @@ export SKYRL_ROCM_PALLAS_ATTENTION="${SKYRL_ROCM_PALLAS_ATTENTION:-0}"
 export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_enable_command_buffer="
 
 exec uv run --active --no-sync -m skyrl.tinker.api \
-  --base-model Qwen/Qwen3.5-4B \
+  --base-model "$model_path" \
   --backend jax \
-  --backend-config '{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64}' \
+  --backend-config "$backend_config" \
   --host 127.0.0.1 \
   --port "$port" \
   --checkpoints-base "$run_dir/checkpoints" \

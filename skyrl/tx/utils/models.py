@@ -153,6 +153,45 @@ def _get_shared_lora_A(arrays: list[np.ndarray]) -> np.ndarray:
     return arrays[0]
 
 
+def _fuse_checkpoint_arrays_numpy(
+    arrays: list[np.ndarray], group_sizes: tuple[int, ...]
+) -> np.ndarray:
+    """Interleave checkpoint projections without staging host weights on an accelerator.
+
+    ``FusedLoRALinear.fuse`` is the runtime JAX operation.  Calling it while
+    loading NumPy safetensor arrays dispatches the inputs and concatenation to
+    JAX's default device before converting the result back to NumPy.  The
+    checkpoint transform is purely a host layout operation, so keep it in
+    NumPy and perform only the final ``device_put`` in ``load_safetensors``.
+    """
+    if len(arrays) != len(group_sizes) or not arrays:
+        raise ValueError(
+            f"expected one nonempty checkpoint array per group size, got {len(arrays)} and {len(group_sizes)}"
+        )
+    if any(group_size <= 0 for group_size in group_sizes):
+        raise ValueError(f"group sizes must all be positive, got {group_sizes}")
+    if any(array.ndim == 0 for array in arrays):
+        raise ValueError("checkpoint projection arrays must have at least one dimension")
+    *batch_shape, _ = arrays[0].shape
+    if arrays[0].shape[-1] % group_sizes[0]:
+        raise ValueError(
+            f"checkpoint last dim {arrays[0].shape[-1]} is not divisible by first group size {group_sizes[0]}"
+        )
+    num_groups = arrays[0].shape[-1] // group_sizes[0]
+    reshaped = []
+    for array, group_size in zip(arrays, group_sizes):
+        if array.shape[:-1] != tuple(batch_shape):
+            raise ValueError(
+                f"checkpoint batch shape {array.shape[:-1]} does not match {tuple(batch_shape)}"
+            )
+        if array.shape[-1] != num_groups * group_size:
+            raise ValueError(
+                f"checkpoint last dim {array.shape[-1]} != num_groups({num_groups}) * group_size({group_size})"
+            )
+        reshaped.append(array.reshape(*batch_shape, num_groups, group_size))
+    return np.concatenate(reshaped, axis=-1).reshape(*batch_shape, -1)
+
+
 def get_expert_key(path: tuple, expert_idx: int) -> str:
     "Get the safetensors key for an expert weight model path."
     path = tuple(s if s != "experts" else f"experts.{expert_idx}" for s in path)
@@ -174,7 +213,6 @@ def load_safetensors(
     When adapter_index and rank are provided, loads LoRA weights into a specific
     adapter slot instead of replacing the full parameter.
     """
-    from skyrl.tx.layers.lora import FusedLoRALinear
     from skyrl.tx.layers.stacked import unstack_state
 
     fused_info = get_fused_info(model)
@@ -214,7 +252,7 @@ def load_safetensors(
             if path[-1] == "lora_A":
                 tensor = _get_shared_lora_A(weights)
             else:
-                tensor = np.asarray(FusedLoRALinear.fuse(*weights, group_sizes=group_sizes))
+                tensor = _fuse_checkpoint_arrays_numpy(weights, group_sizes)
         elif key not in tensors:
             raise RuntimeError(f"Missing key while loading from {checkpoint_dir}: {key}")
         else:
@@ -229,7 +267,113 @@ def load_safetensors(
                 tensor = tensor.reshape(param.shape)
             assert param.shape == tensor.shape, f"shape mismatch for {key}"
             # ArrayRef.set_raw_value writes through to the stacked parent variable
-            param.set_raw_value(jax.device_put(tensor.astype(param.dtype), param.sharding))
+            param.set_raw_value(jax.device_put(tensor.astype(param.dtype, copy=False), param.sharding))
+
+
+def _state_path_string(path: tuple) -> str:
+    return ".".join(str(getattr(key, "key", getattr(key, "name", key))) for key in path)
+
+
+def bind_abstract_mesh_shardings(model: nnx.Module, mesh: jax.sharding.Mesh) -> None:
+    """Bind eval-shape ``AbstractMesh`` shardings to a concrete runtime mesh."""
+    for _, variable in nnx.to_flat_state(nnx.state(model)):
+        value = variable.get_raw_value()
+        if not isinstance(value, jax.ShapeDtypeStruct):
+            continue
+        sharding = value.sharding
+        if isinstance(sharding, jax.NamedSharding):
+            sharding = jax.NamedSharding(mesh, sharding.spec)
+        variable.set_raw_value(
+            jax.ShapeDtypeStruct(
+                value.shape,
+                value.dtype,
+                sharding=sharding,
+                weak_type=value.weak_type,
+            )
+        )
+
+
+def materialize_abstract_lora_initializers(model: nnx.Module, *, max_lora_rank: int) -> None:
+    """Materialize only the LoRA leaves intentionally skipped by checkpoint loading."""
+    for path, variable in nnx.to_flat_state(nnx.state(model)):
+        value = variable.get_raw_value()
+        if not isinstance(value, jax.ShapeDtypeStruct):
+            continue
+        key = getattr(path[-1], "key", getattr(path[-1], "name", path[-1]))
+        if key == "lora_scaling":
+            host_value = np.ones(value.shape, dtype=value.dtype)
+        elif key == "lora_ranks":
+            host_value = np.full(value.shape, max_lora_rank, dtype=value.dtype)
+        elif key in {"lora_A", "lora_B"}:
+            host_value = np.zeros(value.shape, dtype=value.dtype)
+        else:
+            continue
+        variable.set_raw_value(jax.device_put(host_value, variable.sharding))
+
+
+def assert_model_fully_materialized(model: nnx.Module) -> None:
+    """Reject a model that still contains abstract state after direct loading."""
+    abstract_paths = [
+        _state_path_string(path)
+        for path, variable in nnx.to_flat_state(nnx.state(model))
+        if isinstance(variable.get_raw_value(), jax.ShapeDtypeStruct)
+    ]
+    if abstract_paths:
+        preview = ", ".join(abstract_paths[:8])
+        raise RuntimeError(
+            f"checkpoint construction left {len(abstract_paths)} abstract state leaves: {preview}"
+        )
+
+
+def _validate_qwen3_5_abstract_load(config: ModelConfig, model_class: Callable[..., nnx.Module]) -> None:
+    from skyrl.tx.models.qwen3_5 import Qwen3_5ForCausalLM
+
+    if model_class is not Qwen3_5ForCausalLM:
+        raise ValueError(
+            "abstract_model_load currently supports only the SkyRL Qwen3.5 causal-LM model class"
+        )
+
+    source_text_config = getattr(config, "text_config", None)
+    if getattr(source_text_config, "model_type", None) != "qwen3_5_text":
+        raise ValueError(
+            "abstract_model_load requires a Qwen3.5 text config; "
+            f"got model_type={getattr(source_text_config, 'model_type', None)!r}"
+        )
+
+    text_config = config.get_config()
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is not None:
+        unsupported = sorted(set(layer_types) - {"full_attention", "linear_attention"})
+        if unsupported:
+            raise ValueError(
+                "abstract_model_load does not support Qwen3.5 layer types "
+                f"{unsupported}"
+            )
+
+
+def load_qwen3_5_safetensors_abstract(
+    checkpoint_dir: str | os.PathLike,
+    config: ModelConfig,
+    model_class: Callable[..., nnx.Module],
+    *,
+    dtype: jnp.dtype,
+    mesh: jax.sharding.Mesh,
+) -> nnx.Module:
+    """Construct Qwen3.5 abstractly, then materialize it directly from a checkpoint.
+
+    This avoids allocating eager random base weights before replacing them.  The
+    deliberately narrow validation keeps unsupported model layouts on the
+    established eager construction path instead of guessing at their initializers.
+    """
+    _validate_qwen3_5_abstract_load(config, model_class)
+
+    with jax.set_mesh(mesh), nnx.use_eager_sharding(True):
+        model = nnx.eval_shape(lambda: model_class(config, dtype=dtype, rngs=nnx.Rngs(0)))
+        bind_abstract_mesh_shardings(model, mesh)
+        load_safetensors(checkpoint_dir, config, model)
+        materialize_abstract_lora_initializers(model, max_lora_rank=config.max_lora_rank)
+        assert_model_fully_materialized(model)
+    return model
 
 
 def save_safetensors(

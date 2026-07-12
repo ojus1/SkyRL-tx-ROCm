@@ -53,6 +53,7 @@ from skyrl.tx.utils.models import (
     get_model_class,
     insert_adapter_state,
     load_lora_checkpoint,
+    load_qwen3_5_safetensors_abstract,
     load_safetensors,
     resolve_model_path,
     round_up_seq_len,
@@ -83,6 +84,13 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         description="Maximum batch size (measured in number of sequences) for sampling/generation; 0 means disabled (use full batch)",
     )
     enforce_eager: bool = Field(default=False, description="Disable JAX JIT compilation")
+    abstract_model_load: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL: construct supported Qwen3.5 models abstractly and materialize "
+            "their state directly from safetensors"
+        ),
+    )
     shard_attention_heads: bool = Field(
         default=True,
         description="Whether to shard attention linear layers (qkvo projections) across tensor parallel devices",
@@ -244,12 +252,21 @@ class JaxBackendImpl(AbstractBackend):
             axis_types=(jax.sharding.AxisType.Auto,) * 3,
         )
         with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
-            self.model = model_class(
-                self.model_config,
-                dtype=get_dtype(self.model_config.get_config().dtype),
-                rngs=nnx.Rngs(0),
-            )
-            load_safetensors(checkpoint_path, self.model_config, self.model)
+            if config.abstract_model_load:
+                self.model = load_qwen3_5_safetensors_abstract(
+                    checkpoint_path,
+                    self.model_config,
+                    model_class,
+                    dtype=get_dtype(self.model_config.get_config().dtype),
+                    mesh=self.mesh,
+                )
+            else:
+                self.model = model_class(
+                    self.model_config,
+                    dtype=get_dtype(self.model_config.get_config().dtype),
+                    rngs=nnx.Rngs(0),
+                )
+                load_safetensors(checkpoint_path, self.model_config, self.model)
 
             # Split model into LoRA and non-LoRA parameters
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
