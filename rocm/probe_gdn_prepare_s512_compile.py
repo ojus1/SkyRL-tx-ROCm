@@ -37,7 +37,9 @@ _KEY_SHAPE = (1, 512, 16, 128)
 _VALUE_SHAPE = (1, 512, 32, 128)
 _GATE_SHAPE = (1, 512, 32)
 _ARGUMENT_BYTES = 12_713_984
-_OUTPUT_BYTES = 16_842_752
+_LOGICAL_OUTPUT_PAYLOAD_BYTES = 16_842_752
+_TUPLE_ROOT_POINTER_TABLE_BYTES = 24
+_COMPILER_OUTPUT_BYTES = _LOGICAL_OUTPUT_PAYLOAD_BYTES + _TUPLE_ROOT_POINTER_TABLE_BYTES
 _MAX_TEMP_BYTES = 64 * 1024**2
 _MAX_TOTAL_BYTES = 96 * 1024**2
 _COMMAND_BUFFER_FLAG = "--xla_gpu_enable_command_buffer="
@@ -228,10 +230,15 @@ def _exact_contract() -> dict[str, Any]:
             "r4_occurrences": 4,
             "r3_minor_to_major": [2, 1, 0],
             "r3_occurrences": 3,
+            "optimized_hlo_operand_references": 4,
+            "unique_unquoted_top_level_definitions_required": True,
+            "raw_operand_names_or_definitions_emitted": False,
         },
         "compiled_memory_gate": {
             "exact_argument_bytes": _ARGUMENT_BYTES,
-            "exact_output_bytes": _OUTPUT_BYTES,
+            "exact_logical_output_payload_bytes": _LOGICAL_OUTPUT_PAYLOAD_BYTES,
+            "exact_tuple_root_pointer_table_bytes": _TUPLE_ROOT_POINTER_TABLE_BYTES,
+            "exact_compiler_output_bytes": _COMPILER_OUTPUT_BYTES,
             "exact_alias_bytes": 0,
             "maximum_temporary_bytes": _MAX_TEMP_BYTES,
             "maximum_argument_output_temporary_bytes": _MAX_TOTAL_BYTES,
@@ -242,6 +249,8 @@ def _exact_contract() -> dict[str, Any]:
             "private_snapshot_mode": 0o600,
             "required_snapshot_seals_mask": _REQUIRED_SNAPSHOT_SEALS,
             "snapshot_fd_retained_for_process_lifetime": True,
+            "source_path_identity_postcheck_after_every_compile_attempt": True,
+            "postcheck_journal_after_every_compile_attempt": True,
         },
         "scope_exclusions": {
             "constructed_arrays": False,
@@ -649,16 +658,20 @@ def _integer_sequence(value: str) -> tuple[int, ...] | None:
     return tuple(int(piece) for piece in pieces)
 
 
+def _mask_quoted_strings(text: str) -> str:
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"',
+        lambda match: '"' + " " * (len(match.group()) - 2) + '"',
+        text,
+    )
+
+
 def _top_level_custom_call_attributes(
     block: str, *, after: int, before: int
 ) -> str | None:
     # Preserve byte offsets while masking strings so a backend_config payload
     # cannot impersonate structural custom-call attributes.
-    masked = re.sub(
-        r'"(?:\\.|[^"\\])*"',
-        lambda match: '"' + " " * (len(match.group()) - 2) + '"',
-        block,
-    )
+    masked = _mask_quoted_strings(block)
     opening = masked.find("{", after, before)
     if opening < 0:
         return None
@@ -877,7 +890,82 @@ def _stablehlo_layout_proof(block: str) -> dict[str, Any]:
     }
 
 
-def _optimized_hlo_layout_proof(block: str) -> dict[str, Any]:
+def _optimized_hlo_instruction_definitions(text: str) -> list[dict[str, Any]]:
+    masked = _mask_quoted_strings(text)
+    raw_lines = text.splitlines()
+    masked_lines = masked.splitlines()
+    if len(raw_lines) != len(masked_lines):
+        raise RuntimeError("quoted-string masking changed optimized HLO line count")
+    assignment = re.compile(
+        r"^\s*(?:ROOT\s+)?(?P<name>%[A-Za-z_][A-Za-z0-9_.$-]*)\s*=\s*"
+        r"(?P<definition>.*)$"
+    )
+    typed = re.compile(
+        r"^(?P<dtype>[A-Za-z][A-Za-z0-9_]*)"
+        r"\[\s*(?P<shape>[0-9,\s]+)\s*\]"
+        r"\{\s*(?P<layout>[0-9,\s]+)\s*\}\s+"
+        r"(?P<opcode>[A-Za-z_][A-Za-z0-9_.-]*)\s*\("
+    )
+    depth = 0
+    definitions: list[dict[str, Any]] = []
+    for line_number, (raw_line, masked_line) in enumerate(
+        zip(raw_lines, masked_lines, strict=True), start=1
+    ):
+        line_depth = depth
+        match = assignment.match(masked_line)
+        if match is not None:
+            type_match = typed.match(match.group("definition"))
+            shape = (
+                _integer_sequence(type_match.group("shape"))
+                if type_match is not None
+                else None
+            )
+            layout = (
+                _integer_sequence(type_match.group("layout"))
+                if type_match is not None
+                else None
+            )
+            definitions.append(
+                {
+                    "name": match.group("name"),
+                    "line_number": line_number,
+                    "brace_depth": line_depth,
+                    "top_level_instruction": line_depth == 1,
+                    "definition_parsed": type_match is not None
+                    and shape is not None
+                    and layout is not None,
+                    "dtype": type_match.group("dtype")
+                    if type_match is not None
+                    else None,
+                    "shape": shape,
+                    "layout": layout,
+                    "opcode": type_match.group("opcode")
+                    if type_match is not None
+                    else None,
+                    "line_sha256": hashlib.sha256(raw_line.encode()).hexdigest(),
+                }
+            )
+        for character in masked_line:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth < 0:
+                    raise RuntimeError("optimized HLO has unbalanced closing braces")
+    if depth != 0:
+        raise RuntimeError("optimized HLO has unbalanced braces")
+    return definitions
+
+
+def _quoted_definition_mentions(text: str, name: str) -> int:
+    count = 0
+    for match in re.finditer(r'"(?:\\.|[^"\\])*"', text):
+        if re.search(rf"(?<![A-Za-z0-9_.$-]){re.escape(name)}\s*=", match.group()):
+            count += 1
+    return count
+
+
+def _optimized_hlo_layout_proof(block: str, full_text: str) -> dict[str, Any]:
     instruction = re.search(
         r"=\s*(?P<outputs>\([^)]*\))\s*custom-call\s*\("
         r"(?P<inputs>[^)]*)\)\s*,",
@@ -891,9 +979,10 @@ def _optimized_hlo_layout_proof(block: str) -> dict[str, Any]:
 
     def shapes_and_layouts(
         segment: str,
-    ) -> tuple[tuple[tuple[int, ...] | None, tuple[int, ...] | None], ...]:
+    ) -> tuple[tuple[str, tuple[int, ...] | None, tuple[int, ...] | None], ...]:
         return tuple(
             (
+                match.group(0).split("[", 1)[0],
                 _integer_sequence(match.group("shape")),
                 _integer_sequence(match.group("layout")),
             )
@@ -901,57 +990,125 @@ def _optimized_hlo_layout_proof(block: str) -> dict[str, Any]:
         )
 
     if instruction is None:
-        inputs: tuple[tuple[tuple[int, ...] | None, tuple[int, ...] | None], ...] = ()
-        outputs: tuple[tuple[tuple[int, ...] | None, tuple[int, ...] | None], ...] = ()
+        outputs: tuple[
+            tuple[str, tuple[int, ...] | None, tuple[int, ...] | None], ...
+        ] = ()
         input_text = ""
         output_text = ""
     else:
         input_text = instruction.group("inputs")
         output_text = instruction.group("outputs")
-        inputs = shapes_and_layouts(input_text)
         outputs = shapes_and_layouts(output_text)
     expected_inputs = (
-        ((1, 512, 16, 128), (3, 2, 1, 0)),
-        ((1, 512, 32, 128), (3, 2, 1, 0)),
-        ((1, 512, 32), (2, 1, 0)),
-        ((1, 512, 32), (2, 1, 0)),
+        ("f32", (1, 512, 16, 128), (3, 2, 1, 0)),
+        ("f32", (1, 512, 32, 128), (3, 2, 1, 0)),
+        ("f32", (1, 512, 32), (2, 1, 0)),
+        ("f32", (1, 512, 32), (2, 1, 0)),
     )
     expected_outputs = (
-        ((1, 512, 32, 128), (3, 2, 1, 0)),
-        ((1, 512, 32, 128), (3, 2, 1, 0)),
-        ((1, 512, 32), (2, 1, 0)),
+        ("f32", (1, 512, 32, 128), (3, 2, 1, 0)),
+        ("f32", (1, 512, 32, 128), (3, 2, 1, 0)),
+        ("f32", (1, 512, 32), (2, 1, 0)),
     )
     generic_shape = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*\[")
-    input_names = re.findall(r"%[A-Za-z0-9_.$-]+", input_text)
+    operand_parts = [part.strip() for part in input_text.split(",")]
+    operand_references_exact = bool(operand_parts) and all(
+        re.fullmatch(r"%[A-Za-z_][A-Za-z0-9_.$-]*", part) is not None
+        for part in operand_parts
+    )
+    input_names = operand_parts if operand_references_exact else []
+    definitions = _optimized_hlo_instruction_definitions(full_text)
+    inputs: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+    operand_definition_proof = []
+    for index, name in enumerate(input_names):
+        matches = [item for item in definitions if item["name"] == name]
+        top_level = [item for item in matches if item["top_level_instruction"]]
+        quoted_mentions = _quoted_definition_mentions(full_text, name)
+        unique = (
+            len(matches) == 1
+            and len(top_level) == 1
+            and top_level[0]["definition_parsed"] is True
+            and quoted_mentions == 0
+        )
+        if unique:
+            definition = top_level[0]
+            inputs.append(
+                (definition["dtype"], definition["shape"], definition["layout"])
+            )
+        else:
+            definition = top_level[0] if len(top_level) == 1 else None
+        operand_definition_proof.append(
+            {
+                "operand_index": index,
+                "reference_sha256": hashlib.sha256(name.encode()).hexdigest(),
+                "exact_definition_occurrences": len(matches),
+                "top_level_definition_occurrences": len(top_level),
+                "quoted_definition_mentions": quoted_mentions,
+                "unique_unquoted_top_level_definition": unique,
+                "definition_parsed": definition is not None
+                and definition["definition_parsed"] is True,
+                "dtype": definition["dtype"] if definition is not None else None,
+                "shape": list(definition["shape"])
+                if definition is not None and definition["shape"] is not None
+                else None,
+                "layout": list(definition["layout"])
+                if definition is not None and definition["layout"] is not None
+                else None,
+                "definition_line_sha256": definition["line_sha256"]
+                if definition is not None
+                else None,
+                "definition_opcode_sha256": hashlib.sha256(
+                    str(definition["opcode"]).encode()
+                ).hexdigest()
+                if definition is not None and definition["opcode"] is not None
+                else None,
+                "raw_operand_name_emitted": False,
+                "raw_definition_emitted": False,
+            }
+        )
     checks = {
         "one_tuple_typed_signature": instruction is not None,
+        "operand_list_contains_only_exact_references": operand_references_exact,
         "four_named_call_operands": len(input_names) == 4
         and len(set(input_names)) == 4,
-        "four_and_only_four_input_array_types": len(generic_shape.findall(input_text))
-        == 4,
+        "no_inline_or_unbound_input_array_types": len(generic_shape.findall(input_text))
+        == 0,
+        "four_unique_unquoted_top_level_operand_definitions": len(
+            operand_definition_proof
+        )
+        == 4
+        and all(
+            item["unique_unquoted_top_level_definition"] is True
+            for item in operand_definition_proof
+        ),
         "three_and_only_three_output_array_types": len(
             generic_shape.findall(output_text)
         )
         == 3,
-        "input_shapes_bound_to_exact_layouts_in_order": inputs == expected_inputs,
+        "input_shapes_dtypes_and_layouts_bound_in_order": tuple(inputs)
+        == expected_inputs,
         "output_shapes_bound_to_exact_layouts_in_order": outputs == expected_outputs,
     }
-    all_layouts = tuple(layout for _shape, layout in (*inputs, *outputs))
+    all_layouts = tuple(layout for _dtype, _shape, layout in (*inputs, *outputs))
     return {
         "representation": "xla_minor_to_major",
+        "operand_definition_proof": operand_definition_proof,
+        "raw_operand_definitions_emitted": False,
         "observed_inputs": [
             {
-                "shape": list(shape) if shape is not None else None,
-                "layout": list(layout) if layout is not None else None,
+                "dtype": dtype,
+                "shape": list(shape),
+                "layout": list(layout),
             }
-            for shape, layout in inputs
+            for dtype, shape, layout in inputs
         ],
         "observed_outputs": [
             {
+                "dtype": dtype,
                 "shape": list(shape) if shape is not None else None,
                 "layout": list(layout) if layout is not None else None,
             }
-            for shape, layout in outputs
+            for dtype, shape, layout in outputs
         ],
         "expected_r4": [3, 2, 1, 0],
         "expected_r3": [2, 1, 0],
@@ -962,11 +1119,11 @@ def _optimized_hlo_layout_proof(block: str) -> dict[str, Any]:
     }
 
 
-def _layout_proof(block: str, dialect: str) -> dict[str, Any]:
+def _layout_proof(block: str, dialect: str, full_text: str) -> dict[str, Any]:
     if dialect == "stablehlo":
         return _stablehlo_layout_proof(block)
     if dialect == "optimized_hlo":
-        return _optimized_hlo_layout_proof(block)
+        return _optimized_hlo_layout_proof(block, full_text)
     raise ValueError("unsupported IR dialect")
 
 
@@ -1006,7 +1163,7 @@ def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
             {
                 "targets": sorted(_custom_call_targets(resolved, dialect)),
                 "nonempty_alias_metadata": _nonempty_alias_metadata(resolved),
-                "layouts": _layout_proof(block, dialect),
+                "layouts": _layout_proof(block, dialect, text),
                 "sha256": hashlib.sha256(resolved.encode()).hexdigest(),
                 "utf8_bytes": len(resolved.encode()),
             }
@@ -1108,7 +1265,8 @@ def _compiled_memory_gate(memory: dict[str, Any]) -> dict[str, Any]:
     checks = {
         "memory_analysis_available": available,
         "argument_bytes_exact": argument == _ARGUMENT_BYTES,
-        "output_bytes_exact": output == _OUTPUT_BYTES,
+        "compiler_output_bytes_exact_including_tuple_root_pointer_table": output
+        == _COMPILER_OUTPUT_BYTES,
         "alias_bytes_zero": alias == 0,
         "temporary_bytes_at_most_64_mib": temporary is not None
         and temporary <= _MAX_TEMP_BYTES,
@@ -1117,7 +1275,9 @@ def _compiled_memory_gate(memory: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "expected_argument_bytes": _ARGUMENT_BYTES,
-        "expected_output_bytes": _OUTPUT_BYTES,
+        "logical_output_payload_bytes": _LOGICAL_OUTPUT_PAYLOAD_BYTES,
+        "tuple_root_pointer_table_bytes": _TUPLE_ROOT_POINTER_TABLE_BYTES,
+        "expected_compiler_output_bytes": _COMPILER_OUTPUT_BYTES,
         "expected_alias_bytes": 0,
         "maximum_temporary_bytes": _MAX_TEMP_BYTES,
         "maximum_combined_bytes": _MAX_TOTAL_BYTES,
@@ -1346,6 +1506,26 @@ def _compile_exact(
     return report
 
 
+def _compile_with_unconditional_library_postcheck(
+    compile_operation: Callable[[], dict[str, Any]],
+    library_path: Path,
+    library_manifest: dict[str, Any],
+    require_clean_boot: Callable[[], dict[str, Any]],
+    counters: dict[str, int],
+    output: TextIO,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        report = compile_operation()
+    finally:
+        try:
+            final_library = _assert_same_library(library_path, library_manifest)
+        finally:
+            _journal_checkpoint(
+                require_clean_boot, output, "after_library_postcheck", counters
+            )
+    return report, final_library
+
+
 def _run_rocm(
     args: argparse.Namespace,
     output: TextIO,
@@ -1414,24 +1594,25 @@ def _run_rocm(
             require_clean_boot, output, "after_backend_initialization_attempt", counters
         )
 
-    report = _compile_exact(
-        jax,
-        jnp,
-        gdn_prepare_s512,
-        register_gdn_prepare_s512,
+    report, final_library = _compile_with_unconditional_library_postcheck(
+        lambda: _compile_exact(
+            jax,
+            jnp,
+            gdn_prepare_s512,
+            register_gdn_prepare_s512,
+            args.library,
+            args.library_sha256,
+            int(library_manifest["size_bytes"]),
+            require_clean_boot,
+            counters,
+            output,
+        ),
         args.library,
-        args.library_sha256,
-        int(library_manifest["size_bytes"]),
+        library_manifest,
         require_clean_boot,
         counters,
         output,
     )
-    try:
-        final_library = _assert_same_library(args.library, library_manifest)
-    finally:
-        _journal_checkpoint(
-            require_clean_boot, output, "after_library_postcheck", counters
-        )
     if counters != _completed_counters():
         raise RuntimeError("compile-only counter contract was not completed exactly")
     _emit(

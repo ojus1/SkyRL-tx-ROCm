@@ -111,13 +111,24 @@ memfd snapshot, then performs one abstract lower and one compile from four FP32
 `ShapeDtypeStruct` inputs. StableHLO and optimized HLO must independently show
 exactly one `skyrl_gdn_prepare_s512_f32_v1` call, no other custom call, loop, or
 alias, and exact physical row-major minor-to-major layouts: four rank-4
-`{3,2,1,0}` buffers and three rank-3 `{2,1,0}` buffers. Compiler accounting
-must report exactly 12,713,984 argument bytes, 16,842,752 output bytes, zero
-alias bytes, at most 64 MiB temporary bytes, and at most 96 MiB for arguments,
-outputs, and temporaries together. StableHLO must pass its complete structural,
-typed-signature, ordered-layout, loop, and alias gate before `compile()` is
-allowed to run; optimized HLO and compiler memory remain independent
-postcompile gates.
+`{3,2,1,0}` buffers and three rank-3 `{2,1,0}` buffers. Optimized HLO names the
+four call operands by reference; each reference must resolve to exactly one
+unquoted top-level instruction definition in the full module, and those four
+definitions must bind the exact ordered FP32 shapes and layouts. Only hashes,
+counts, and shape/layout/dtype evidence are emitted, never raw definitions.
+
+Compiler accounting must report exactly 12,713,984 argument bytes and
+16,842,776 output bytes. The latter is the exact 16,842,752-byte logical output
+payload plus XLA's 24-byte root pointer table for the three-element output
+tuple. Alias bytes must be zero, temporary bytes at most 64 MiB, and compiler
+arguments, tuple-root-inclusive outputs, and temporaries together at most
+96 MiB. StableHLO must pass its complete structural, typed-signature,
+ordered-layout, loop, and alias gate before `compile()` is allowed to run;
+optimized HLO and compiler memory remain independent postcompile gates.
+The original external library path is then rehashed and checked against its
+pre-registration device/inode/size/mtime identity, and the current boot journal
+is checkpointed, after every compile attempt—including a failed release gate or
+failed path-identity postcheck.
 
 The executable is discarded without invocation; no user array, device put,
 device get, or synchronization is allowed. `compile()` may still dispatch ROCm

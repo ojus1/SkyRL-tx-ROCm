@@ -115,9 +115,12 @@ def _optimized(*, target: str = _TARGET, extra: str = "", alias: str = "") -> st
     return "\n".join(
         [
             "ENTRY main {",
+            "  %key = f32[1,512,16,128]{3,2,1,0} parameter(0)",
+            "  %value = f32[1,512,32,128]{3,2,1,0} parameter(1)",
+            "  %g = f32[1,512,32]{2,1,0} parameter(2)",
+            "  %beta = f32[1,512,32]{2,1,0} parameter(3)",
             "  ROOT %prepare = (f32[1,512,32,128]{3,2,1,0}, f32[1,512,32,128]{3,2,1,0}, f32[1,512,32]{2,1,0}) "
-            "custom-call(f32[1,512,16,128]{3,2,1,0} %key, f32[1,512,32,128]{3,2,1,0} %value, "
-            "f32[1,512,32]{2,1,0} %g, f32[1,512,32]{2,1,0} %beta), "
+            "custom-call(%key, %value, %g, %beta), "
             f'custom_call_target="{target}"{alias}',
             extra,
             "}",
@@ -261,7 +264,9 @@ def test_contract_fixes_exact_abi_compile_counts_memory_and_scope():
     }
     assert contract["compiled_memory_gate"] == {
         "exact_argument_bytes": 12_713_984,
-        "exact_output_bytes": 16_842_752,
+        "exact_logical_output_payload_bytes": 16_842_752,
+        "exact_tuple_root_pointer_table_bytes": 24,
+        "exact_compiler_output_bytes": 16_842_776,
         "exact_alias_bytes": 0,
         "maximum_temporary_bytes": 64 * 1024**2,
         "maximum_argument_output_temporary_bytes": 96 * 1024**2,
@@ -388,6 +393,85 @@ def test_independent_ir_summaries_prove_target_no_alias_loop_and_physical_layout
         assert layouts["observed_r3_count"] == 3
         assert layouts["passed"] is True
     assert _PROBE._structural_gate(stable, optimized)["passed"] is True
+    optimized_layouts = optimized["calls"][0]["layouts"]
+    assert optimized_layouts["raw_operand_definitions_emitted"] is False
+    assert optimized_layouts["observed_inputs"] == [
+        {"dtype": "f32", "shape": [1, 512, 16, 128], "layout": [3, 2, 1, 0]},
+        {"dtype": "f32", "shape": [1, 512, 32, 128], "layout": [3, 2, 1, 0]},
+        {"dtype": "f32", "shape": [1, 512, 32], "layout": [2, 1, 0]},
+        {"dtype": "f32", "shape": [1, 512, 32], "layout": [2, 1, 0]},
+    ]
+    assert len(optimized_layouts["operand_definition_proof"]) == 4
+    for index, proof in enumerate(optimized_layouts["operand_definition_proof"]):
+        assert proof["operand_index"] == index
+        assert proof["exact_definition_occurrences"] == 1
+        assert proof["top_level_definition_occurrences"] == 1
+        assert proof["quoted_definition_mentions"] == 0
+        assert proof["unique_unquoted_top_level_definition"] is True
+        assert proof["raw_operand_name_emitted"] is False
+        assert proof["raw_definition_emitted"] is False
+        assert re.fullmatch(r"[0-9a-f]{64}", proof["reference_sha256"])
+        assert re.fullmatch(r"[0-9a-f]{64}", proof["definition_line_sha256"])
+        assert re.fullmatch(r"[0-9a-f]{64}", proof["definition_opcode_sha256"])
+
+
+def _without_key_definition(text: str) -> str:
+    return text.replace("  %key = f32[1,512,16,128]{3,2,1,0} parameter(0)\n", "", 1)
+
+
+@pytest.mark.parametrize(
+    "optimized",
+    [
+        _without_key_definition(_optimized()),
+        _optimized().replace(
+            "  %key = f32[1,512,16,128]{3,2,1,0} parameter(0)",
+            "  %key = f32[1,512,16,128]{3,2,1,0} parameter(0)\n"
+            "  %key = f32[1,512,16,128]{3,2,1,0} copy(%other)",
+            1,
+        ),
+        _without_key_definition(_optimized()).replace(
+            "ENTRY main {",
+            "ENTRY main {\n  {\n"
+            "    %key = f32[1,512,16,128]{3,2,1,0} parameter(0)\n  }",
+            1,
+        ),
+        _without_key_definition(_optimized()).replace(
+            "ENTRY main {",
+            "%key = f32[1,512,16,128]{3,2,1,0} parameter(0)\nENTRY main {",
+            1,
+        ),
+        _optimized().replace(
+            "ENTRY main {",
+            'HloModule m, config="%key = f32[1,512,16,128]{3,2,1,0} parameter(9)"\n'
+            "ENTRY main {",
+            1,
+        ),
+        _optimized().replace("  %key =", "  %key_lookalike =", 1),
+        _optimized().replace(
+            "%key = f32[1,512,16,128]", "%key = bf16[1,512,16,128]", 1
+        ),
+        _optimized().replace("parameter(0)", "not_an_instruction", 1),
+        _optimized().replace(
+            "custom-call(%key, %value, %g, %beta)",
+            "custom-call(%value, %key, %g, %beta)",
+            1,
+        ),
+        _optimized().replace(
+            "custom-call(%key, %value, %g, %beta)",
+            "custom-call(%key, %key, %g, %beta)",
+            1,
+        ),
+        _optimized().replace(
+            "custom-call(%key, %value, %g, %beta)",
+            "custom-call(f32[1,512,16,128]{3,2,1,0} %key, %value, %g, %beta)",
+            1,
+        ),
+    ],
+)
+def test_optimized_operand_definitions_fail_closed_on_every_binding_spoof(optimized):
+    summary = _PROBE._ir_summary(optimized, "optimized_hlo")
+    assert summary["checks"]["physical_row_major_layouts_exact"] is False
+    assert summary["passed"] is False
 
 
 @pytest.mark.parametrize(
@@ -568,8 +652,8 @@ def test_stablehlo_layout_values_must_be_fully_consumed_and_typed(stable):
         (
             "optimized_hlo",
             _optimized().replace(
-                "f32[1,512,32]{2,1,0} %beta)",
-                "f32[1,512,32]{2,1,0} %beta, s32[] %extra)",
+                "custom-call(%key, %value, %g, %beta)",
+                "custom-call(%key, %value, %g, %beta, %extra)",
                 1,
             ),
         ),
@@ -585,18 +669,25 @@ def test_compiled_memory_gate_requires_exact_sizes_and_both_caps():
     exact = {
         "available": True,
         "argument_size_in_bytes": 12_713_984,
-        "output_size_in_bytes": 16_842_752,
+        "output_size_in_bytes": 16_842_776,
         "alias_size_in_bytes": 0,
         "temp_size_in_bytes": 64 * 1024**2,
     }
-    assert _PROBE._compiled_memory_gate(exact)["passed"] is True
+    gate = _PROBE._compiled_memory_gate(exact)
+    assert gate["passed"] is True
+    assert gate["logical_output_payload_bytes"] == 16_842_752
+    assert gate["tuple_root_pointer_table_bytes"] == 24
+    assert gate["expected_compiler_output_bytes"] == 16_842_776
+    assert gate["argument_output_temporary_bytes"] == (
+        12_713_984 + 16_842_776 + 64 * 1024**2
+    )
     exact["temp_size_in_bytes"] = 70_000_000
     assert _PROBE._compiled_memory_gate(exact)["passed"] is False
     exact["temp_size_in_bytes"] = 60_000_000
     assert _PROBE._compiled_memory_gate(exact)["passed"] is True
     for key, value in (
         ("argument_size_in_bytes", 12_713_985),
-        ("output_size_in_bytes", 16_842_751),
+        ("output_size_in_bytes", 16_842_752),
         ("alias_size_in_bytes", 1),
     ):
         assert _PROBE._compiled_memory_gate({**exact, key: value})["passed"] is False
@@ -646,7 +737,7 @@ def test_registration_manifest_requires_complete_sealed_identity(tmp_path):
 
 class _Memory:
     argument_size_in_bytes = 12_713_984
-    output_size_in_bytes = 16_842_752
+    output_size_in_bytes = 16_842_776
     alias_size_in_bytes = 0
     temp_size_in_bytes = 4096
     generated_code_size_in_bytes = 2048
@@ -890,3 +981,98 @@ def test_backend_manifest_requires_exactly_one_rocm_gpu():
 def test_journal_checkpoint_rejects_undeclared_stage():
     with pytest.raises(RuntimeError, match="undeclared"):
         _PROBE._journal_checkpoint(lambda: dict(_CLEAN), io.StringIO(), "surprise", {})
+
+
+def test_library_postcheck_and_journal_are_recorded_after_compile_success(monkeypatch):
+    events: list[str] = []
+    path = Path("/private/library.so")
+    manifest = {"identity": (1, 2, 3, 4), "sha256": "a" * 64}
+    final = {"validated": True}
+
+    def compile_operation():
+        events.append("compile")
+        return {"release_gate": {"passed": True}}
+
+    def postcheck(observed_path, observed_manifest):
+        events.append("postcheck")
+        assert observed_path == path
+        assert observed_manifest is manifest
+        return final
+
+    monkeypatch.setattr(_PROBE, "_assert_same_library", postcheck)
+    output = io.StringIO()
+    report, observed_final = _PROBE._compile_with_unconditional_library_postcheck(
+        compile_operation,
+        path,
+        manifest,
+        lambda: dict(_CLEAN),
+        _PROBE._zero_counters(),
+        output,
+    )
+
+    assert events == ["compile", "postcheck"]
+    assert report == {"release_gate": {"passed": True}}
+    assert observed_final is final
+    journals = [
+        record
+        for record in _records(output)
+        if record["record_type"] == "journal_checkpoint"
+    ]
+    assert [record["stage"] for record in journals] == ["after_library_postcheck"]
+
+
+def test_library_postcheck_and_journal_are_unconditional_after_compile_failure(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    def compile_operation():
+        events.append("compile_failed")
+        raise RuntimeError("synthetic release-gate failure")
+
+    def postcheck(_path, _manifest):
+        events.append("postcheck_after_failure")
+        return {"validated": True}
+
+    monkeypatch.setattr(_PROBE, "_assert_same_library", postcheck)
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="synthetic release-gate failure"):
+        _PROBE._compile_with_unconditional_library_postcheck(
+            compile_operation,
+            Path("/private/library.so"),
+            {"identity": (1, 2, 3, 4), "sha256": "b" * 64},
+            lambda: dict(_CLEAN),
+            _PROBE._zero_counters(),
+            output,
+        )
+
+    assert events == ["compile_failed", "postcheck_after_failure"]
+    journals = [
+        record
+        for record in _records(output)
+        if record["record_type"] == "journal_checkpoint"
+    ]
+    assert [record["stage"] for record in journals] == ["after_library_postcheck"]
+
+
+def test_library_postcheck_failure_still_records_journal(monkeypatch):
+    monkeypatch.setattr(
+        _PROBE,
+        "_assert_same_library",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("identity changed")),
+    )
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="identity changed"):
+        _PROBE._compile_with_unconditional_library_postcheck(
+            lambda: {"release_gate": {"passed": True}},
+            Path("/private/library.so"),
+            {"identity": (1, 2, 3, 4), "sha256": "c" * 64},
+            lambda: dict(_CLEAN),
+            _PROBE._zero_counters(),
+            output,
+        )
+    assert [
+        record["stage"]
+        for record in _records(output)
+        if record["record_type"] == "journal_checkpoint"
+    ] == ["after_library_postcheck"]
