@@ -2,10 +2,18 @@
 
 import jax
 import jax.numpy as jnp
+from jax.extend import backend as jax_backend
 
 # cuDNN flash attention supported dtypes
 # https://github.com/jax-ml/jax/blob/8b1f782540f71fbe230a2dccd331975faafc6c83/jax/_src/cudnn/fused_attention_stablehlo.py#L290
 _CUDNN_SUPPORTED_DTYPES = (jnp.float16, jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2)
+
+
+def _has_cuda_backend() -> bool:
+    """Return whether JAX's generic GPU platform is backed by CUDA, not ROCm."""
+    if jax.default_backend() != "gpu":
+        return False
+    return "rocm" not in jax_backend.get_backend().platform_version.lower()
 
 
 def dot_product_attention(
@@ -34,7 +42,7 @@ def dot_product_attention(
     """
     scale = 1.0 / head_dim**0.5
 
-    if jax.default_backend() == "gpu" and q.dtype in _CUDNN_SUPPORTED_DTYPES:
+    if _has_cuda_backend() and q.dtype in _CUDNN_SUPPORTED_DTYPES:
         kv_seq_lengths = attention_mask.sum(axis=1).astype(jnp.int32)
         q_seq_lengths = jnp.minimum(kv_seq_lengths, q.shape[1])
         return jax.nn.dot_product_attention(
@@ -48,7 +56,7 @@ def dot_product_attention(
             implementation="cudnn",
         )
 
-    # CPU/TPU fallback
+    # Portable CPU/TPU/ROCm fallback.
     return jax.nn.dot_product_attention(
         q, k, v, scale=scale, mask=attention_mask[:, None, None, :].astype(bool), is_causal=is_causal
     )
