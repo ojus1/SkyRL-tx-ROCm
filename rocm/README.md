@@ -255,6 +255,7 @@ TINKER_API_KEY=tml-dummy .venv/bin/python rocm/profile_rocm.py \
   --terminate-included-on-safety \
   --sensor-grace-seconds 60 \
   --max-junction-temp-c 90 \
+  --max-gpu-power-watts 315 \
   --max-vram-gib 23 \
   --min-host-available-gib 4 \
   --timeout 900 \
@@ -268,6 +269,12 @@ runtime-suspended: its hwmon files can remain temporarily unreadable while the
 first ROCm context starts. Safety limits still apply as soon as the sensors
 become readable. See [`RESULTS.md`](RESULTS.md) for the exact validated runs
 and the context buckets that remain untested.
+
+Large-context runs may use the full practical VRAM budget and explicit
+CPU/RAM/disk offload. Keep offload buffers and transfer timing observable;
+uncontrolled swap is not a substitute for a deliberate offload path. Smaller
+isolated probes retain tighter workload-specific limits so an unexpected
+allocation or power excursion fails early.
 
 The exact optimizer replay probe defaults to CPU. GPU use requires two
 explicit acknowledgements and should only be run in a fresh process with the

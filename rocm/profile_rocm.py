@@ -379,6 +379,7 @@ def _safety_violation(
     """Return the first configured resource-limit violation in priority order."""
     checks = (
         ("gpu_junction_temp_c", limits.get("max_junction_temp_c"), "maximum", lambda value, limit: value > limit),
+        ("gpu_power_watts", limits.get("max_gpu_power_watts"), "maximum", lambda value, limit: value > limit),
         ("vram_used_bytes", limits.get("max_vram_bytes"), "maximum", lambda value, limit: value > limit),
         (
             "host_memory_available_bytes",
@@ -717,6 +718,7 @@ def main() -> int:
         help="allow runtime-suspended GPU sensors this long to become readable",
     )
     parser.add_argument("--max-junction-temp-c", type=float)
+    parser.add_argument("--max-gpu-power-watts", type=float)
     parser.add_argument("--max-vram-gib", type=float)
     parser.add_argument("--min-host-available-gib", type=float)
     parser.add_argument("--max-swap-gib", type=float)
@@ -748,6 +750,7 @@ def main() -> int:
         parser.error("--timeout must be positive")
     resource_limits = (
         ("--max-junction-temp-c", args.max_junction_temp_c),
+        ("--max-gpu-power-watts", args.max_gpu_power_watts),
         ("--max-vram-gib", args.max_vram_gib),
         ("--min-host-available-gib", args.min_host_available_gib),
         ("--max-swap-gib", args.max_swap_gib),
@@ -809,6 +812,7 @@ def main() -> int:
     measured_start: float | None = None
     safety_limits = {
         "max_junction_temp_c": args.max_junction_temp_c,
+        "max_gpu_power_watts": args.max_gpu_power_watts,
         "max_vram_bytes": args.max_vram_gib * _GIB if args.max_vram_gib is not None else None,
         "min_host_available_bytes": (
             args.min_host_available_gib * _GIB if args.min_host_available_gib is not None else None
