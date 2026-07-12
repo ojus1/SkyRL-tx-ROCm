@@ -32,3 +32,39 @@ values, dtypes, shardings, steady device residency, executable working set, or
 training speed. It is not active weight, optimizer, or activation offload.
 Linux swap and memory-mapped page eviction are likewise not explicit offload
 and must not be counted as GPU-memory savings.
+
+## Phase 2 primitive: explicit pinned-host placement
+
+`skyrl/tx/utils/offload.py` provides synchronous, policy-free primitives for
+copying a committed, fully addressable JAX array to an explicitly requested
+memory kind and for replacing a basic NNX Variable only after that copy is
+ready. The target is derived from the source sharding with
+`with_memory_kind`; `device_put` is passed the exact source sharding with
+donation and aliasing disabled. Shape, dtype, memory kind, device assignment,
+partition spec, and exact target sharding are checked after synchronization.
+The source remains valid. Unsupported/global/uncommitted/deleted arrays and
+NNX Variable subclasses with custom raw-value setters fail closed.
+
+CPU-only tests validate exact device-to-`pinned_host`-to-device round trips,
+NamedSharding preservation, failure atomicity, and a three-update AdamW replay
+with one moment leaf staged before each update and re-offloaded afterwards.
+These tests establish API and state semantics only. They do not measure ROCm
+DMA bandwidth, VRAM release, overlap, optimizer latency, or end-to-end SFT/GRPO
+performance, and the utility is not connected to the backend.
+
+For the current two-slot rank-8 Qwen3.5 LoRA inventory, the two BF16 Adam
+moment trees contain exactly 138,051,584 bytes (131.65625 MiB). Offloading both
+would save that persistent VRAM between updates but require at least
+276,103,168 bytes (263.3125 MiB) of H2D+D2H traffic per step. At an assumed
+20--25 GiB/s effective PCIe rate, transfer alone is approximately
+10.29--12.86 ms, before dispatch and per-leaf overhead. This is therefore an
+OOM-boundary option, not an expected speed optimization; W8/W4 frozen-weight
+residency and activation work have much larger capacity upside.
+
+Production wiring remains gated on a transactional moment-tree manager. It
+must prepare and block all destination arrays before replacing any of the 804
+moment leaves, stage the complete tree back to each leaf's exact device
+sharding before the jitted update, re-offload only after a successful update,
+and integrate save/load/delete failure paths. Batched tree transfers and
+measured overlap are required; 804 individually synchronized copies are not an
+acceptable performance implementation.
