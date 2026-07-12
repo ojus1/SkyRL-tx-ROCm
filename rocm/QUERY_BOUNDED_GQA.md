@@ -1,7 +1,9 @@
 # Query-bounded native GQA prototype
 
-Status: CPU/Pallas-interpret correctness prototype only. It has never been
-compiled or executed on the GPU and is not connected to the model dispatcher.
+Status: CPU/Pallas-interpret correctness plus exact T=512 guarded ROCm
+compile-only structural prototype. Compilation has run, but the returned
+attention executable has never been invoked and the prototype is not connected
+to the model dispatcher.
 
 The prototype in `skyrl/tx/kernels/query_bounded_gqa.py` is the next safe
 attention architecture for Qwen3.5-4B's `B=1, Hq=16, Hkv=4, D=256` training
@@ -212,6 +214,40 @@ name, and no outer HLO `while` may remain. A mismatch fails closed after
 preserving the metadata. "Compile-only" means that the returned model callable
 is not invoked; it does not mean no GPU kernels run during compilation, nor is
 it evidence of numerical correctness or runtime watchdog safety.
+
+### ROCm 7.2.4 compile-only result
+
+The first guarded hardware gate passed on commit `a3a40d41` and clean boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. The exact BF16
+`B=1, T=512, Hq=16, Hkv=4, D=256` forward-plus-arbitrary-VJP signature lowered
+in 0.349206 s and compiled in 3.037847 s. Both StableHLO and optimized HLO
+contained exactly three `__gpu$xla.gpu.triton` custom calls: one exactly named
+forward boundary, one dQ boundary, and one dK/dV boundary. Both dialects had
+zero outer `while` operations, and every exact-name/bijection check passed.
+Their SHA-256 digests were respectively
+`f62ffb9ae654d13152031dece070e05cf1e44e4621b45cfd614c0092583e6ab5` and
+`6b18b3834fac2a85926f1009516d75b28cbb2f029ca7e26bcf023e5c545b6c88`.
+
+`CompiledMemoryStats` reported 10,487,808 B of arguments, 10,485,792 B of
+outputs, 2,130,688 B of temporary storage, and no aliases. The telemetry
+wrapper completed in 10.010465 s with return code zero: physical VRAM peaked
+at 711,987,200 B, junction temperature at 53 C, power at 132 W, and swap at
+zero. The kernel log stayed available and fault-free. The private probe,
+telemetry, and summary artifacts are:
+
+- `/tmp/query-bounded-gqa-t512-compile-boot54ccf56c-run1.jsonl`
+- `/tmp/query-bounded-gqa-t512-compile-boot54ccf56c-run1.telemetry.jsonl`
+- `/tmp/query-bounded-gqa-t512-compile-boot54ccf56c-run1.telemetry.jsonl.summary.json`
+
+All three files are mode `0600`. The manifest, compiled record, and completion
+record report zero lowered-callable and compiled-executable invocations; there
+is no error record. The guarded journal postflight passed. A separate
+point-in-time postcheck found `/dev/kfd` and the AMD render node unowned and
+the card back in runtime suspend.
+
+This promotes only the exact T=512 structure through compile. It does not
+promote execution, numerical correctness, padding, repeated launches, or any
+larger bucket. The prototype remains disconnected from model attention.
 
 ## GPU promotion gates
 
