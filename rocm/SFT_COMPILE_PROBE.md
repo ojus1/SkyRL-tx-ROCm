@@ -73,7 +73,7 @@ run in a fresh process under telemetry:
   --output /tmp/qwen35-sft-compile-t2048.telemetry.jsonl \
   --interval 0.25 --timeout 1800 --sensor-grace-seconds 60 \
   --max-junction-temp-c 80 --max-vram-gib 22 \
-  --min-host-available-gib 8 --max-swap-gib 0 -- \
+  --min-host-available-gib 8 --max-swap-gib 0.001 -- \
   .venv/bin/python rocm/probe_sft_compile.py \
     --platform rocm --allow-gpu --context 2048 \
     --output /tmp/qwen35-sft-compile-t2048.jsonl

@@ -132,18 +132,21 @@ non-Writeback AMD display; this probe has no safety override:
   --max-junction-temp-c 80 \
   --max-vram-gib 22 \
   --min-host-available-gib 8 \
-  --max-swap-gib 0 \
+  --max-swap-gib 0.001 \
   -- .venv/bin/python rocm/probe_bfc_preallocation.py \
        --platform rocm --allow-gpu \
        --fraction 0.85 --settle-seconds 5 \
        --output /tmp/qwen35-bfc85-allocation.jsonl
 ```
 
-On this 25,753,026,560-byte device, the allocation gate requires
-`pool_bytes == bytes_limit == 21,890,072,576`, physical VRAM below 21.2 GiB,
-zero swap, no fatal AMDGPU journal event, and return to idle KFD/VRAM after the
-probe exits. A mismatch stops the experiment; increasing the fraction is not a
-substitute for understanding it.
+On this 25,753,026,560-byte device, the observed allocation gate is
+`pool_bytes == bytes_limit == 21,892,169,728` B (20.3887 GiB). This is one
+2 MiB granule above the raw 85% sysfs estimate: pinned OpenXLA deliberately
+[rounds the GPU BFC limit upward to 2 MiB](https://raw.githubusercontent.com/openxla/xla/5a9e73cbd92530cac2ac36f4736a774b2412afe2/xla/pjrt/gpu/gpu_helpers.cc).
+Also require physical VRAM below 21.2 GiB, no swap growth from the measured
+baseline, no fatal AMDGPU journal event, and return to idle KFD/VRAM after the
+probe exits. Any other mismatch stops the experiment; increasing the fraction
+is not a substitute for understanding it.
 
 After that passes, advance one fresh process at a time:
 

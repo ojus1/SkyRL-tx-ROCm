@@ -195,6 +195,39 @@ one 20.387 GiB region and avoid replacement holes. That is quantitative
 feasibility only; allocation-only, load-only, compile-only, and one-step gates
 must pass in separate fresh processes before another multi-step run.
 
+### Fixed-BFC allocation and direct-load gates
+
+The reviewed fixed-85% BFC allocation-only probe passed in a fresh guarded
+process. XLA reported `bytes_limit == pool_bytes == peak_pool_bytes ==
+21,892,169,728 B` (20.3887 GiB), with only the 256-byte probe array live. The
+value is exactly one 2 MiB granule above the raw sysfs-times-0.85 estimate;
+OpenXLA explicitly rounds the BFC GPU limit upward to 2 MiB. Physical VRAM
+peaked at 22,605,082,624 B (21.0526 GiB), junction temperature at 49 C, and
+swap stayed at its pre-existing 622,592-byte baseline. The process returned to
+27,947,008 B idle VRAM with unowned KFD and no fatal driver event. Artifacts:
+
+- `/tmp/bfc85-allocation-1783863595.jsonl`
+- `/tmp/bfc85-allocation-1783863595.telemetry.jsonl`
+- `/tmp/bfc85-allocation-1783863595.telemetry.jsonl.summary.json`
+
+The next fresh process loaded the pinned checkpoint through the abstract
+constructor without a model pass. `loaded` contained exactly 1,182 unique
+buffers and 8,480,538,476 live bytes; `nnx.split` left both unique-buffer deltas
+at zero. Settled BFC usage was 8,484,341,504 B with a peak of 8,553,896,960 B,
+leaving 13,407,828,224 B (12.4870 GiB) inside the fixed pool—1.9270 GiB beyond
+the nominal 10.56 GiB failed arena request. Physical VRAM peaked at
+22,610,644,992 B, junction temperature at 54 C, swap did not grow, artifacts
+were mode 0600, and exit again restored idle KFD/VRAM without a fatal driver
+event. Artifacts:
+
+- `/tmp/bfc85-residency-1783864015.jsonl`
+- `/tmp/bfc85-residency-1783864015.telemetry.jsonl`
+- `/tmp/bfc85-residency-1783864015.telemetry.jsonl.summary.json`
+
+These two gates establish allocation and residency feasibility only. They do
+not execute forward/backward, prove compiled temporary placement, or move the
+validated full-model frontier beyond context 1,024.
+
 ## Fixed-rollout GRPO learner control
 
 Revision `31800cf001c0c982e56231f386182f0cb02c163c` completed one cold
