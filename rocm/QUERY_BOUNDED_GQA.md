@@ -859,6 +859,91 @@ This promotes only the exact all-valid final-C256 T=1024 nonzero-scale forward
 sentinel. It does not authorize padding, another query chunk or length, replay,
 backward, model integration, SFT, GRPO, or a latency-distribution claim.
 
+## Pending T=1024/C=256 right-padding gates
+
+`rocm/probe_query_bounded_gqa_padding.py` defines the next isolated forward
+gate but has **not** been run on the GPU. Its exact case enum is
+`valid768`, `valid769`, `valid831`, `valid832`, `valid833`, and `valid1023`.
+One explicit case is admitted per fresh process; the probe has no multi-case
+GPU path. These cases place the first masked key immediately before the final
+query chunk, immediately after its first query, on either side of the next
+64-key tile boundary, and at the last sequence position.
+
+Q/K/V and scale are unchanged from the promoted all-valid sentinel. Their
+SHA-256 values remain respectively
+`16aa12a02e88387223f000513febba987c23490016e5a1c9fe32019a862afc5d`,
+`85ba4ec243a74b9a2019d30c94c4a0edf62e2204a6d3148fe551113605134841`,
+and `60132fd8c7733d2f02381f90d59e5a3dc7d740c09f25e1833540d7c956771b8a`;
+the explicit scale is still 3/32. Only the int32 key mask changes to a
+nonempty prefix of ones. The mask applies to keys only: query rows at and
+after the padding transition remain defined and must still be removed by the
+training loss mask when appropriate.
+
+The independent FP32 oracle streams over 32-query and 64-key tiles without a
+full 256-by-1024 matrix. Conservative explicit NumPy-array scratch accounting
+is 334,400 bytes, including separate causal, key, and combined validity masks;
+it remains accounting rather than a measured allocator peak and excludes
+Python/NumPy object overhead and internal BLAS workspace. All six exact
+production-shape results match a separate dense CPU oracle within the fixed
+test tolerance.
+
+Each case pins its mask and reference hashes and requires an all-valid-mask
+control to fail on both all affected rows and the first affected row with
+relative L2 above 0.02. This row-local gate prevents the single affected row
+in `valid1023` from being hidden by 255 unaffected rows: its informational
+whole-output relative L2 is only about 0.001954, while its one affected row is
+0.0333121893.
+
+| Case | Mask SHA-256 | Reference SHA-256 | Affected-row wrong-mask rel L2 | First-affected-row rel L2 |
+|---|---|---|---:|---:|
+| `valid768` | `41b4c32a488d09f1b6487b1d89e4b78d93e02dea44b0cf6dbf65fb1dd4286c53` | `017970569e9232a1d289ef1bc084c187a3e266a46250741962f3e2008d963ec1` | 0.3656457575 | 0.0372590756 |
+| `valid769` | `cbc965937f4fc2c6b9a151a0024f4283e18ae1e3781198800d58f23e31b059f3` | `92c9ff029e1ded9b7e08f56d8e3b04e9ded198f6289221de47385fff667c5845` | 0.3649149871 | 0.0374931669 |
+| `valid831` | `6c0ad7401a09409a707d995e0cc35ac1a7db579c8738262c847f9d6b8cd5b4a2` | `8ae299a67efdb7e8abb3f4d52842e248341d9d8076de2a8e9033da8357b538f5` | 0.3199291223 | 0.0323933496 |
+| `valid832` | `53c0cfc02674331795d5243e14a0c67386fc9b2d901e4d9076938aac2c3fd5d9` | `1c01b2f7ed46b6b0a948b6873755989a572520bdb68a5de3ad31612db078c4b9` | 0.3187053494 | 0.0348590429 |
+| `valid833` | `ce0382fba2e5be6f36fee68b6be584555b804b7168fbbfb311653e1aecad8a80` | `f56f62eb56fb8e5f0b7989f04cbd548fac24142e282eda9d5334e32374962617` | 0.3173608216 | 0.0326644662 |
+| `valid1023` | `b70afc4fbdb3d8248e081b57a3b0ba543c0be859ea9c82e46d969fe669abcfc9` | `c5199af1c94d6afd600b1b6147699acf10854f43bbb42dc891170874d5d5af79` | 0.0333121893 | 0.0333121893 |
+
+Runtime validation records aggregate metrics, the worst relative L2, cosine,
+maximum error, and mean error over individual query rows, plus exact metrics
+for the last unaffected, first affected, and second affected rows when those
+rows exist in the final chunk. Both aggregate and every-row gates require
+relative L2 below 0.01, cosine at least 0.9999, and maximum absolute error at
+most 0.02. Candidate duration must be below the 100 ms hard limit and 75 ms
+promotion ceiling.
+
+The compile path pins and delegates the promoted nonzero-scale probe. It still
+requires one q768 ROCm Triton call in each IR dialect, exact parsed and
+independently checked raw `query_start=768`/`query_size=256` metadata, no outer
+`while`, 6,295,552 argument bytes, 2,097,152 output bytes, zero alias bytes,
+and no more than 64 MiB temporary memory. Counters permit exactly one lower,
+compile, tuple placement, checked invocation, and retrieval, with no warmup,
+replay, backward, accelerator reference/reduction, or model call.
+
+After independent source review, each case would require a separate command
+of this form. This is a pending command template, not evidence that it ran:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-c256-t1024-valid768.telemetry.jsonl \
+  --card card1 \
+  --interval 0.1 \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 15 \
+  --max-junction-temp-c 70 \
+  --max-gpu-power-watts 315 \
+  --max-vram-gib 2 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_padding.py \
+       --platform rocm --allow-gpu --case valid768 \
+       --output /tmp/query-bounded-gqa-c256-t1024-valid768.jsonl
+```
+
+No case is promoted by this documentation or its CPU tests. A passing private
+child artifact and profiler telemetry must be independently audited before
+advancing to another case or to backward/model integration.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
