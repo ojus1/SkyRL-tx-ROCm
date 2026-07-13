@@ -300,10 +300,12 @@ to one bounded stage and permits a stage-by-stage rollback to the JAX reference.
 
 ### 1. LoRA routing
 
-Use direct A/B selection and ordinary GEMMs for the common batch-size-one path.
-Keep the sorted ragged-dot path for true mixed-adapter batches. If larger mixed
-batches become important, prepare their token permutation and group sizes once
-per model pass rather than once per LoRA layer.
+Direct A/B selection and ordinary GEMMs for the common batch-size-one path are
+already implemented by `LoRAMixin._apply_single_adapter_lora`; this is the
+baseline, not remaining megakernel work. Keep the sorted ragged-dot path for
+true mixed-adapter batches. If larger mixed batches become important, prepare
+their token permutation and group sizes once per model pass rather than once
+per LoRA layer.
 
 For backward, each token superblock writes unique FP32 partial `dA` and `dB`.
 A deterministic second-stage tree reduction avoids contended atomics.
@@ -735,11 +737,14 @@ lookup would reduce the memory saving and must be reported explicitly.
    not store attention softmax data, Q/K normalization statistics, GDN U/W, or
    recurrent state in O8. The benefit must be measured with rematerialization
    enabled because XLA may not retain every boundary.
-6. **Blockwise INT8 Adam moments.** The exact two-adapter, rank-8 shape has
-   34,512,896 trainable LoRA elements. Its two BF16 moment arrays occupy about
-   131.7 MiB; two INT8 moment arrays would use about 65.8 MiB plus scales, saving
-   only about 65.8 MiB. Perform the update and bias correction in FP32. This is
-   lower priority than compacting inactive adapter slots or quantizing the base.
+6. **Blockwise INT8 Adam moments.** The implemented semantic prototype is
+   negative evidence for the current BF16 training path. For the exact
+   two-adapter, rank-8 inventory, its byte payloads plus block-16 FP32
+   scales/offsets use 90.51 MiB and save only 41.14 MiB versus BF16 moments.
+   Its fixed 100-step BF16 comparison reached 5.239612% worst relative
+   update-norm error and failed the 1% gate. Keep it unwired; a materially
+   different encoding would be a new experiment. This remains lower priority
+   than compacting inactive adapter slots or quantizing the frozen base.
 7. **O4 boundaries and four-bit optimizer state.** Defer. Integer-four-bit
    matrix support does not make four-bit residual checkpoints or Adam moments
    numerically safe, and those encodings risk corrupting residual, norm,
@@ -935,8 +940,9 @@ an unsafe compute dispatch acceptable. GPU experiments must remain serialized.
 
 ## Recommended implementation order
 
-1. Single-adapter LoRA fast path and reusable routing.
-2. Watchdog-bounded native-GQA Pallas custom VJP.
+1. Preserve the completed single-adapter LoRA fast path; add reusable routing
+   only if true mixed-adapter batches become important.
+2. Complete and qualify the watchdog-bounded native-GQA Pallas custom VJP.
 3. Split-vocabulary tied linear-logprob Pallas prototype.
 4. Gate/up+SwiGLU Pallas prototype and exact custom VJP.
 5. Minimal typed HIP/FFI reference handler and CPU fallback.
