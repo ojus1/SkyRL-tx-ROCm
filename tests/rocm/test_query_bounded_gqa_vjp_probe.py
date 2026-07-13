@@ -47,6 +47,11 @@ def exact_case():
     return _PROBE._construct_host_case(np, ml_dtypes)
 
 
+@pytest.fixture(scope="module")
+def valid385_case():
+    return _PROBE._construct_host_case(np, ml_dtypes, "valid385")
+
+
 def test_default_is_abstract_refusal_without_accelerator_import():
     before = _accelerator_modules()
     output = io.StringIO()
@@ -77,6 +82,8 @@ def test_default_is_abstract_refusal_without_accelerator_import():
         (("--sequence-length", "1024"), "unrecognized arguments"),
         (("--replay",), "unrecognized arguments"),
         (("--padding",), "unrecognized arguments"),
+        (("--case", "valid384"), "invalid choice"),
+        (("--case", "385"), "invalid choice"),
         (("--second-vjp",), "unrecognized arguments"),
         (("--compile-diagnostic",), "only valid with --platform rocm"),
         (
@@ -123,6 +130,32 @@ def test_compile_diagnostic_requires_full_rocm_acknowledgement_and_private_outpu
     assert contract["host_reference_construction_authorized"] is False
     assert contract["executable_invocation_authorized"] is False
     assert contract["always_stop_after_compile_and_postflight"] is True
+
+
+def test_valid385_parser_and_compile_diagnostic_remain_explicit_and_closed(tmp_path):
+    path = tmp_path / "valid385-compile.jsonl"
+    args = _PROBE._parse_args(
+        [
+            "--platform",
+            "rocm",
+            "--allow-gpu",
+            "--compile-diagnostic",
+            "--case",
+            "valid385",
+            "--output",
+            str(path),
+        ]
+    )
+    assert args.case == "valid385"
+    contract = _PROBE._compile_diagnostic_contract(args.case)
+    assert contract["case"] == "valid385"
+    assert contract["inputs"][3]["value"] == "ones_before_385_zeros_at_and_after_385"
+    assert "bitwise_positive_zero" in contract["inputs"][4]["value"]
+    assert contract["compile_gate"]["exact_argument_bytes"] == 10_487_808
+    assert contract["compile_gate"]["exact_output_bytes"] == 10_485_792
+    assert contract["checked_capability_creation_or_release_authorized"] is False
+    assert contract["host_reference_construction_authorized"] is False
+    assert contract["executable_invocation_authorized"] is False
 
 
 def test_exact_contract_fixes_shape_dispatch_memory_and_numerical_gates():
@@ -188,6 +221,20 @@ def test_exact_contract_fixes_shape_dispatch_memory_and_numerical_gates():
             "model_invocations",
         )
     )
+
+
+def test_valid385_contract_adds_only_host_case_and_validation_gates():
+    default = _PROBE._exact_contract()
+    padded = _PROBE._exact_contract("valid385")
+    assert padded["case"] == "valid385"
+    assert padded["valid_tokens"] == 385
+    assert padded["padding_side"] == "right"
+    assert padded["loss_mask_applied_to_host_dout_before_device_put"] is True
+    assert padded["compile_gate"] == default["compile_gate"]
+    assert padded["execution_contract"] == default["execution_contract"]
+    assert padded["tiles"] == default["tiles"]
+    assert padded["affected_forward_output_rows_numerically_gated"] == [385, 512]
+    assert all(padded["padded_zero_gates"].values())
 
 
 def test_static_source_binding_and_kernel_api_are_exact(monkeypatch):
@@ -257,6 +304,75 @@ def test_exact_host_inputs_cotangent_hashes_norms_and_scratch(exact_case):
     assert np.count_nonzero(dout) == dout.size
     assert not np.array_equal(q, dout)
     assert all(array.dtype == np.float32 for array in expected)
+
+
+def test_valid385_host_inputs_oracle_hashes_zero_tails_and_sensitivity(valid385_case):
+    inputs, manifests, expected, reference = valid385_case
+    q, k, v, key_mask, dout = inputs
+    assert {item["name"]: item["sha256"] for item in manifests} == (
+        _PROBE._EXPECTED_VALID385_INPUT_SHA256
+    )
+    assert {item["name"]: item["sha256"] for item in reference["outputs"]} == (
+        _PROBE._EXPECTED_VALID385_REFERENCE_SHA256
+    )
+    assert reference["reference_l2_norms"] == pytest.approx(
+        _PROBE._EXPECTED_VALID385_REFERENCE_NORMS, abs=1e-12
+    )
+    assert all(reference["calibration_pin_checks"].values())
+    assert reference["case"] == "valid385"
+    assert reference["valid_tokens"] == 385
+    assert np.all(key_mask[:, :385] == 1)
+    assert np.all(key_mask[:, 385:] == 0)
+    assert np.count_nonzero(dout[:, :385]) == dout[:, :385].size
+    assert _PROBE._bitwise_positive_zero(np, dout[:, 385:])
+    assert q.dtype == k.dtype == v.dtype == dout.dtype == ml_dtypes.bfloat16
+    for value in expected[1:]:
+        assert _PROBE._bitwise_positive_zero(np, value[:, 385:])
+    sensitivity = reference["sensitivity_controls"]
+    assert sensitivity["alternative_reference_sha256"] == (
+        _PROBE._EXPECTED_VALID385_SENSITIVITY_SHA256
+    )
+    assert (
+        sensitivity["ignored_key_mask"]["fails_affected_output_numerical_gate"] is True
+    )
+    assert all(
+        sensitivity["ignored_key_mask"][
+            "boundary_controls_fail_individual_output_numerical_gates"
+        ].values()
+    )
+    assert all(
+        sensitivity["ignored_key_mask"][
+            "gradients_exactly_equal_to_correct_reference"
+        ].values()
+    )
+    assert sensitivity["ignored_key_mask"]["backward_sensitivity_claimed"] is False
+    assert sensitivity["ignored_loss_mask"]["fails_padded_dq_zero_gate"] is True
+    assert all(
+        sensitivity["ignored_loss_mask"][
+            "full_gradient_numerical_gate_failures"
+        ].values()
+    )
+    assert (
+        sensitivity["ignored_loss_mask"]["output_exactly_equal_to_correct_reference"]
+        is True
+    )
+    transform = reference["host_loss_mask_transformation"]
+    assert (
+        transform["raw_unmasked_dout_sha256"] == _PROBE._EXPECTED_INPUT_SHA256["dout"]
+    )
+    assert transform["raw_unmasked_dout_elements"] == 2_097_152
+    assert transform["raw_unmasked_dout_nonzero_elements"] == 2_097_152
+    assert transform["active_prefix_byte_equal_to_raw"] is True
+    assert transform["padded_tail_bitwise_positive_zero"] is True
+    assert transform["raw_values_emitted"] is False
+
+
+def test_valid385_calibration_pin_mutation_fails_closed(monkeypatch):
+    corrupted = dict(_PROBE._EXPECTED_VALID385_INPUT_SHA256)
+    corrupted["key_mask"] = "0" * 64
+    monkeypatch.setattr(_PROBE, "_EXPECTED_VALID385_INPUT_SHA256", corrupted)
+    with pytest.raises(RuntimeError, match="calibration pin changed"):
+        _PROBE._construct_host_case(np, ml_dtypes, "valid385")
 
 
 @pytest.mark.parametrize(
@@ -331,6 +447,95 @@ def test_tiled_vjp_matches_independent_float64_directional_finite_differences():
         assert analytic == pytest.approx(finite_difference, rel=2e-3, abs=2e-4)
 
 
+def test_padded_tiled_vjp_matches_independent_float64_directional_differences():
+    rng = np.random.Generator(np.random.PCG64(8441))
+    q = rng.uniform(-0.5, 0.5, (1, 6, 4, 3)).astype(np.float32)
+    k = rng.uniform(-0.5, 0.5, (1, 6, 2, 3)).astype(np.float32)
+    v = rng.uniform(-0.5, 0.5, (1, 6, 2, 3)).astype(np.float32)
+    dout = rng.uniform(-0.3, 0.3, q.shape).astype(np.float32)
+    dout[:, 4:] = 0
+    mask = np.zeros((1, 6), np.int32)
+    mask[:, :4] = 1
+    (_output, dq, dk, dv), _metadata = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np, q, k, v, mask, dout, scale=3 / 32, query_tile=3, key_tile=2
+    )
+
+    def scalar_loss(q_item, k_item, v_item):
+        q64 = np.asarray(q_item[0], np.float64)
+        k64 = np.repeat(np.asarray(k_item[0], np.float64), 2, axis=1)
+        v64 = np.repeat(np.asarray(v_item[0], np.float64), 2, axis=1)
+        logits = np.einsum("thd,shd->hts", q64, k64) * (3 / 32)
+        invalid = np.triu(np.ones((6, 6), dtype=np.bool_), k=1)
+        invalid[:, 4:] = True
+        logits[:, invalid] = -np.inf
+        logits -= np.max(logits, axis=2, keepdims=True)
+        probability = np.exp(logits)
+        probability /= np.sum(probability, axis=2, keepdims=True)
+        value = np.einsum("hts,shd->thd", probability, v64)
+        return float(np.sum(value * np.asarray(dout[0], np.float64)))
+
+    epsilon = 1e-4
+    for index, (primal, gradient) in enumerate(zip((q, k, v), (dq, dk, dv))):
+        direction = rng.normal(size=primal.shape).astype(np.float32)
+        plus = [q, k, v]
+        minus = [q, k, v]
+        plus[index] = primal + epsilon * direction
+        minus[index] = primal - epsilon * direction
+        finite_difference = (scalar_loss(*plus) - scalar_loss(*minus)) / (2 * epsilon)
+        analytic = float(
+            np.sum(np.asarray(gradient, np.float64) * np.asarray(direction, np.float64))
+        )
+        assert analytic == pytest.approx(finite_difference, rel=2e-3, abs=2e-4)
+
+
+def test_padded_oracle_proves_key_mask_and_loss_mask_sensitivity_limits():
+    rng = np.random.Generator(np.random.PCG64(8612))
+    q = rng.uniform(-0.6, 0.6, (1, 7, 4, 3)).astype(np.float32)
+    k = rng.uniform(-0.6, 0.6, (1, 7, 2, 3)).astype(np.float32)
+    v = rng.uniform(-0.6, 0.6, k.shape).astype(np.float32)
+    raw_dout = rng.uniform(-0.4, 0.4, q.shape).astype(np.float32)
+    masked_dout = raw_dout.copy()
+    masked_dout[:, 4:] = 0
+    mask = np.zeros((1, 7), np.int32)
+    mask[:, :4] = 1
+    correct, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np, q, k, v, mask, masked_dout, scale=3 / 32, query_tile=3, key_tile=2
+    )
+    ignored_key, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        np.ones_like(mask),
+        masked_dout,
+        scale=3 / 32,
+        query_tile=3,
+        key_tile=2,
+    )
+    assert not np.array_equal(ignored_key[0], correct[0])
+    assert all(
+        np.array_equal(wrong, expected)
+        for wrong, expected in zip(ignored_key[1:], correct[1:], strict=True)
+    )
+    ignored_loss, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        mask,
+        raw_dout,
+        scale=3 / 32,
+        query_tile=3,
+        key_tile=2,
+        _require_loss_masked_padding=False,
+    )
+    assert np.array_equal(ignored_loss[0], correct[0])
+    assert all(
+        not np.array_equal(wrong, expected)
+        for wrong, expected in zip(ignored_loss[1:], correct[1:], strict=True)
+    )
+
+
 def test_exact_t512_tiled_oracle_matches_dense_reference(exact_case):
     inputs, _manifests, expected, _reference = exact_case
     dense = _PROBE._dense_causal_gqa_forward_vjp_reference(np, *inputs, scale=3 / 32)
@@ -338,24 +543,70 @@ def test_exact_t512_tiled_oracle_matches_dense_reference(exact_case):
         np.testing.assert_allclose(actual, dense_item, rtol=3e-6, atol=6e-7)
 
 
-def test_oracle_rejects_padding_and_degenerate_shapes():
+def test_valid385_t512_tiled_oracle_matches_dense_reference(valid385_case):
+    inputs, _manifests, expected, _reference = valid385_case
+    dense = _PROBE._dense_causal_gqa_forward_vjp_reference(np, *inputs, scale=3 / 32)
+    for actual, dense_item in zip(expected, dense, strict=True):
+        np.testing.assert_allclose(actual, dense_item, rtol=3e-6, atol=8e-7)
+
+
+def test_small_right_padded_loss_masked_tiled_oracle_matches_dense_reference():
+    rng = np.random.Generator(np.random.PCG64(7744))
+    q = rng.uniform(-0.7, 0.7, (1, 9, 4, 5)).astype(np.float32)
+    k = rng.uniform(-0.7, 0.7, (1, 9, 2, 5)).astype(np.float32)
+    v = rng.uniform(-0.7, 0.7, k.shape).astype(np.float32)
+    dout = rng.uniform(-0.5, 0.5, q.shape).astype(np.float32)
+    dout[:, 5:] = 0
+    mask = np.zeros((1, 9), np.int32)
+    mask[:, :5] = 1
+    tiled, metadata = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np, q, k, v, mask, dout, scale=3 / 32, query_tile=4, key_tile=3
+    )
+    dense = _PROBE._dense_causal_gqa_forward_vjp_reference(
+        np, q, k, v, mask, dout, scale=3 / 32
+    )
+    for actual, expected in zip(tiled, dense, strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=3e-6, atol=6e-7)
+    assert metadata["valid_tokens"] == 5
+    assert metadata["right_padded_key_mask"] is True
+    for value in tiled[1:]:
+        assert _PROBE._bitwise_positive_zero(np, value[:, 5:])
+
+
+def test_oracle_rejects_invalid_padding_loss_mask_and_degenerate_shapes():
     q = np.ones((1, 8, 4, 3), np.float32)
     k = np.ones((1, 8, 2, 3), np.float32)
     v = np.ones_like(k)
     dout = np.ones_like(q)
     mask = np.ones((1, 8), np.int32)
     mask[:, -1] = 0
-    with pytest.raises(RuntimeError, match="all-valid"):
+    with pytest.raises(RuntimeError, match="bitwise-positive-zero"):
         _PROBE._tiled_causal_gqa_forward_vjp_oracle(
             np, q, k, v, mask, dout, scale=3 / 32
         )
-    with pytest.raises(RuntimeError, match="int32-ones"):
+    with pytest.raises(RuntimeError, match="binary int32"):
         _PROBE._tiled_causal_gqa_forward_vjp_oracle(
             np, q, k, v, np.full_like(mask, 2), dout, scale=3 / 32
         )
-    with pytest.raises(RuntimeError, match="int32-ones"):
+    with pytest.raises(RuntimeError, match="binary int32"):
         _PROBE._tiled_causal_gqa_forward_vjp_oracle(
             np, q, k, v, np.ones_like(mask, dtype=np.bool_), dout, scale=3 / 32
+        )
+    nonprefix = np.ones_like(mask)
+    nonprefix[:, 3] = 0
+    with pytest.raises(RuntimeError, match="right-padded"):
+        _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+            np, q, k, v, nonprefix, dout, scale=3 / 32
+        )
+    with pytest.raises(RuntimeError, match="nonempty"):
+        _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+            np, q, k, v, np.zeros_like(mask), np.zeros_like(dout), scale=3 / 32
+        )
+    negative_zero_dout = dout.copy()
+    negative_zero_dout[:, -1] = np.float32(-0.0)
+    with pytest.raises(RuntimeError, match="bitwise-positive-zero"):
+        _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+            np, q, k, v, mask, negative_zero_dout, scale=3 / 32
         )
     with pytest.raises(RuntimeError, match="shapes"):
         _PROBE._tiled_causal_gqa_forward_vjp_oracle(
@@ -1104,6 +1355,183 @@ def test_bf16_rounded_reference_passes_and_corrupted_gradient_fails(exact_case):
         )
 
 
+def test_valid385_bf16_reference_passes_all_numerical_and_zero_tail_gates(
+    valid385_case,
+):
+    _inputs, _manifests, expected, _reference = valid385_case
+    actual = tuple(item.astype(ml_dtypes.bfloat16) for item in expected)
+    record = _PROBE._validate_candidate(
+        np,
+        actual,
+        expected,
+        0.01,
+        _PROBE._completed_counters(),
+        io.StringIO(),
+        "valid385",
+    )
+    assert record["gates"]["promotion_passed"] is True
+    assert record["gates"]["case_specific_padded_validation_passed"] is True
+    assert record["padded_validation"]["affected_output_rows_numerical_passed"] is True
+    assert record["padded_validation"]["all_zero_tail_gates_passed"] is True
+    assert record["padded_validation"]["boundary_output_rows"] == [384, 385, 511]
+    assert all(
+        record["padded_validation"]["boundary_output_rows_numerical_passed"].values()
+    )
+    assert all(record["padded_validation"]["active_gradient_numerical_passed"].values())
+    for item in record["padded_validation"]["exact_numeric_zero_tails"].values():
+        assert item["actual"]["numeric_exact_zero"] is True
+        assert item["reference"]["numeric_exact_zero"] is True
+        assert item["reference"]["bitwise_positive_zero_diagnostic_only"] is True
+
+
+def test_valid385_negative_zero_gradient_tail_is_accepted_as_numeric_zero(
+    valid385_case,
+):
+    _inputs, _manifests, expected, _reference = valid385_case
+    actual = [item.astype(ml_dtypes.bfloat16) for item in expected]
+    actual[1][0, 385, 0, 0] = ml_dtypes.bfloat16(-0.0)
+    record = _PROBE._validate_candidate(
+        np,
+        tuple(actual),
+        expected,
+        0.01,
+        _PROBE._completed_counters(),
+        io.StringIO(),
+        "valid385",
+    )
+    dq = record["padded_validation"]["exact_numeric_zero_tails"]["dq"]
+    assert dq["actual"]["numeric_exact_zero"] is True
+    assert dq["actual"]["bitwise_positive_zero_diagnostic_only"] is False
+    assert record["gates"]["promotion_passed"] is True
+
+
+def test_valid385_nonzero_gradient_tail_fails_exact_numeric_zero_gate(valid385_case):
+    _inputs, _manifests, expected, _reference = valid385_case
+    actual = [item.astype(ml_dtypes.bfloat16) for item in expected]
+    actual[1][0, 385, 0, 0] = ml_dtypes.bfloat16(2**-8)
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            tuple(actual),
+            expected,
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+            "valid385",
+        )
+    [record] = _records(output)
+    dq = record["padded_validation"]["exact_numeric_zero_tails"]["dq"]
+    assert dq["actual"]["numeric_exact_zero"] is False
+    assert dq["actual"]["count_nonzero"] == 1
+    assert record["gates"]["case_specific_padded_validation_passed"] is False
+
+
+def test_valid385_ignored_key_mask_fails_affected_forward_rows(valid385_case):
+    inputs, _manifests, expected, _reference = valid385_case
+    q, k, v, _mask, dout = inputs
+    wrong, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        np.ones((1, 512), np.int32),
+        dout,
+        scale=3 / 32,
+    )
+    actual = [item.astype(ml_dtypes.bfloat16) for item in expected]
+    actual[0] = wrong[0].astype(ml_dtypes.bfloat16)
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            tuple(actual),
+            expected,
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+            "valid385",
+        )
+    [record] = _records(output)
+    assert record["padded_validation"]["affected_output_rows_numerical_passed"] is False
+    assert record["padded_validation"]["all_zero_tail_gates_passed"] is True
+
+
+def test_valid385_each_boundary_output_row_is_independently_gated(valid385_case):
+    inputs, _manifests, expected, _reference = valid385_case
+    q, k, v, _mask, dout = inputs
+    alternatives = {}
+    for valid_tokens, row in ((384, 384), (386, 385), (512, 511)):
+        mask = np.zeros((1, 512), np.int32)
+        mask[:, :valid_tokens] = 1
+        alternative, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+            np,
+            q,
+            k,
+            v,
+            mask,
+            dout,
+            scale=3 / 32,
+            _require_loss_masked_padding=valid_tokens != 384,
+        )
+        alternatives[row] = alternative[0]
+    for row, wrong_output in alternatives.items():
+        actual = [item.astype(ml_dtypes.bfloat16) for item in expected]
+        actual[0][:, row] = wrong_output.astype(ml_dtypes.bfloat16)[:, row]
+        output = io.StringIO()
+        with pytest.raises(RuntimeError, match="numerical"):
+            _PROBE._validate_candidate(
+                np,
+                tuple(actual),
+                expected,
+                0.01,
+                _PROBE._completed_counters(),
+                output,
+                "valid385",
+            )
+        [record] = _records(output)
+        boundary = record["padded_validation"]["boundary_output_rows_numerical_passed"]
+        assert boundary[str(row)] is False
+        assert all(value for name, value in boundary.items() if name != str(row))
+        assert record["padded_validation"]["all_zero_tail_gates_passed"] is True
+
+
+def test_valid385_ignored_loss_mask_fails_gradient_and_dq_tail_gates(
+    valid385_case, exact_case
+):
+    inputs, _manifests, expected, _reference = valid385_case
+    q, k, v, mask, _masked_dout = inputs
+    unmasked_dout = exact_case[0][4]
+    wrong, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        mask,
+        unmasked_dout,
+        scale=3 / 32,
+        _require_loss_masked_padding=False,
+    )
+    actual = tuple(item.astype(ml_dtypes.bfloat16) for item in wrong)
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            actual,
+            expected,
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+            "valid385",
+        )
+    [record] = _records(output)
+    assert record["gates"]["all_tensor_numerical_passed"] is False
+    tails = record["padded_validation"]["exact_numeric_zero_tails"]
+    assert tails["dq"]["actual"]["numeric_exact_zero"] is False
+    assert tails["dk"]["actual"]["numeric_exact_zero"] is True
+    assert tails["dv"]["actual"]["numeric_exact_zero"] is True
+
+
 def test_nonfinite_candidate_emits_json_safe_failure_before_failing(exact_case):
     _inputs, _manifests, expected, _reference = exact_case
     actual = [item.astype(ml_dtypes.bfloat16) for item in expected]
@@ -1294,7 +1722,8 @@ def test_fake_run_rocm_executes_one_put_one_checked_call_one_get_and_exact_count
         )
         return dict(_CLEAN)
 
-    def validate(_np, actual, expected, seconds, counters, output):
+    def validate(_np, actual, expected, seconds, counters, output, case):
+        assert case == "all_valid"
         assert actual == ("q", "q", "k", "v")
         assert expected == (
             "expected-output",
@@ -1349,7 +1778,7 @@ def test_fake_run_rocm_executes_one_put_one_checked_call_one_get_and_exact_count
     monkeypatch.setattr(
         _PROBE,
         "_construct_host_case",
-        lambda _np, _ml: (
+        lambda _np, _ml, case: (
             ("q", "k", "v", "mask", "dout"),
             [],
             ("expected-output", "expected-dq", "expected-dk", "expected-dv"),

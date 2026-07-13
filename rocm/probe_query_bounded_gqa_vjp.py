@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guarded exact-T512 full arbitrary-cotangent GQA VJP gate.
+"""Guarded exact-T512 full GQA VJP gate.
 
 The default ``abstract`` mode emits a refusal manifest without importing JAX.
 ROCm requires ``--platform rocm --allow-gpu --output`` in a fresh process under
@@ -19,11 +19,15 @@ before postflight.  That path cannot construct a host reference or device
 inputs, create a checked capability, invoke the executable, or retrieve output.
 
 Q/K/V and the output cotangent are independent deterministic nonzero BF16
-PCG64 grids.  Validation uses an independent host NumPy FP32 causal-GQA
-forward/backward oracle.  It streams over 32-query/32-key tiles and recomputes
-probabilities, never retaining a complete T-by-T matrix.  Output, dQ, dK, and
-dV are gated independently.  There is no warmup, replay, second invocation,
-GPU reference/reduction, model call, padding case, or backward-of-backward.
+PCG64 grids.  The default case remains all-valid.  The only padded case is
+``--case valid385``: its int32 key mask is one through row 384 and zero after,
+and its independently generated cotangent is set to bitwise positive zero
+after row 384 to model loss masking.  Validation uses an independent host
+NumPy FP32 causal-GQA forward/backward oracle.  It streams over
+32-query/32-key tiles and recomputes probabilities, never retaining a complete
+T-by-T matrix.  Output, dQ, dK, and dV are gated independently.  There is no
+warmup, replay, second invocation, GPU reference/reduction, model call, or
+backward-of-backward.
 """
 
 from __future__ import annotations
@@ -59,6 +63,9 @@ _COTANGENT_SEED = 20260714
 _GRID_DENOMINATOR = 128
 _QKV_MAXIMUM_INTEGER_MAGNITUDE = 96
 _COTANGENT_MAXIMUM_INTEGER_MAGNITUDE = 48
+_ALL_VALID_CASE = "all_valid"
+_VALID385_CASE = "valid385"
+_CASE_VALID_TOKENS = {_ALL_VALID_CASE: 512, _VALID385_CASE: 385}
 _EXPECTED_ARGUMENT_BYTES = 10_487_808
 _EXPECTED_OUTPUT_BYTES = 10_485_792
 _EXPECTED_ALIAS_BYTES = 0
@@ -105,6 +112,71 @@ _EXPECTED_REFERENCE_NORMS = {
 }
 _EXPECTED_ORACLE_SCRATCH_BYTES = 323_072
 _EXPECTED_MAXIMUM_ABSOLUTE_VALID_LOGIT = 1.4235591888427734
+_EXPECTED_VALID385_INPUT_SHA256 = {
+    "q": "ff889e094bfb7ce5e55446f1fff3956a747eed7986e9c30d170f7c4433b9bda7",
+    "k": "e5d2258530fcb373b981167ba116b43306bb424f565bbf2da7f5c55810369978",
+    "v": "26f13a090d34805fb6fc1ea002c65e7d7cdb9952b8a582cd132246fe54420699",
+    "key_mask": "7fe610e6a15b1f19c3266fff71c6c63030a974bf986266a719a388f76f7b9299",
+    "dout": "2641e35a3b1dcdd277a6aa44ccc341552112617b77f3d12585eac15cd74c905b",
+}
+_EXPECTED_VALID385_REFERENCE_SHA256 = {
+    "output": "7e488e1ef314cbc513714ed4914cecc398d184d46e52bef14eb9cf513c45d8b1",
+    "dq": "f995a2ec2da893d24f3a23fb71e984907ce81b6759983a4cecc95dbc94df29c5",
+    "dk": "813dc721ff7931a15e4d5b0cc61f493e6cc222bedf813761f681b481fe0bb291",
+    "dv": "10a42a2ae5ee8c8d99ee77919aeec1f1598d30c18e1fc065f2631d5833c6426c",
+}
+_EXPECTED_VALID385_REFERENCE_NORMS = {
+    "output": 75.66161081261592,
+    "dq": 8.937369297138494,
+    "dk": 8.988992969708956,
+    "dv": 37.09246081216146,
+}
+_EXPECTED_VALID385_MAXIMUM_ABSOLUTE_VALID_LOGIT = 1.4235591888427734
+_EXPECTED_VALID385_SENSITIVITY_SHA256 = {
+    "ignored_key_mask_output": "273c1e5694bc21b03798ccd73b8c8be669218d41c82e1b23236c2e3a4bea506f",
+    "wrong_valid384_output": "2ad3945dcc49b1b4803bc0aca92dd4b9b48230c70f8730422a1a1c0ec006babe",
+    "wrong_valid386_output": "f05bf273961a86119e7ef23cc29316b65d252954ccd547c72bc523a7efed7e3b",
+    "ignored_loss_mask_dq": "51b55482a9effa4047952d143380f0f731882af3a94b34db88854669ab26235e",
+    "ignored_loss_mask_dk": "fa41910c6e79e288575fc590306f80753b76a04656c0aa56d3356b5560d25ef6",
+    "ignored_loss_mask_dv": "7e27fb07e7e521ae28ec7a1b4a3a9e50826f83592705511db1c810a7460bdd12",
+}
+_EXPECTED_VALID385_SENSITIVITY_METRICS = {
+    "ignored_key_mask_affected": {
+        "relative_l2": 0.3657309920526969,
+        "cosine": 0.9307311482256659,
+        "max_abs": 0.053003087639808655,
+    },
+    "ignored_key_mask_boundary_384_wrong_valid384": {
+        "relative_l2": 0.051949241238546565,
+        "cosine": 0.998651428667888,
+        "max_abs": 0.00296160951256752,
+    },
+    "ignored_key_mask_boundary_385_wrong_valid386": {
+        "relative_l2": 0.05737496052545676,
+        "cosine": 0.9983563895485048,
+        "max_abs": 0.004151057451963425,
+    },
+    "ignored_key_mask_boundary_511_ignored_key_mask": {
+        "relative_l2": 0.49378035447136176,
+        "cosine": 0.869597168664908,
+        "max_abs": 0.053003087639808655,
+    },
+    "ignored_loss_mask_dq": {
+        "relative_l2": 0.26905400487417747,
+        "cosine": 0.9656585954892194,
+        "max_abs": 0.016500195488333702,
+    },
+    "ignored_loss_mask_dk": {
+        "relative_l2": 0.2670853309515711,
+        "cosine": 0.9660999339963957,
+        "max_abs": 0.01844042629818432,
+    },
+    "ignored_loss_mask_dv": {
+        "relative_l2": 0.23070081049708538,
+        "cosine": 0.9745800453229094,
+        "max_abs": 0.05243309319484979,
+    },
+}
 _EXPECTED_AMD_PCI_DEVICE_ID = "0x744c"
 _EXPECTED_GPU_ARCHITECTURE = "gfx1100"
 _IR_NAME_TOKEN_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.$-]*")
@@ -359,12 +431,24 @@ def _compile_diagnostic_completed_counters() -> dict[str, int]:
     return result
 
 
-def _exact_contract() -> dict[str, Any]:
+def _normalize_case(case: str) -> str:
+    if case not in _CASE_VALID_TOKENS:
+        raise RuntimeError("VJP case is outside the exact closed case set")
+    return case
+
+
+def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
+    case = _normalize_case(case)
+    valid_tokens = _CASE_VALID_TOKENS[case]
     q_shape = [_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM]
     kv_shape = [_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM]
-    return {
+    contract = {
         "model_family": "Qwen/Qwen3.5-4B",
-        "operation": "query_bounded_gqa_t512_forward_and_full_vjp",
+        "operation": (
+            "query_bounded_gqa_t512_forward_and_full_vjp"
+            if case == _ALL_VALID_CASE
+            else "query_bounded_gqa_t512_valid385_loss_masked_forward_and_full_vjp"
+        ),
         "gpu_architecture": _EXPECTED_GPU_ARCHITECTURE,
         "gpu_pci_device_id": _EXPECTED_AMD_PCI_DEVICE_ID,
         "inputs": [
@@ -375,13 +459,24 @@ def _exact_contract() -> dict[str, Any]:
                 "name": "key_mask",
                 "shape": [_BATCH_SIZE, _SEQUENCE_LENGTH],
                 "dtype": "int32",
-                "value": "all_ones",
+                "value": (
+                    "all_ones"
+                    if case == _ALL_VALID_CASE
+                    else "ones_before_385_zeros_at_and_after_385"
+                ),
             },
             {
                 "name": "dout",
                 "shape": q_shape,
                 "dtype": "bfloat16",
-                "value": "independent_host_pcg64_nonzero_signed_grid",
+                "value": (
+                    "independent_host_pcg64_nonzero_signed_grid"
+                    if case == _ALL_VALID_CASE
+                    else (
+                        "independent_host_pcg64_nonzero_signed_grid_then_"
+                        "bitwise_positive_zero_at_and_after_row_385"
+                    )
+                ),
             },
         ],
         "outputs": [
@@ -462,6 +557,29 @@ def _exact_contract() -> dict[str, Any]:
         "candidate_total_seconds_strictly_below": _MAX_CANDIDATE_SECONDS,
         "promotion_total_seconds_strictly_below": (_MAX_PROMOTION_CANDIDATE_SECONDS),
     }
+    if case == _VALID385_CASE:
+        contract.update(
+            {
+                "case": case,
+                "valid_tokens": valid_tokens,
+                "padding_side": "right",
+                "loss_mask_applied_to_host_dout_before_device_put": True,
+                "padded_zero_gates": {
+                    "dq_query_rows_at_and_after_385_actual_finite_numeric_exact_zero": True,
+                    "dk_key_rows_at_and_after_385_actual_finite_numeric_exact_zero": True,
+                    "dv_key_rows_at_and_after_385_actual_finite_numeric_exact_zero": True,
+                    "deterministic_fp32_reference_tails_bitwise_positive_zero": True,
+                    "candidate_negative_zero_sign_bits_accepted": True,
+                },
+                "affected_forward_output_rows_numerically_gated": [385, 512],
+                "individually_gated_boundary_output_rows": [384, 385, 511],
+                "sensitivity_controls": {
+                    "ignored_key_mask": "all-valid wrong-mask output rows 385:512 must fail the affected-row numerical gate",
+                    "ignored_loss_mask": "unmasked-dout wrong gradient must fail the padded dQ bitwise-zero gate and full-gradient numerical gate",
+                },
+            }
+        )
+    return contract
 
 
 def _abstract_contract() -> dict[str, Any]:
@@ -472,10 +590,14 @@ def _abstract_contract() -> dict[str, Any]:
     }
 
 
-def _compile_diagnostic_contract() -> dict[str, Any]:
-    exact = _exact_contract()
+def _compile_diagnostic_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
+    exact = _exact_contract(case)
     return {
-        "operation": "query_bounded_gqa_t512_full_vjp_compile_diagnostic",
+        "operation": (
+            "query_bounded_gqa_t512_full_vjp_compile_diagnostic"
+            if case == _ALL_VALID_CASE
+            else "query_bounded_gqa_t512_valid385_loss_masked_full_vjp_compile_diagnostic"
+        ),
         "model_family": exact["model_family"],
         "gpu_architecture": exact["gpu_architecture"],
         "gpu_pci_device_id": exact["gpu_pci_device_id"],
@@ -492,6 +614,7 @@ def _compile_diagnostic_contract() -> dict[str, Any]:
         "device_get_authorized": False,
         "always_stop_after_compile_and_postflight": True,
         "raw_ir_emitted": False,
+        "case": case,
     }
 
 
@@ -518,6 +641,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "compile and emit sanitized structural evidence only; never release "
             "or invoke the executable"
         ),
+    )
+    parser.add_argument(
+        "--case",
+        choices=tuple(_CASE_VALID_TOKENS),
+        default=_ALL_VALID_CASE,
+        help="closed host-input case set; default all_valid, or exact padded valid385",
     )
     parser.add_argument(
         "--output",
@@ -2127,8 +2256,15 @@ def _iid_nonzero_grid(
 
 
 def _validate_oracle_inputs(
-    np: Any, q: Any, k: Any, v: Any, key_mask: Any, dout: Any
-) -> tuple[int, int, int, int]:
+    np: Any,
+    q: Any,
+    k: Any,
+    v: Any,
+    key_mask: Any,
+    dout: Any,
+    *,
+    require_loss_masked_padding: bool = True,
+) -> tuple[int, int, int, int, int]:
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or dout.ndim != 4:
         raise RuntimeError("VJP oracle requires rank-four Q/K/V/dout")
     batch, sequence, query_heads, head_dim = q.shape
@@ -2148,10 +2284,21 @@ def _validate_oracle_inputs(
         not isinstance(key_mask, np.ndarray)
         or key_mask.shape != (batch, sequence)
         or key_mask.dtype != np.dtype(np.int32)
-        or not bool(np.all(key_mask == 1))
+        or not bool(np.all((key_mask == 0) | (key_mask == 1)))
     ):
-        raise RuntimeError("VJP gate requires an exact all-valid int32-ones key mask")
-    return sequence, query_heads, k.shape[2], head_dim
+        raise RuntimeError("VJP oracle requires an exact binary int32 key mask")
+    valid_tokens = int(np.sum(key_mask[0], dtype=np.int64))
+    expected_mask = np.zeros((sequence,), dtype=np.int32)
+    expected_mask[:valid_tokens] = 1
+    if valid_tokens <= 0 or not bool(np.array_equal(key_mask[0], expected_mask)):
+        raise RuntimeError("VJP oracle requires a nonempty right-padded key mask")
+    if require_loss_masked_padding and valid_tokens < sequence:
+        padded_dout = np.asarray(dout[:, valid_tokens:])
+        if any(padded_dout.tobytes(order="C")):
+            raise RuntimeError(
+                "padded VJP oracle requires bitwise-positive-zero dout padding rows"
+            )
+    return sequence, query_heads, k.shape[2], head_dim, valid_tokens
 
 
 def _tiled_causal_gqa_forward_vjp_oracle(
@@ -2165,9 +2312,16 @@ def _tiled_causal_gqa_forward_vjp_oracle(
     scale: float,
     query_tile: int = _ORACLE_QUERY_TILE,
     key_tile: int = _ORACLE_KEY_TILE,
+    _require_loss_masked_padding: bool = True,
 ) -> tuple[tuple[Any, Any, Any, Any], dict[str, Any]]:
-    sequence, query_heads, kv_heads, head_dim = _validate_oracle_inputs(
-        np, q, k, v, key_mask, dout
+    sequence, query_heads, kv_heads, head_dim, valid_tokens = _validate_oracle_inputs(
+        np,
+        q,
+        k,
+        v,
+        key_mask,
+        dout,
+        require_loss_masked_padding=_require_loss_masked_padding,
     )
     if query_tile <= 0 or key_tile <= 0 or not math.isfinite(scale) or scale <= 0:
         raise RuntimeError("VJP oracle tile sizes and scale must be positive")
@@ -2197,7 +2351,12 @@ def _tiled_causal_gqa_forward_vjp_oracle(
                 k_block = np.asarray(k[0, key_offset:key_stop, kv_head], np.float32)
                 logits = (q_block @ k_block.T).astype(np.float32, copy=False)
                 logits *= np.float32(scale)
-                valid = key_positions[None, :] <= query_positions[:, None]
+                key_valid = key_mask[0, key_offset:key_stop].astype(
+                    np.bool_, copy=False
+                )
+                valid = (key_positions[None, :] <= query_positions[:, None]) & (
+                    key_valid[None, :]
+                )
                 valid_logits = logits[valid]
                 if valid_logits.size:
                     maximum_absolute_valid_logit = max(
@@ -2224,7 +2383,12 @@ def _tiled_causal_gqa_forward_vjp_oracle(
                 v_block = np.asarray(v[0, key_offset:key_stop, kv_head], np.float32)
                 logits = (q_block @ k_block.T).astype(np.float32, copy=False)
                 logits *= np.float32(scale)
-                valid = key_positions[None, :] <= query_positions[:, None]
+                key_valid = key_mask[0, key_offset:key_stop].astype(
+                    np.bool_, copy=False
+                )
+                valid = (key_positions[None, :] <= query_positions[:, None]) & (
+                    key_valid[None, :]
+                )
                 probabilities = np.exp(
                     np.where(valid, logits - row_max[:, None], np.float32(-np.inf))
                 ).astype(np.float32, copy=False)
@@ -2244,7 +2408,12 @@ def _tiled_causal_gqa_forward_vjp_oracle(
                 v_block = np.asarray(v[0, key_offset:key_stop, kv_head], np.float32)
                 logits = (q_block @ k_block.T).astype(np.float32, copy=False)
                 logits *= np.float32(scale)
-                valid = key_positions[None, :] <= query_positions[:, None]
+                key_valid = key_mask[0, key_offset:key_stop].astype(
+                    np.bool_, copy=False
+                )
+                valid = (key_positions[None, :] <= query_positions[:, None]) & (
+                    key_valid[None, :]
+                )
                 probabilities = np.exp(
                     np.where(valid, logits - row_max[:, None], np.float32(-np.inf))
                 ).astype(np.float32, copy=False)
@@ -2289,6 +2458,9 @@ def _tiled_causal_gqa_forward_vjp_oracle(
         "scratch_bytes_are_conservative_accounting_not_measured_peak": True,
         "observed_maximum_absolute_valid_logit": maximum_absolute_valid_logit,
         "scale": float(scale),
+        "valid_tokens": valid_tokens,
+        "right_padded_key_mask": valid_tokens < sequence,
+        "loss_masked_dout_padding_required": _require_loss_masked_padding,
         "accelerator_used": False,
     }
 
@@ -2296,7 +2468,7 @@ def _tiled_causal_gqa_forward_vjp_oracle(
 def _dense_causal_gqa_forward_vjp_reference(
     np: Any, q: Any, k: Any, v: Any, key_mask: Any, dout: Any, *, scale: float
 ) -> tuple[Any, Any, Any, Any]:
-    sequence, query_heads, kv_heads, head_dim = _validate_oracle_inputs(
+    sequence, query_heads, kv_heads, head_dim, valid_tokens = _validate_oracle_inputs(
         np, q, k, v, key_mask, dout
     )
     if sequence > _SEQUENCE_LENGTH:
@@ -2311,6 +2483,7 @@ def _dense_causal_gqa_forward_vjp_reference(
     dk = np.zeros(k.shape, np.float32)
     dv = np.zeros(v.shape, np.float32)
     invalid = np.triu(np.ones((sequence, sequence), dtype=np.bool_), k=1)
+    invalid[:, valid_tokens:] = True
     for query_head in range(query_heads):
         kv_head = query_head // group_size
         logits = (q_fp32[:, query_head] @ k_fp32[:, kv_head].T).astype(
@@ -2341,9 +2514,218 @@ def _array_manifest(name: str, value: Any) -> dict[str, Any]:
     return _nonzero_probe()._array_manifest(name, value)
 
 
+def _float_difference_metrics(np: Any, actual: Any, expected: Any) -> dict[str, float]:
+    actual64 = np.asarray(actual, np.float64).ravel()
+    expected64 = np.asarray(expected, np.float64).ravel()
+    difference = actual64 - expected64
+    actual_norm = float(np.linalg.norm(actual64))
+    expected_norm = float(np.linalg.norm(expected64))
+    denominator = max(expected_norm, float(np.finfo(np.float64).tiny))
+    cosine_denominator = max(
+        actual_norm * expected_norm, float(np.finfo(np.float64).tiny)
+    )
+    return {
+        "relative_l2": float(np.linalg.norm(difference) / denominator),
+        "cosine": float(np.vdot(actual64, expected64) / cosine_denominator),
+        "max_abs": float(np.max(np.abs(difference))),
+    }
+
+
+def _bitwise_positive_zero(np: Any, value: Any) -> bool:
+    return not any(np.asarray(value).tobytes(order="C"))
+
+
+def _valid385_sensitivity_controls(
+    np: Any,
+    q: Any,
+    k: Any,
+    v: Any,
+    key_mask: Any,
+    masked_dout: Any,
+    unmasked_dout: Any,
+    expected: tuple[Any, ...],
+) -> dict[str, Any]:
+    wrong_key_mask = np.ones_like(key_mask, dtype=np.int32)
+    ignored_key_mask, _ = _tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        wrong_key_mask,
+        masked_dout,
+        scale=_ATTENTION_SCALE,
+    )
+    ignored_loss_mask, _ = _tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        key_mask,
+        unmasked_dout,
+        scale=_ATTENTION_SCALE,
+        _require_loss_masked_padding=False,
+    )
+    valid_tokens = _CASE_VALID_TOKENS[_VALID385_CASE]
+    wrong_valid384_mask = np.zeros_like(key_mask, dtype=np.int32)
+    wrong_valid384_mask[:, : valid_tokens - 1] = 1
+    wrong_valid384, _ = _tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        wrong_valid384_mask,
+        masked_dout,
+        scale=_ATTENTION_SCALE,
+        _require_loss_masked_padding=False,
+    )
+    wrong_valid386_mask = np.zeros_like(key_mask, dtype=np.int32)
+    wrong_valid386_mask[:, : valid_tokens + 1] = 1
+    wrong_valid386, _ = _tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        wrong_valid386_mask,
+        masked_dout,
+        scale=_ATTENTION_SCALE,
+    )
+    expected_output, _expected_dq, _expected_dk, _expected_dv = expected
+    affected_output_metrics = _float_difference_metrics(
+        np,
+        ignored_key_mask[0][:, valid_tokens:],
+        expected_output[:, valid_tokens:],
+    )
+    boundary_output_metrics = {
+        "384_wrong_valid384": _float_difference_metrics(
+            np,
+            wrong_valid384[0][:, valid_tokens - 1 : valid_tokens],
+            expected_output[:, valid_tokens - 1 : valid_tokens],
+        ),
+        "385_wrong_valid386": _float_difference_metrics(
+            np,
+            wrong_valid386[0][:, valid_tokens : valid_tokens + 1],
+            expected_output[:, valid_tokens : valid_tokens + 1],
+        ),
+        "511_ignored_key_mask": _float_difference_metrics(
+            np,
+            ignored_key_mask[0][:, 511:512],
+            expected_output[:, 511:512],
+        ),
+    }
+    ignored_loss_gradient_metrics = {
+        name: _float_difference_metrics(np, wrong, correct)
+        for name, wrong, correct in zip(
+            ("dq", "dk", "dv"),
+            ignored_loss_mask[1:],
+            expected[1:],
+            strict=True,
+        )
+    }
+    hashes = {
+        "ignored_key_mask_output": _array_manifest(
+            "ignored_key_mask_output", ignored_key_mask[0]
+        )["sha256"],
+        "wrong_valid384_output": _array_manifest(
+            "wrong_valid384_output", wrong_valid384[0]
+        )["sha256"],
+        "wrong_valid386_output": _array_manifest(
+            "wrong_valid386_output", wrong_valid386[0]
+        )["sha256"],
+        **{
+            f"ignored_loss_mask_{name}": _array_manifest(
+                f"ignored_loss_mask_{name}", value
+            )["sha256"]
+            for name, value in zip(
+                ("dq", "dk", "dv"), ignored_loss_mask[1:], strict=True
+            )
+        },
+    }
+    affected_key_mask_decisive = (
+        affected_output_metrics["relative_l2"] >= _MAX_RELATIVE_L2
+        or affected_output_metrics["cosine"] < _MIN_COSINE
+        or affected_output_metrics["max_abs"] > _MAX_ABSOLUTE_ERROR
+    )
+    boundary_key_mask_decisive = {
+        name: (
+            item["relative_l2"] >= _MAX_RELATIVE_L2
+            or item["cosine"] < _MIN_COSINE
+            or item["max_abs"] > _MAX_ABSOLUTE_ERROR
+        )
+        for name, item in boundary_output_metrics.items()
+    }
+    loss_gradient_failures = {
+        name: (
+            item["relative_l2"] >= _MAX_RELATIVE_L2
+            or item["cosine"] < _MIN_COSINE
+            or item["max_abs"] > _MAX_ABSOLUTE_ERROR
+        )
+        for name, item in ignored_loss_gradient_metrics.items()
+    }
+    wrong_dq_tail = ignored_loss_mask[1][:, valid_tokens:]
+    ignored_key_gradient_exact_equal = {
+        name: bool(np.array_equal(wrong, correct))
+        for name, wrong, correct in zip(
+            ("dq", "dk", "dv"), ignored_key_mask[1:], expected[1:], strict=True
+        )
+    }
+    ignored_loss_output_exact_equal = bool(
+        np.array_equal(ignored_loss_mask[0], expected_output)
+    )
+    return {
+        "ignored_key_mask": {
+            "comparison": "output_query_rows_385_through_511_and_boundary_rows_384_385_511",
+            "affected_rows_metrics": affected_output_metrics,
+            "boundary_rows_metrics": boundary_output_metrics,
+            "fails_affected_output_numerical_gate": affected_key_mask_decisive,
+            "boundary_controls_fail_individual_output_numerical_gates": (
+                boundary_key_mask_decisive
+            ),
+            "gradients_exactly_equal_to_correct_reference": (
+                ignored_key_gradient_exact_equal
+            ),
+            "backward_sensitivity_claimed": False,
+        },
+        "ignored_loss_mask": {
+            "comparison": "full_dq_dk_dv_and_dq_query_rows_385_through_511",
+            "gradient_metrics": ignored_loss_gradient_metrics,
+            "full_gradient_numerical_gate_failures": loss_gradient_failures,
+            "wrong_dq_padding_bitwise_positive_zero": _bitwise_positive_zero(
+                np, wrong_dq_tail
+            ),
+            "fails_padded_dq_zero_gate": not _bitwise_positive_zero(np, wrong_dq_tail),
+            "output_exactly_equal_to_correct_reference": (
+                ignored_loss_output_exact_equal
+            ),
+        },
+        "alternative_reference_sha256": hashes,
+    }
+
+
+def _case_calibration(
+    case: str,
+) -> tuple[dict[str, str], dict[str, str], dict[str, float], float]:
+    if case == _ALL_VALID_CASE:
+        return (
+            _EXPECTED_INPUT_SHA256,
+            _EXPECTED_REFERENCE_SHA256,
+            _EXPECTED_REFERENCE_NORMS,
+            _EXPECTED_MAXIMUM_ABSOLUTE_VALID_LOGIT,
+        )
+    if case == _VALID385_CASE:
+        return (
+            _EXPECTED_VALID385_INPUT_SHA256,
+            _EXPECTED_VALID385_REFERENCE_SHA256,
+            _EXPECTED_VALID385_REFERENCE_NORMS,
+            _EXPECTED_VALID385_MAXIMUM_ABSOLUTE_VALID_LOGIT,
+        )
+    raise RuntimeError("VJP host construction case is outside the closed set")
+
+
 def _construct_host_case(
-    np: Any, ml_dtypes: Any
+    np: Any, ml_dtypes: Any, case: str = _ALL_VALID_CASE, *, _skip_pins: bool = False
 ) -> tuple[tuple[Any, ...], list[dict[str, Any]], tuple[Any, ...], dict[str, Any]]:
+    case = _normalize_case(case)
+    valid_tokens = _CASE_VALID_TOKENS[case]
     q_shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM)
     kv_shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM)
     input_rng = np.random.Generator(np.random.PCG64(_INPUT_SEED))
@@ -2356,15 +2738,20 @@ def _construct_host_case(
     v = _iid_nonzero_grid(
         np, ml_dtypes, input_rng, kv_shape, _QKV_MAXIMUM_INTEGER_MAGNITUDE
     )
-    key_mask = np.ones((_BATCH_SIZE, _SEQUENCE_LENGTH), dtype=np.int32)
+    key_mask = np.zeros((_BATCH_SIZE, _SEQUENCE_LENGTH), dtype=np.int32)
+    key_mask[:, :valid_tokens] = 1
     dout_rng = np.random.Generator(np.random.PCG64(_COTANGENT_SEED))
-    dout = _iid_nonzero_grid(
+    unmasked_dout = _iid_nonzero_grid(
         np,
         ml_dtypes,
         dout_rng,
         q_shape,
         _COTANGENT_MAXIMUM_INTEGER_MAGNITUDE,
     )
+    dout = unmasked_dout.copy()
+    if valid_tokens < _SEQUENCE_LENGTH:
+        dout[:, valid_tokens:] = ml_dtypes.bfloat16(0)
+    unmasked_dout_manifest = _array_manifest("unmasked_dout", unmasked_dout)
     inputs = (q, k, v, key_mask, dout)
     expected, oracle = _tiled_causal_gqa_forward_vjp_oracle(
         np, q, k, v, key_mask, dout, scale=_ATTENTION_SCALE
@@ -2385,18 +2772,21 @@ def _construct_host_case(
         math.isfinite(norm) and norm > _MIN_REFERENCE_NORM for norm in norms.values()
     ):
         raise RuntimeError("VJP host reference contains a degenerate tensor norm")
+    expected_input_hashes, expected_reference_hashes, expected_norms, expected_logit = (
+        _case_calibration(case)
+    )
     checks = {
         "input_hashes_pinned": {
             item["name"]: item["sha256"] for item in input_manifests
         }
-        == _EXPECTED_INPUT_SHA256,
+        == expected_input_hashes,
         "reference_hashes_pinned": {
             item["name"]: item["sha256"] for item in expected_manifests
         }
-        == _EXPECTED_REFERENCE_SHA256,
+        == expected_reference_hashes,
         "reference_norms_pinned": all(
             math.isclose(norms[name], expected_norm, rel_tol=0.0, abs_tol=1e-12)
-            for name, expected_norm in _EXPECTED_REFERENCE_NORMS.items()
+            for name, expected_norm in expected_norms.items()
         ),
         "scratch_accounting_pinned": oracle[
             "conservative_accounted_numpy_array_scratch_bytes"
@@ -2404,23 +2794,128 @@ def _construct_host_case(
         == _EXPECTED_ORACLE_SCRATCH_BYTES,
         "maximum_valid_logit_pinned": math.isclose(
             oracle["observed_maximum_absolute_valid_logit"],
-            _EXPECTED_MAXIMUM_ABSOLUTE_VALID_LOGIT,
+            expected_logit,
             rel_tol=0.0,
             abs_tol=1e-12,
         ),
     }
-    if not all(checks.values()):
+    sensitivity: dict[str, Any] | None = None
+    if case == _VALID385_CASE:
+        sensitivity = _valid385_sensitivity_controls(
+            np, q, k, v, key_mask, dout, unmasked_dout, expected
+        )
+        sensitivity_metrics = {
+            "ignored_key_mask_affected": sensitivity["ignored_key_mask"][
+                "affected_rows_metrics"
+            ],
+            **{
+                f"ignored_key_mask_boundary_{name}": metrics
+                for name, metrics in sensitivity["ignored_key_mask"][
+                    "boundary_rows_metrics"
+                ].items()
+            },
+            **{
+                f"ignored_loss_mask_{name}": metrics
+                for name, metrics in sensitivity["ignored_loss_mask"][
+                    "gradient_metrics"
+                ].items()
+            },
+        }
+        checks.update(
+            {
+                "q_k_v_hashes_equal_all_valid_case": all(
+                    input_manifests[index]["sha256"] == _EXPECTED_INPUT_SHA256[name]
+                    for index, name in enumerate(("q", "k", "v"))
+                ),
+                "raw_unmasked_dout_hash_equals_all_valid_dout": (
+                    unmasked_dout_manifest["sha256"] == _EXPECTED_INPUT_SHA256["dout"]
+                ),
+                "raw_unmasked_dout_fully_nonzero": (
+                    int(np.count_nonzero(unmasked_dout)) == unmasked_dout.size
+                ),
+                "masked_dout_active_prefix_byte_equal_raw": (
+                    dout[:, :valid_tokens].tobytes(order="C")
+                    == unmasked_dout[:, :valid_tokens].tobytes(order="C")
+                ),
+                "masked_dout_padding_bitwise_positive_zero": (
+                    _bitwise_positive_zero(np, dout[:, valid_tokens:])
+                ),
+                "dq_padding_reference_bitwise_positive_zero": _bitwise_positive_zero(
+                    np, expected[1][:, valid_tokens:]
+                ),
+                "dk_padding_reference_bitwise_positive_zero": _bitwise_positive_zero(
+                    np, expected[2][:, valid_tokens:]
+                ),
+                "dv_padding_reference_bitwise_positive_zero": _bitwise_positive_zero(
+                    np, expected[3][:, valid_tokens:]
+                ),
+                "ignored_key_mask_control_decisive": sensitivity["ignored_key_mask"][
+                    "fails_affected_output_numerical_gate"
+                ]
+                and all(
+                    sensitivity["ignored_key_mask"][
+                        "boundary_controls_fail_individual_output_numerical_gates"
+                    ].values()
+                ),
+                "ignored_key_mask_gradient_limitation_proven": all(
+                    sensitivity["ignored_key_mask"][
+                        "gradients_exactly_equal_to_correct_reference"
+                    ].values()
+                ),
+                "ignored_loss_mask_control_decisive": sensitivity["ignored_loss_mask"][
+                    "fails_padded_dq_zero_gate"
+                ]
+                and all(
+                    sensitivity["ignored_loss_mask"][
+                        "full_gradient_numerical_gate_failures"
+                    ].values()
+                ),
+                "ignored_loss_mask_output_limitation_proven": sensitivity[
+                    "ignored_loss_mask"
+                ]["output_exactly_equal_to_correct_reference"],
+                "sensitivity_hashes_pinned": sensitivity["alternative_reference_sha256"]
+                == _EXPECTED_VALID385_SENSITIVITY_SHA256,
+                "sensitivity_metrics_pinned": sensitivity_metrics
+                == _EXPECTED_VALID385_SENSITIVITY_METRICS,
+            }
+        )
+    if not _skip_pins and not all(checks.values()):
         raise RuntimeError("VJP host input or oracle calibration pin changed")
+    reference_manifest = {
+        "outputs": expected_manifests,
+        "reference_l2_norms": norms,
+        "oracle": oracle,
+        "calibration_pin_checks": checks,
+    }
+    if case == _VALID385_CASE:
+        reference_manifest.update(
+            {
+                "case": case,
+                "valid_tokens": valid_tokens,
+                "padded_rows": [valid_tokens, _SEQUENCE_LENGTH],
+                "sensitivity_controls": sensitivity,
+                "host_loss_mask_transformation": {
+                    "raw_unmasked_dout_sha256": unmasked_dout_manifest["sha256"],
+                    "raw_unmasked_dout_elements": int(unmasked_dout.size),
+                    "raw_unmasked_dout_nonzero_elements": int(
+                        np.count_nonzero(unmasked_dout)
+                    ),
+                    "active_prefix_byte_equal_to_raw": (
+                        dout[:, :valid_tokens].tobytes(order="C")
+                        == unmasked_dout[:, :valid_tokens].tobytes(order="C")
+                    ),
+                    "padded_tail_bitwise_positive_zero": _bitwise_positive_zero(
+                        np, dout[:, valid_tokens:]
+                    ),
+                    "raw_values_emitted": False,
+                },
+            }
+        )
     return (
         inputs,
         input_manifests,
         expected,
-        {
-            "outputs": expected_manifests,
-            "reference_l2_norms": norms,
-            "oracle": oracle,
-            "calibration_pin_checks": checks,
-        },
+        reference_manifest,
     )
 
 
@@ -2488,6 +2983,37 @@ def _json_safe_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, dict[str
     }
 
 
+def _numerical_metrics_pass(item: dict[str, Any]) -> bool:
+    return bool(
+        item["finite"]
+        and item["shape_dtype_nbytes_exact"]
+        and item["reference_l2_norm"] > _MIN_REFERENCE_NORM
+        and math.isfinite(item["relative_l2"])
+        and item["relative_l2"] < _MAX_RELATIVE_L2
+        and math.isfinite(item["cosine_raw"])
+        and item["cosine"] >= _MIN_COSINE
+        and math.isfinite(item["max_abs"])
+        and item["max_abs"] <= _MAX_ABSOLUTE_ERROR
+    )
+
+
+def _exact_numeric_zero_manifest(np: Any, value: Any) -> dict[str, Any]:
+    raw = np.asarray(value)
+    fp32 = raw.astype(np.float32)
+    finite = bool(np.all(np.isfinite(fp32)))
+    count_nonzero = int(np.count_nonzero(raw))
+    maximum_absolute_value = float(np.max(np.abs(fp32))) if raw.size else 0.0
+    return {
+        "finite": finite,
+        "count_nonzero": count_nonzero,
+        "maximum_absolute_value": maximum_absolute_value,
+        "numeric_exact_zero": (
+            finite and count_nonzero == 0 and maximum_absolute_value == 0.0
+        ),
+        "bitwise_positive_zero_diagnostic_only": _bitwise_positive_zero(np, raw),
+    }
+
+
 def _validate_candidate(
     np: Any,
     actual_host: Any,
@@ -2495,7 +3021,9 @@ def _validate_candidate(
     seconds: float,
     counters: dict[str, int],
     output: TextIO,
+    case: str = _ALL_VALID_CASE,
 ) -> dict[str, Any]:
+    case = _normalize_case(case)
     if not isinstance(actual_host, tuple) or len(actual_host) != 4:
         raise RuntimeError("checked VJP executable did not return an exact four-tuple")
     shapes = (
@@ -2522,25 +3050,129 @@ def _validate_candidate(
             strict=True,
         )
     }
-    per_tensor = {
-        name: (
-            item["finite"]
-            and item["shape_dtype_nbytes_exact"]
-            and item["reference_l2_norm"] > _MIN_REFERENCE_NORM
-            and math.isfinite(item["relative_l2"])
-            and item["relative_l2"] < _MAX_RELATIVE_L2
-            and math.isfinite(item["cosine_raw"])
-            and item["cosine"] >= _MIN_COSINE
-            and math.isfinite(item["max_abs"])
-            and item["max_abs"] <= _MAX_ABSOLUTE_ERROR
+    per_tensor = {name: _numerical_metrics_pass(item) for name, item in metrics.items()}
+    padded_validation: dict[str, Any] | None = None
+    padded_passed = True
+    if case == _VALID385_CASE:
+        valid_tokens = _CASE_VALID_TOKENS[case]
+        output_tail_actual = np.asarray(actual_host[0])[:, valid_tokens:]
+        output_tail_expected = np.asarray(expected_host[0])[:, valid_tokens:]
+        affected_output_metrics = _tensor_metrics(
+            np,
+            output_tail_actual,
+            output_tail_expected,
+            expected_shape=(
+                _BATCH_SIZE,
+                _SEQUENCE_LENGTH - valid_tokens,
+                _QUERY_HEADS,
+                _HEAD_DIM,
+            ),
+            expected_actual_nbytes=(
+                _BATCH_SIZE
+                * (_SEQUENCE_LENGTH - valid_tokens)
+                * _QUERY_HEADS
+                * _HEAD_DIM
+                * 2
+            ),
         )
-        for name, item in metrics.items()
-    }
+        affected_output_passed = _numerical_metrics_pass(affected_output_metrics)
+        boundary_rows = (valid_tokens - 1, valid_tokens, _SEQUENCE_LENGTH - 1)
+        boundary_output_metrics = {
+            str(row): _tensor_metrics(
+                np,
+                np.asarray(actual_host[0])[:, row : row + 1],
+                np.asarray(expected_host[0])[:, row : row + 1],
+                expected_shape=(_BATCH_SIZE, 1, _QUERY_HEADS, _HEAD_DIM),
+                expected_actual_nbytes=_BATCH_SIZE * _QUERY_HEADS * _HEAD_DIM * 2,
+            )
+            for row in boundary_rows
+        }
+        boundary_output_passed = {
+            row: _numerical_metrics_pass(item)
+            for row, item in boundary_output_metrics.items()
+        }
+        active_gradient_metrics = {
+            name: _tensor_metrics(
+                np,
+                np.asarray(actual)[:, :valid_tokens],
+                np.asarray(expected)[:, :valid_tokens],
+                expected_shape=(
+                    _BATCH_SIZE,
+                    valid_tokens,
+                    heads,
+                    _HEAD_DIM,
+                ),
+                expected_actual_nbytes=(
+                    _BATCH_SIZE * valid_tokens * heads * _HEAD_DIM * 2
+                ),
+            )
+            for name, actual, expected, heads in zip(
+                ("dq", "dk", "dv"),
+                actual_host[1:],
+                expected_host[1:],
+                (_QUERY_HEADS, _KV_HEADS, _KV_HEADS),
+                strict=True,
+            )
+        }
+        active_gradient_passed = {
+            name: _numerical_metrics_pass(item)
+            for name, item in active_gradient_metrics.items()
+        }
+        zero_tails = {
+            name: {
+                "actual": _exact_numeric_zero_manifest(
+                    np, np.asarray(actual)[:, valid_tokens:]
+                ),
+                "reference": _exact_numeric_zero_manifest(
+                    np, np.asarray(expected)[:, valid_tokens:]
+                ),
+            }
+            for name, actual, expected in zip(
+                ("dq", "dk", "dv"),
+                actual_host[1:],
+                expected_host[1:],
+                strict=True,
+            )
+        }
+        zero_tails_passed = all(
+            item["actual"]["numeric_exact_zero"]
+            and item["reference"]["numeric_exact_zero"]
+            and item["reference"]["bitwise_positive_zero_diagnostic_only"]
+            for item in zero_tails.values()
+        )
+        padded_passed = (
+            affected_output_passed
+            and all(boundary_output_passed.values())
+            and all(active_gradient_passed.values())
+            and zero_tails_passed
+        )
+        padded_validation = {
+            "valid_tokens": valid_tokens,
+            "padded_rows": [valid_tokens, _SEQUENCE_LENGTH],
+            "affected_output_rows_metrics": _json_safe_metrics(
+                {"output": affected_output_metrics}
+            )["output"],
+            "affected_output_rows_numerical_passed": affected_output_passed,
+            "boundary_output_rows": list(boundary_rows),
+            "boundary_output_rows_metrics": _json_safe_metrics(boundary_output_metrics),
+            "boundary_output_rows_numerical_passed": boundary_output_passed,
+            "active_gradient_metrics": _json_safe_metrics(active_gradient_metrics),
+            "active_gradient_numerical_passed": active_gradient_passed,
+            "exact_numeric_zero_tails": zero_tails,
+            "candidate_tail_sign_bits_are_diagnostic_only": True,
+            "all_zero_tail_gates_passed": zero_tails_passed,
+            "passed": padded_passed,
+        }
     safety_duration = math.isfinite(seconds) and 0 <= seconds < _MAX_CANDIDATE_SECONDS
     promotion_duration = (
         math.isfinite(seconds) and 0 <= seconds < _MAX_PROMOTION_CANDIDATE_SECONDS
     )
-    passed = all(per_tensor.values()) and safety_duration and promotion_duration
+    passed = (
+        all(per_tensor.values())
+        and padded_passed
+        and safety_duration
+        and promotion_duration
+    )
     record = {
         "record_type": "host_vjp_validation",
         "timestamp": _utc_now(),
@@ -2548,7 +3180,7 @@ def _validate_candidate(
             "passed"
             if passed
             else "not_promoted"
-            if all(per_tensor.values()) and safety_duration
+            if all(per_tensor.values()) and padded_passed and safety_duration
             else "failed"
         ),
         "metrics": _json_safe_metrics(metrics),
@@ -2568,6 +3200,7 @@ def _validate_candidate(
         "gates": {
             "per_tensor_numerical_passed": per_tensor,
             "all_tensor_numerical_passed": all(per_tensor.values()),
+            "case_specific_padded_validation_passed": padded_passed,
             "safety_duration_passed": safety_duration,
             "promotion_duration_passed": promotion_duration,
             "promotion_passed": passed,
@@ -2575,6 +3208,8 @@ def _validate_candidate(
         "candidate_total_seconds": _json_safe_duration(seconds),
         "counters": dict(counters),
     }
+    if padded_validation is not None:
+        record["padded_validation"] = padded_validation
     _emit(record, output)
     if not passed:
         raise RuntimeError("full VJP candidate failed numerical or duration gates")
@@ -2664,8 +3299,10 @@ def _run_rocm(
     *,
     environment: dict[str, str | None],
     compile_diagnostic: bool = False,
+    case: str = _ALL_VALID_CASE,
     _dependencies: tuple[Any, Any, Any, Any, Any, Any, Any] | None = None,
 ) -> int:
+    case = _normalize_case(case)
     proof = _prove_command_buffers_disabled(environment)
     architecture_binding = _assert_gfx1100_drm()
     _emit(
@@ -2730,7 +3367,7 @@ def _run_rocm(
     counters["host_reference_construction_attempts"] += 1
     try:
         host_inputs, input_manifests, expected_host, reference_manifest = (
-            _construct_host_case(np, ml_dtypes)
+            _construct_host_case(np, ml_dtypes, case)
         )
         counters["host_reference_construction_completions"] += 1
         _emit(
@@ -2739,14 +3376,23 @@ def _run_rocm(
                 "timestamp": _utc_now(),
                 "construction": {
                     "q_k_v": "independent nonzero BF16 host PCG64 signed grids",
-                    "dout": "separate-seed independent nonzero BF16 host PCG64 signed grid",
-                    "key_mask": "all int32 ones",
+                    "dout": (
+                        "separate-seed independent nonzero BF16 host PCG64 signed grid"
+                        if case == _ALL_VALID_CASE
+                        else "separate-seed independent nonzero BF16 host PCG64 signed grid with rows 385:512 set to bitwise positive zero"
+                    ),
+                    "key_mask": (
+                        "all int32 ones"
+                        if case == _ALL_VALID_CASE
+                        else "int32 ones through token 384 and zeros through token 511"
+                    ),
                     "scale_exact_fraction": "3/32",
                     "oracle": "independent host FP32 three-pass tiled causal forward/VJP",
                     "accelerator_rng_used": False,
                 },
                 "inputs": input_manifests,
                 "reference": reference_manifest,
+                "case": case,
                 "counters": dict(counters),
             },
             output,
@@ -2773,7 +3419,7 @@ def _run_rocm(
     )
     try:
         validation = _validate_candidate(
-            np, actual_host, expected_host, seconds, counters, output
+            np, actual_host, expected_host, seconds, counters, output, case
         )
     finally:
         _journal_checkpoint(
@@ -2785,7 +3431,12 @@ def _run_rocm(
         {
             "record_type": "runtime_passed",
             "timestamp": _utc_now(),
-            "status": "passed_exact_t512_full_arbitrary_cotangent_vjp",
+            "status": (
+                "passed_exact_t512_full_arbitrary_cotangent_vjp"
+                if case == _ALL_VALID_CASE
+                else "passed_exact_t512_valid385_loss_masked_active_token_cotangent_vjp"
+            ),
+            "case": case,
             "scale_exact_fraction": "3/32",
             "compile_release_gate": compile_report["release_gate"],
             "compiled_memory_gate": compile_report["compiled_memory_gate"],
@@ -2807,6 +3458,7 @@ def _run_rocm(
 def _execute(args: argparse.Namespace, output: TextIO) -> int:
     counters = _zero_counters()
     compile_diagnostic = getattr(args, "compile_diagnostic", False)
+    case = _normalize_case(getattr(args, "case", _ALL_VALID_CASE))
     _emit(
         {
             "record_type": "manifest",
@@ -2814,19 +3466,28 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             "platform_requested": args.platform,
             "allow_gpu": args.allow_gpu,
             "compile_diagnostic": compile_diagnostic,
+            "case": case,
             "scope": (
                 "abstract_refusal"
                 if args.platform == "abstract"
-                else "guarded_exact_t512_full_vjp_compile_diagnostic"
+                else (
+                    "guarded_exact_t512_full_vjp_compile_diagnostic"
+                    if case == _ALL_VALID_CASE
+                    else "guarded_exact_t512_valid385_loss_masked_full_vjp_compile_diagnostic"
+                )
                 if compile_diagnostic
-                else "guarded_exact_t512_full_vjp"
+                else (
+                    "guarded_exact_t512_full_vjp"
+                    if case == _ALL_VALID_CASE
+                    else "guarded_exact_t512_valid385_loss_masked_active_token_cotangent_vjp"
+                )
             ),
             "contract": (
                 _abstract_contract()
                 if args.platform == "abstract"
-                else _compile_diagnostic_contract()
+                else _compile_diagnostic_contract(case)
                 if compile_diagnostic
-                else _exact_contract()
+                else _exact_contract(case)
             ),
             "compile_may_dispatch_gpu_work": args.platform == "rocm",
             "compile_dispatch_caveat": _COMPILE_GPU_WORK_CAVEAT,
@@ -2922,6 +3583,7 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                     counters,
                     environment=environment,
                     compile_diagnostic=compile_diagnostic,
+                    case=case,
                 )
             finally:
                 try:
