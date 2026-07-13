@@ -227,7 +227,59 @@ else
   export XLA_CLIENT_MEM_FRACTION=0.85
   unset XLA_PYTHON_CLIENT_MEM_FRACTION
 fi
-export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$HOME/.cache/skyrl-jax}"
+
+# Spend startup/disk to avoid repeating backend compilation and per-fusion
+# autotuning after a restart.  The cache contains trusted executable content,
+# so keep it private and namespace it by every installed GPU-stack component.
+# Source/HLO changes still participate in JAX's cache key.  Future external FFI
+# libraries must additionally version this namespace by their exact hash.
+expected_jax_stack="0.10.2,0.10.2,0.10.2,0.10.2"
+if ! installed_jax_stack="$(python - <<'PY'
+from importlib.metadata import version
+
+print(
+    ",".join(
+        version(package)
+        for package in ("jax", "jaxlib", "jax-rocm7-plugin", "jax-rocm7-pjrt")
+    )
+)
+PY
+)"; then
+  echo "refusing to configure the trusted JAX cache because stack-version discovery failed" >&2
+  exit 2
+fi
+if [[ "$installed_jax_stack" != "$expected_jax_stack" ]]; then
+  echo "refusing stale JAX cache namespace for stack $installed_jax_stack (expected $expected_jax_stack)" >&2
+  exit 2
+fi
+if [[ ! -r /opt/rocm/.info/version || "$(</opt/rocm/.info/version)" != "7.2.4" ]]; then
+  echo "refusing stale JAX cache namespace because ROCm is not exactly 7.2.4" >&2
+  exit 2
+fi
+if [[ ! -r /sys/module/amdgpu/version || "$(</sys/module/amdgpu/version)" != "6.16.13" ]]; then
+  echo "refusing stale JAX cache namespace because AMDGPU is not exactly 6.16.13" >&2
+  exit 2
+fi
+if [[ -v JAX_COMPILATION_CACHE_DIR ]]; then
+  echo "refusing inherited JAX_COMPILATION_CACHE_DIR; the trusted cache path is stack-versioned by the launcher" >&2
+  exit 2
+fi
+if ! jax_cache_dir="$(
+  python rocm/prepare_jax_cache_dir.py \
+    --max-autotune-bytes 4294967296
+)"; then
+  echo "refusing to start without a private, validated JAX compilation cache" >&2
+  exit 2
+fi
+export JAX_COMPILATION_CACHE_DIR="$jax_cache_dir"
+export JAX_ENABLE_COMPILATION_CACHE=true
+export JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES=xla_gpu_per_fusion_autotune_cache_dir
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1
+# This 16 GiB JAX LRU covers top-level serialized executable entries only.
+# prepare_jax_cache_dir.py separately refuses an autotune subtree above 4 GiB
+# at startup; XLA's per-fusion textproto files are not part of this LRU.
+export JAX_COMPILATION_CACHE_MAX_SIZE=17179869184
 export HF_XET_HIGH_PERFORMANCE=1
 export SKYRL_ROCM_PALLAS_ATTENTION="${SKYRL_ROCM_PALLAS_ATTENTION:-0}"
 
@@ -235,7 +287,7 @@ export SKYRL_ROCM_PALLAS_ATTENTION="${SKYRL_ROCM_PALLAS_ATTENTION:-0}"
 # executable produced HSA_STATUS_ERROR_INVALID_PACKET_FORMAT and an illegal
 # gfx1100 command-stream opcode. Disable XLA HIP-graph command-buffer capture
 # until the isolated replay probe establishes a narrower safe configuration.
-export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_enable_command_buffer="
+export XLA_FLAGS=--xla_gpu_enable_command_buffer=
 
 exec uv run --active --no-sync -m skyrl.tinker.api \
   --base-model "$model_path" \
