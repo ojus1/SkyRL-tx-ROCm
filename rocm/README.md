@@ -111,7 +111,7 @@ SKYRL_QWEN35_PREWARM_BUCKETS=64,256 \
 SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
   ./rocm/start_qwen35.sh prewarm-t64-t256-adam
 
-# Run the same gates, then exit before the hardware-unqualified API transition.
+# Run the same gates, then exit without starting the API.
 SKYRL_QWEN35_PREWARM_BUCKETS=512 \
 SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
 SKYRL_QWEN35_PREWARM_ONLY=1 \
@@ -144,8 +144,8 @@ occurs.
 prewarm, handoff, or final-journal gate; after all of them pass, it disarms the
 launcher traps and exits zero before the API command. This is the qualification
 route when no server transition is wanted. The source-aligned API/engine
-readiness and exact T64 cache-attestation paths are CPU-qualified, but their
-real ROCm backend transition remains hardware-unqualified.
+readiness and exact T64 cache-attestation paths are CPU-qualified, and the one
+guarded real-ROCm T64 transition recorded below is hardware-qualified.
 
 Every operational launcher prewarm also requires a clean Git worktree before
 the first hardware or JAX access. Fixed, sanitized Git commands bind the exact
@@ -236,9 +236,10 @@ The exact cold T64-plus-Adam direct-tool pair, supervised T512 Pallas pair, and
 commit-keyed T1024 Pallas pair described below are hardware-qualified. The
 launcher-to-API/nested-engine source alignment, readiness protocol, and exact
 T64 in-engine cache-evidence contract are implemented and CPU-qualified. The
-multi-bucket engine path, repeated engine hits, normal first-call warmup, and
-the real ROCm engine transition remain hardware-unqualified. The launcher
-examples above provide the required telemetry, headless-display, exclusive-KFD,
+single T64 real-ROCm transition described below is also hardware-qualified. The
+multi-bucket engine path, repeated complete server starts, normal first-call
+warmup, and executable invocation remain unqualified. The launcher examples
+above provide the required telemetry, headless-display, exclusive-KFD,
 fatal-journal, and cleanup gates. Historical T64 direct-tool artifacts used
 equivalent external supervision; current operational ROCm prewarm is
 launcher-only.
@@ -272,8 +273,8 @@ This proves exact-key AOT persistent-cache lookup/deserialization, signature
 compatibility, and executable-byte continuity. It does not seed normal
 `PjitFunction` first-call dispatch, invoke a training executable, establish
 request latency or throughput, prove numerical execution, or prove HSA runtime
-stability. Prewarm and engine attestation therefore remain default-off until the
-real ROCm path is separately qualified. The API waits for an exact
+stability. Prewarm and engine attestation therefore remain default-off pending
+repeatability and first-call execution qualification. The API waits for an exact
 launch-ID/PID/start-tick/boot/source/lock-bound engine row published only after
 backend construction and any required cache proof. Health revalidates that row,
 a one-second watchdog heartbeat, the isolated API-spawned process group, and all
@@ -283,6 +284,100 @@ Both Qwen launcher branches bound readiness to 3600 seconds. This containment
 result covers only the pinned topology: a POSIX process group is not a cgroup,
 so Ray/FSDP/Megatron workers, daemonized descendants, or any child that calls
 `setsid()` require separate containment and qualification.
+
+### ROCm 7.2.4 guarded T64 in-engine exact-hit result
+
+Commit `13c94f77cdad013458bf764c59e3d902efb301d0` completed one full pinned
+non-Ray JAX server transition on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. The first attempt safely populated the
+new commit's T64 key but an additional whole-run profiler terminated the
+launcher before API start because hwmon values are intentionally unavailable
+while the GPU is runtime-suspended. It observed no resource or driver fault and
+returned the device to its exact idle baseline. The successful second attempt
+tolerated unavailable sensors only during suspension, still applied the 90 C,
+315 W, 24 GiB VRAM, and 8 GiB swap comparisons whenever values were present,
+and paused those external sensor reads across the launcher's mandatory idle
+handoff. The launcher's own independent prewarm profiler and all source,
+journal, ownership, handoff, and readiness gates remained unchanged.
+
+The successful prewarm process reported one request, one hit, zero misses,
+`8.361478 s` lower time, `6.080420 s` compile time, `32.028201 s` saved, and
+`5.971799 s` cache retrieval. Its exact cache key was
+`jit_forward_backward_and_accumulate-8cddda465f2ac982196fb06e4e9392077cea4282a8adf34fd3b0b2d09453d9d1`.
+The paired 4,513,621-byte executable SHA-256 was
+`2769e469a660831e54dc5a01ec0870a87b6a853dfba111e350f9e57dd593b2e5`.
+The nested engine then reconstructed the real backend, synchronized its
+constructor arrays, and reported the same exact key and executable bytes with
+one request, one hit, zero misses, `6.425871 s` lower time, `5.626213 s`
+compile time, `32.477840 s` saved, and `5.522160 s` retrieval. Executable and
+auxiliary manifests were stable, and the exact logical-atime rewrite fell
+inside the compile wall-time bracket.
+
+The first attempt's valid seed miss also provides a matched prewarm-process
+comparison against the second attempt's hit. Backend setup was effectively
+unchanged (`33.564958 s` miss versus `33.642953 s` hit). Compile time fell from
+`40.399136 s` to `6.080420 s`, a `6.64x` speedup and `84.95%` reduction;
+lower-plus-compile fell from `49.256827 s` to `14.441898 s`, a `3.41x` speedup
+and `70.68%` reduction. Full prewarm-profiler elapsed time fell from
+`125.318095 s` to `89.842595 s`, saving `35.475500 s` (`1.395x`, `28.31%`).
+Peak VRAM was effectively unchanged at 17,923,596,288 versus 17,900,109,824
+bytes (only 23,486,464 bytes lower), so persistent-cache hits provide no GPU
+capacity gain. Peak profiled command-tree PSS fell from 5,461,569,536 to
+4,207,732,736 bytes (`22.96%`), and total host-memory use peaked 1,088,212,992
+bytes lower (`7.57%`); these are startup compiler-memory results, not
+steady-state training memory claims. The r1 comparison inputs are under
+`/tmp/skyrl-qwen35-runs/t64-engine-attest-13c94f77-r1` and
+`/tmp/skyrl-qwen35-qualification-13c94f77`; their prewarm, inner telemetry,
+inner summary, outer telemetry, and outer summary SHA-256 values are
+`8a425732403c6a016b99be56be6d4d9ab317dc957ab3527ce312bfe01875f901`,
+`9621b84b4cb48dc5ea42bc593097d30662862726d0a1f9272b723f8460faa64e`,
+`e3748c7ef4078df6e38d00e7433a887959bacbe38825550c9d3ad874b4b04622`,
+`faa554848d79c8d2d416cee458c89b222a77554e6cdff8644da1096fdbfacc12`,
+and `dbc94170ad36d469dc2ac09ef225c2e670dcb426093c4a27868247702c3ce7db`.
+The engine's public monitoring independently estimated
+`32.477840 s` saved, but no in-engine miss was executed, so its hit-only
+speedup is not presented as a controlled server comparison.
+
+The API accepted the exact READY row; during the live run, two operator-side
+`/api/v1/healthz` requests returned `{"status":"ok"}`. The evidence status was
+`strict_aot_t64_persistent_cache_hit_v1`; lower and compile counts were one,
+all compiled/model-pass/optimizer invocation counters were zero, graph and
+command-buffer use were false, and `normal_pjit_first_call_seeded` was false.
+After an operator-side PID/start-tick/boot-validated `SIGINT`, the API reaped
+the dedicated engine process group and the raw database state became `STOPPED`
+with no error. A separate whole-run handoff then required three exact idle
+samples with KFD and render unowned, runtime suspended, and VRAM/GTT no higher
+than the pre-run 27,947,008-byte/15,966,208-byte baselines. The HTTP bodies and
+shutdown signal are operator observations; the saved database independently
+persists READY evidence, heartbeat progress, and the clean STOPPED state.
+
+The outer guarded run lasted `258.053 s`; observed maxima were 66 C junction,
+188 W, 17,900,109,824 bytes VRAM, 13,785,796,608 bytes host memory used, and
+zero swap. Its status was `completed`, return code was zero, and both its
+mid-run and final kernel-log checks found no driver error. The independent
+prewarm profiler peaked at 62 C, 167 W, and the same VRAM value. The current
+boot fatal-event quarantine remained clean after shutdown. Evidence artifacts
+are under `/tmp/skyrl-qwen35-runs/t64-engine-attest-13c94f77-r2` and
+`/tmp/skyrl-qwen35-qualification-13c94f77/r2`; their SHA-256 values are:
+
+- prewarm / prewarm handoff:
+  `4bf8ac1d3e7c8004fe28ce960bad3643c56edadf2df42638a0ca993cc7a405e5`,
+  `3f8c0493dd3ec4f358d53734ef300fdbc99a585f276bdf0c6d40f1272e18690c`;
+- prewarm telemetry / summary:
+  `8614a9f657bc255614e6e00bc7df03b059031bcb78cfca3dc2445bba2bfcbcdf`,
+  `801aca9817b425dccc71c441972b99ff637a4585dd3e0b6d288cdd572fc0571e`;
+- stopped-state SQLite database:
+  `3eec1c54dacbc12469a5a76c5cdf8339ff2532a4f068d2ecf2f1337f7c198b54`;
+- outer telemetry / summary / whole-run handoff:
+  `a6bcbef4f19394882934a065d71def8d565c462cc5be133a2f834e2a56e1d5a4`,
+  `6128cc681dfc21f84e415b08dcddcae4a94d4cd5fa1f3c3985c4deecafbcbb11`,
+  and `05b5de0eb8fc410251cdce5167841ec5c680fb3145652d42620d7c07ff53c16a`.
+
+This promotes only exact T64 AOT lookup/deserialization and READY integration.
+It does not invoke the compiled object, exercise the 3% Pallas gradient-error
+tolerance, seed normal first-call dispatch, or establish request/training
+latency, throughput, numerical correctness, repeated-start reliability, a
+runtime VRAM reduction, or any longer sequence bucket.
 
 ### ROCm 7.2.4 cold T64 plus Adam cache-population result
 
@@ -638,8 +733,9 @@ selection, archive/full-tree binding, environment behavior, no snapshot
 mutation, rejection of shadow modules, exact engine readiness transitions,
 stale/PID-reused/stopped process rejection, heartbeat freshness, child-exit and
 timeout behavior, terminate-to-kill whole-group cleanup, and the exact T64 AOT
-cache-evidence contract. This transition has not yet run on the GPU, so
-real-backend readiness, hit timing, and execution behavior remain unproven.
+cache-evidence contract. At evidence commit `5fb2b220` this transition had not
+run on the GPU; the guarded `13c94f77` result above closes that gap only for one
+T64 startup and AOT hit. Training execution and longer buckets remain unproven.
 Ordinary warmup, graph capture/replay, and any compiled-call invocation remain
 unauthorized. The older
 T1024 `93.144 s` then `47.655 s` runs were two misses with different source
