@@ -1309,6 +1309,53 @@ boundary, an unrestricted cotangent, replay, a latency distribution, model
 integration, optimizer behavior, SFT, GRPO, or a speedup claim. Do not replay
 this evidence run.
 
+### Exact T=1024 two-chunk VJP compile diagnostic
+
+The compile-only `all_valid_t1024` rung passed on clean commit `9ef5ba65` and
+boot `54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. It lowers the exact BF16
+`B=1, T=1024, Hq=16, Hkv=4, D=256` forward plus arbitrary-cotangent VJP into
+two 512-query ranges. Lowering took `0.470560852 s` and compilation took
+`3.403651397 s`. StableHLO and optimized HLO each contained exactly two
+forward, two dQ, and two dK/dV calls with the six unique `(kind,
+query_start)` pairs at starts 0 and 512. Every call was directly owned by the
+sole entry computation. The nine optimized-HLO fusion helpers were resolved,
+acyclic, and contained zero custom calls.
+
+Both dK/dV calls alias output 0 to operand 7 and output 1 to operand 8. In
+both dialects, the q0 FP32 accumulators have exact shape
+`[1,1024,4,256]` and flow into the q512 call as distinct, single-use values.
+Optimized HLO uses a direct `get-tuple-element` path for each value with zero
+copies on either path. Each accumulator is 4,194,304 bytes and the pair is
+8,388,608 bytes. Compiler memory was exactly 20,975,616 argument bytes,
+20,971,552 output bytes, 25,232,640 temporary bytes, and zero alias bytes.
+
+This source revision structurally withholds runtime release for T=1024 even
+when all diagnostic checks pass. No host or device inputs, FP32 reference,
+checked capability, executable invocation, device retrieval, warmup, or
+replay was created or attempted. Their counters, along with the
+lowered-callable counter, remained zero. The terminal status was
+`compile_diagnostic_completed_no_runtime_release`.
+
+The profiler returned zero with no signal. Across 311 measured samples, peak
+physical VRAM was 711,995,392 bytes, peak junction temperature was 48 C, peak
+board power was 128 W, minimum host-available memory was 58,618,929,152 bytes,
+and swap remained zero. The child preflight, all three journal checkpoints,
+the child postflight, and an external postflight were clean; `/dev/kfd` was
+unowned and the card returned to runtime suspend. The mode-`0600` evidence
+artifacts and SHA-256 values are:
+
+- `/tmp/query-bounded-gqa-t1024-vjp-compile-diagnostic-boot54ccf56c-run4.jsonl`:
+  `e5da2dffad33ad97b6279bf5f0047e67eed6079bb4a55dd4812d0af48a151083`;
+- its telemetry:
+  `08e96c0c375b4365e9c13606079aa7f178511ab92df295ad3217fe83d782c4c3`;
+- its summary:
+  `6fcbb252e2eff5bf93a799ace0eba9e9e20530f875d7208df7b262e23a516176`.
+
+This proves only the exact T=1024 two-range compiler structure and memory
+contract on the pinned stack. It is not execution, numerical-correctness,
+latency, repeated-run, model-integration, SFT, or GRPO evidence, and it does
+not authorize a runtime call. Do not replay this diagnostic.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
