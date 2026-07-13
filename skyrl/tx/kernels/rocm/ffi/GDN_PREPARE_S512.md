@@ -230,3 +230,93 @@ the HIP launch, numerical U/W/G values, watchdog safety, runtime latency,
 occupancy, masking, recurrence, VJP, model integration, SFT, or GRPO. A first
 guarded numerical runtime probe may now be designed and reviewed, but this
 compile result does not authorize executing it.
+
+## Pending one-shot numerical runtime gate
+
+`rocm/probe_gdn_prepare_s512_runtime.py` is default-refusing. Its abstract path
+imports neither NumPy, JAX, the SkyRL ROCm package, nor a shared library:
+
+```bash
+.venv/bin/python rocm/probe_gdn_prepare_s512_runtime.py
+```
+
+The only guarded case is `s512-dense-all-valid`. Before configuring ROCm or
+importing JAX, it binds the runtime probe identity, the promoted compile helper,
+dense NumPy oracle, wrapper, HIP source, sealed loader, safety helper, and every
+executed package initializer. It freshly registers, lowers, and compiles rather
+than reusing the compile-only executable. The complete StableHLO precompile,
+optimized-HLO, layout, alias, and compiler-memory gates are repeated. In
+addition to the 64 MiB temporary hard maximum, this first runtime rung requires
+the observed compile result to retain its expected zero temporary bytes before
+an executable can become accessible.
+
+The host-only case uses the reviewed SplitMix64 construction and requires the
+published individual input hashes:
+
+- K: `2e4575756c918f44128c348a53816e246162fdfcb957155d910236a9651e9089`
+- V: `26bb0760af33a92fe5412ab2263fe28608473d11c4daab0fdaa310589aec9203`
+- g: `7b92e2bc06b11acf7733e1d8dd35301a855176f436928d9acaee9cd268c44ffd`
+- beta: `03b58170cf95fe0eec3990d4f73e7adae0238eef75e7e7d3f2bf230d360986d8`
+
+The dense reference must reproduce U/W/gamma hashes
+`b5e87a4ba0efa1db90843dc7e1b1569dc0d452ae1c13766ae041d2d1003cdbcb`,
+`425dc1f6399c23d3f79e349d55878a644d435a57915ee07df6363b95e5ad2d7e`,
+and
+`6ff083b3478602b3a17253d241f84dec1dd3f5701ce630cb2c67d1f3cf956371`.
+Named array tuples also use an explicit domain-separated v1 framing: the domain
+`skyrl-gdn-prepare-s512-array-tuple-v1` followed by repeated big-endian 64-bit
+metadata length, UTF-8 `name/NUL/dtype.str/NUL/comma-separated-shape`, payload
+length, and row-major payload. Its pinned input and reference tuple hashes are
+`9ee8387f7139fb6f43d0e161653d8d84f21a5167a584ab3c4a4b83591a2c9926`
+and
+`2dc7066b43a0562703a16c6cddfa3c8066da18acbf6fbcfc5a246ab14f99130b`.
+
+All strict-lower systems must be nonzero and have condition number at most 1.5.
+Identity-solve U/W, missing decay, and wrong global-prefix gamma controls must
+fail their fixed sensitivities. Every chunk and paired value-head result must
+be nondegenerate, gamma must decrease inside each chunk and reset at chunk
+boundaries, and the dense reference equation residual must be at most `1e-6`.
+These host checks and hashes finish before the sole tuple device transfer and
+before the private one-shot capability is released.
+
+The candidate is invoked exactly once, with no warmup or replay. One tuple
+`device_put` plus one input readiness barrier precedes it; one output-tuple
+readiness barrier and one tuple `device_get` follow it. Full CPU FP64-accumulated
+metrics require U and W relative L2 below `2e-4`, cosine at least `0.99999995`,
+and maximum absolute error at most `5e-5`; gamma requires `2e-6`,
+`0.999999999`, and `2e-6`. Actual U/W equation residuals must have relative L2
+below `3e-4` and maximum absolute residual at most `1e-4`. Less than 250 ms is
+promotable; 250 ms through less than 2 seconds is completed but unpromotable;
+2 seconds or more fails the hard gate.
+
+Only after independent static approval of exact source hashes may this command
+be considered. It has not been executed by this documentation change:
+
+```bash
+env \
+  OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 \
+  MKL_NUM_THREADS=1 \
+  XLA_FLAGS=--xla_gpu_enable_command_buffer= \
+  .venv/bin/python rocm/profile_rocm.py \
+    --output /tmp/gdn-prepare-s512-runtime-boot54ccf56c-run1.telemetry.jsonl \
+    --interval 0.05 \
+    --timeout 120 \
+    --sensor-grace-seconds 15 \
+    --max-junction-temp-c 90 \
+    --max-gpu-power-watts 315 \
+    --max-vram-gib 2 \
+    --min-host-available-gib 8 \
+    --max-swap-gib 0 -- \
+    .venv/bin/python rocm/probe_gdn_prepare_s512_runtime.py \
+      --platform rocm \
+      --allow-gpu \
+      --case s512-dense-all-valid \
+      --library /tmp/skyrl-gdn-prepare-s512-build-boot54ccf56c.Stpvf1/libskyrl_gdn_prepare_s512_gfx1100.so \
+      --library-sha256 56f667eee1eddac6b881feba18fc9a3315bc2b22e8fdfe08effa36e32e6315ef \
+      --output /tmp/gdn-prepare-s512-runtime-boot54ccf56c-run1.jsonl
+```
+
+A pass would qualify only this prepare-only S512 all-valid one-shot boundary.
+It would not qualify padding, recurrence, reverse mode, repeated execution,
+model dispatch, training, SFT, GRPO, or production performance.
