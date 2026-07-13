@@ -1369,12 +1369,14 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     source = _LAUNCHER.read_text(encoding="utf-8")
 
     opt_in = 'prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"'
-    optimizer_opt_in = 'prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER:-0}"'
+    optimizer_opt_in = 'prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"'
+    prewarm_only_opt_in = 'prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"'
     invocation = "python rocm/prewarm_qwen35_buckets.py"
     final_journal_gate = "python3 -m rocm.amdgpu_safety >/dev/null"
     api_exec = "exec uv run --active --no-sync -m skyrl.tinker.api"
     assert opt_in in source
     assert optimizer_opt_in in source
+    assert prewarm_only_opt_in in source
     assert "0|1) ;;" in source
     assert "prewarm_optimizer_args=(--compile-optimizer)" in source
     assert '"${prewarm_optimizer_args[@]}"' in source
@@ -1406,8 +1408,11 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     prewarm_status_gate = source.index(
         "if ((prewarm_status != 0))", source.rindex(final_journal_gate)
     )
+    prewarm_only_gate = source.index(
+        'if [[ "$prewarm_only" == "1" ]]', prewarm_status_gate
+    )
     assert source.rindex(final_journal_gate) < prewarm_status_gate
-    assert prewarm_status_gate < source.index(api_exec)
+    assert prewarm_status_gate < prewarm_only_gate < source.index(api_exec)
     between_gate_and_api = source[
         source.rindex(final_journal_gate) + len(final_journal_gate) : source.index(
             api_exec
@@ -1426,6 +1431,7 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
 @pytest.mark.parametrize(
     ("optimizer_value", "buckets", "message"),
     [
+        ("", "64", "must be exactly 0 or 1"),
         ("true", "64", "must be exactly 0 or 1"),
         ("2", "64", "must be exactly 0 or 1"),
         ("1", "", "requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS"),
@@ -1442,6 +1448,39 @@ def test_launcher_optimizer_opt_in_fails_closed_before_hardware_access(
 
     result = subprocess.run(
         ["bash", str(_LAUNCHER), "invalid-opt-in-test"],
+        cwd=_REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "AMDGPU" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("prewarm_only", "buckets", "message"),
+    (
+        ("", "64", "must be exactly 0 or 1"),
+        ("true", "64", "must be exactly 0 or 1"),
+        ("2", "64", "must be exactly 0 or 1"),
+        ("1", "", "requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS"),
+    ),
+)
+def test_launcher_prewarm_only_fails_closed_before_hardware_access(
+    prewarm_only: str, buckets: str, message: str
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("JAX_ENABLE_PGLE", None)
+    environment.pop("JAX_COMPILATION_CACHE_EXPECT_PGLE", None)
+    environment["SKYRL_QWEN35_PREWARM_ONLY"] = prewarm_only
+    environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = buckets
+
+    result = subprocess.run(
+        ["bash", str(_LAUNCHER), "invalid-prewarm-only-test"],
         cwd=_REPO,
         env=environment,
         capture_output=True,

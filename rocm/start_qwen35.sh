@@ -16,7 +16,8 @@ model_repo="Qwen/Qwen3.5-4B"
 model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 memory_mode="${SKYRL_QWEN35_MEMORY_MODE:-growth}"
 prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
-prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER:-0}"
+prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"
+prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"
 prewarm_timeout_seconds="${SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS:-3600}"
 backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64}'
 
@@ -27,8 +28,19 @@ case "$prewarm_optimizer" in
     exit 2
     ;;
 esac
+case "$prewarm_only" in
+  0|1) ;;
+  *)
+    echo "SKYRL_QWEN35_PREWARM_ONLY must be exactly 0 or 1." >&2
+    exit 2
+    ;;
+esac
 if [[ "$prewarm_optimizer" == "1" && -z "$prewarm_buckets" ]]; then
   echo "SKYRL_QWEN35_PREWARM_OPTIMIZER=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
+  exit 2
+fi
+if [[ "$prewarm_only" == "1" && -z "$prewarm_buckets" ]]; then
+  echo "SKYRL_QWEN35_PREWARM_ONLY=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
   exit 2
 fi
 if [[ ! "$prewarm_timeout_seconds" =~ ^[0-9]{3,5}$ ]] \
@@ -518,6 +530,11 @@ fi
 if ((prewarm_status != 0)); then
   echo "refusing API start because startup prewarm failed with status $prewarm_status" >&2
   exit "$prewarm_status"
+fi
+
+if [[ "$prewarm_only" == "1" ]]; then
+  trap - EXIT INT TERM
+  exit 0
 fi
 
 trap - EXIT INT TERM

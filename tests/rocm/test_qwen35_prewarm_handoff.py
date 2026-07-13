@@ -799,11 +799,13 @@ def test_launcher_profiles_then_always_settles_before_final_journal_and_api() ->
         "if ((prewarm_termination_status != 0))", handoff_gate
     )
     prewarm_gate = source.index("if ((prewarm_status != 0))", termination_gate)
+    prewarm_only_gate = source.index('if [[ "$prewarm_only" == "1" ]]', prewarm_gate)
     assert (
         cleanup_call
         < handoff_gate
         < termination_gate
         < prewarm_gate
+        < prewarm_only_gate
         < source.index(api)
     )
     assert 'prewarm_handoff_artifact="$run_dir/prewarm-handoff.jsonl"' in source
@@ -848,6 +850,7 @@ events="$EVENTS"
 run_dir="$(dirname "$events")"
 prewarm_buckets=64
 prewarm_optimizer=0
+prewarm_only="${FAKE_PREWARM_ONLY:-0}"
 prewarm_timeout_seconds=600
 memory_mode=growth
 SKYRL_ROCM_PALLAS_ATTENTION=0
@@ -922,6 +925,11 @@ def _run_prewarm_trap_harness(
             {"FAKE_PROFILE_MODE": "exit0"},
             0,
             ["capture", "profile_start", "profile_exit", "settle", "journal", "api"],
+        ),
+        (
+            {"FAKE_PROFILE_MODE": "exit0", "FAKE_PREWARM_ONLY": "1"},
+            0,
+            ["capture", "profile_start", "profile_exit", "settle", "journal"],
         ),
         (
             {"FAKE_PROFILE_MODE": "exit7"},

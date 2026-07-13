@@ -110,6 +110,13 @@ SKYRL_QWEN35_PREWARM_BUCKETS=64,256 ./rocm/start_qwen35.sh prewarm-t64-t256
 SKYRL_QWEN35_PREWARM_BUCKETS=64,256 \
 SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
   ./rocm/start_qwen35.sh prewarm-t64-t256-adam
+
+# Run the same supervised gates, then exit before the unattested API transition.
+SKYRL_QWEN35_PREWARM_BUCKETS=512 \
+SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
+SKYRL_QWEN35_PREWARM_ONLY=1 \
+SKYRL_ROCM_PALLAS_ATTENTION=1 \
+  ./rocm/start_qwen35.sh qualify-t512-adam
 ```
 
 Buckets at 512 or above additionally require the explicitly enabled Pallas
@@ -125,6 +132,12 @@ This operation is independent of sequence length. The compiled handle is only
 inspected for memory metadata and then discarded; it is never called, so no
 Adam update, gradient reset, or model-state mutation through an optimizer step
 occurs.
+
+`SKYRL_QWEN35_PREWARM_ONLY=1` is also default-off, accepts only literal `0` or
+`1`, and requires a nonempty bucket list. It does not weaken or skip any
+prewarm, handoff, or final-journal gate; after all of them pass, it disarms the
+launcher traps and exits zero before the API command. This is the qualification
+route while engine startup attestation remains unavailable.
 
 Backend/model construction, pinned-weight loading, LoRA parameter and Adam-state
 initialization, array placement, and the explicit `block_until_ready` may still
