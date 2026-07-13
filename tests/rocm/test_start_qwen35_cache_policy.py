@@ -71,6 +71,10 @@ def test_cache_populates_executables_and_only_qualified_autotuning() -> None:
         "xla_gpu_per_fusion_autotune_cache_dir"
     ) in source
     assert "xla_gpu_kernel_cache_file" not in source
+    assert "export JAX_ENABLE_PGLE=false" in source
+    assert "export JAX_COMPILATION_CACHE_EXPECT_PGLE=false" in source
+    assert source.count("export JAX_ENABLE_PGLE=") == 1
+    assert source.count("export JAX_COMPILATION_CACHE_EXPECT_PGLE=") == 1
 
 
 def test_installed_jax_recognizes_exact_cache_environment() -> None:
@@ -79,6 +83,8 @@ def test_installed_jax_recognizes_exact_cache_environment() -> None:
         "JAX_PLATFORMS": "cpu",
         "JAX_COMPILATION_CACHE_DIR": "/tmp/skyrl-cache-policy-test",
         "JAX_ENABLE_COMPILATION_CACHE": "true",
+        "JAX_ENABLE_PGLE": "false",
+        "JAX_COMPILATION_CACHE_EXPECT_PGLE": "false",
         "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true",
         "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": (
             "xla_gpu_per_fusion_autotune_cache_dir"
@@ -97,6 +103,8 @@ from jax import config
 values = config.values
 assert values["jax_compilation_cache_dir"] == "/tmp/skyrl-cache-policy-test"
 assert values["jax_enable_compilation_cache"] is True
+assert values["jax_enable_pgle"] is False
+assert values["jax_compilation_cache_expect_pgle"] is False
 assert values["jax_raise_persistent_cache_errors"] is True
 assert values["jax_persistent_cache_enable_xla_caches"] == "xla_gpu_per_fusion_autotune_cache_dir"
 assert values["jax_persistent_cache_min_compile_time_secs"] == 0.0
@@ -211,6 +219,10 @@ def test_cache_setup_precedes_backend_start_and_graphs_remain_disabled() -> None
     command_buffer_disable = source.index(
         "export XLA_FLAGS=--xla_gpu_enable_command_buffer="
     )
+    pgle_disable = source.index("export JAX_ENABLE_PGLE=false")
+    pgle_cache_disable = source.index("export JAX_COMPILATION_CACHE_EXPECT_PGLE=false")
     backend_start = source.index("exec uv run --active --no-sync -m skyrl.tinker.api")
+    assert pgle_disable < command_buffer_disable < backend_start
+    assert pgle_cache_disable < command_buffer_disable < backend_start
     assert cache_export < command_buffer_disable < backend_start
     assert source.count("export XLA_FLAGS=") == 1

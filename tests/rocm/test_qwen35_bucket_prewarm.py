@@ -59,6 +59,8 @@ def test_default_is_cpu_only_plan_without_jax_or_gpu() -> None:
     )
     assert manifest["compiled_callable_invocations"] == 0
     assert manifest["optimizer_step_invocations"] == 0
+    assert manifest["optimizer_compile_requested"] is False
+    assert manifest["optimizer_compile_calls_planned"] == 0
     assert manifest["executable_export_used"] is False
     assert manifest["graph_api_used"] is False
     assert plan["jax_imported"] is False
@@ -97,6 +99,22 @@ def test_canonical_representative_buckets_are_preserved() -> None:
     )
 
     assert args.buckets == (32, 48, 96, 384, 768, 1536, 2048)
+
+
+def test_optimizer_compile_requires_literal_cli_flag_and_stays_plan_only() -> None:
+    result = _run("--compile-optimizer")
+
+    assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    assert records[0]["optimizer_compile_requested"] is True
+    assert records[0]["optimizer_compile_calls_planned"] == 1
+    assert records[1]["optimizer_compile_planned"] is True
+    assert records[1]["jax_imported"] is False
+
+    malformed = _run("--compile-optimizer=1")
+    assert malformed.returncode == 2
+    assert malformed.stdout == ""
+    assert "ignored explicit argument" in malformed.stderr
 
 
 @pytest.mark.parametrize(
@@ -151,6 +169,8 @@ def _exact_environment(monkeypatch: pytest.MonkeyPatch, cache: Path) -> None:
         "SKYRL_ROCM_PALLAS_ATTENTION": "0",
         "JAX_COMPILATION_CACHE_DIR": str(cache),
         "JAX_ENABLE_COMPILATION_CACHE": "true",
+        "JAX_ENABLE_PGLE": "false",
+        "JAX_COMPILATION_CACHE_EXPECT_PGLE": "false",
         "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true",
         "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": (
             "xla_gpu_per_fusion_autotune_cache_dir"
@@ -179,6 +199,15 @@ def test_cache_and_graph_environment_must_match_launcher_exactly(
     with pytest.raises(RuntimeError, match="JAX_RAISE_PERSISTENT_CACHE_ERRORS"):
         prewarm._validate_environment("xla", "eager")
     monkeypatch.setenv("JAX_RAISE_PERSISTENT_CACHE_ERRORS", "true")
+
+    for name in ("JAX_ENABLE_PGLE", "JAX_COMPILATION_CACHE_EXPECT_PGLE"):
+        monkeypatch.setenv(name, "true")
+        with pytest.raises(RuntimeError, match=name):
+            prewarm._validate_environment("xla", "eager")
+        monkeypatch.delenv(name)
+        with pytest.raises(RuntimeError, match=name):
+            prewarm._validate_environment("xla", "eager")
+        monkeypatch.setenv(name, "false")
 
     monkeypatch.setenv(
         "XLA_FLAGS",
@@ -311,6 +340,7 @@ def test_cache_is_revalidated_after_compilation(
 class _FakeMonitoring:
     def __init__(self) -> None:
         self.listeners: list[object] = []
+        self.duration_listeners: list[object] = []
 
     def register_event_listener(self, listener: object) -> None:
         self.listeners.append(listener)
@@ -318,9 +348,21 @@ class _FakeMonitoring:
     def unregister_event_listener(self, listener: object) -> None:
         self.listeners.remove(listener)
 
+    def register_event_duration_secs_listener(self, listener: object) -> None:
+        self.duration_listeners.append(listener)
+
+    def unregister_event_duration_listener(self, listener: object) -> None:
+        self.duration_listeners.remove(listener)
+
     def emit(self, event: str) -> None:
         for listener in tuple(self.listeners):
             listener(event)
+
+    def emit_duration(
+        self, event: str, duration_secs: object, **metadata: str | int
+    ) -> None:
+        for listener in tuple(self.duration_listeners):
+            listener(event, duration_secs, **metadata)
 
 
 def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
@@ -355,7 +397,7 @@ def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
 
     assert postflights == ["clean"]
     assert evidence["classification"] == (
-        "strict_public_monitoring_miss_with_cache_change"
+        "strict_public_monitoring_miss_with_single_cache_add"
     )
     assert evidence["public_monitoring_events"] == {
         "compile_requests_use_cache": 1,
@@ -371,6 +413,55 @@ def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
     ] == ["bucket_postflight", "bucket_cache_evidence"]
 
 
+@pytest.mark.parametrize(
+    ("mutation", "classification"),
+    [
+        ("two_added", "ambiguous_miss_with_multiple_added_cache_entries"),
+        ("changed_only", "ambiguous_miss_with_changed_cache_entry"),
+    ],
+)
+def test_strict_miss_rejects_multiple_adds_or_changed_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+    classification: str,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    existing = cache / "jit_existing-cache"
+    if mutation == "changed_only":
+        existing.write_bytes(b"before")
+    monitoring = _FakeMonitoring()
+    monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
+
+    def compile_bucket() -> tuple[object, float, float]:
+        monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
+        monitoring.emit("/jax/compilation_cache/cache_misses")
+        if mutation == "two_added":
+            (cache / "jit_first-cache").write_bytes(b"first")
+            (cache / "jit_second-cache").write_bytes(b"second")
+        else:
+            existing.write_bytes(b"changed-and-longer")
+        return object(), 0.1, 0.2
+
+    output = StringIO()
+    with pytest.raises(RuntimeError, match=classification):
+        prewarm._run_bucket_compile_attempt(
+            bucket=64,
+            cache_path=cache,
+            jax=SimpleNamespace(monitoring=monitoring),
+            compile_fn=compile_bucket,
+            boot_validator=lambda: {
+                "amdgpu_boot_clean": True,
+                "fatal_amdgpu_events": [],
+            },
+            output=output,
+        )
+
+    evidence = json.loads(output.getvalue().splitlines()[-1])["evidence"]
+    assert evidence["classification"] == classification
+
+
 def test_strict_public_cache_hit_is_promotable_without_directory_change(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -384,6 +475,10 @@ def test_strict_public_cache_hit_is_promotable_without_directory_change(
     def compile_bucket() -> tuple[object, float, float]:
         monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
         monitoring.emit("/jax/compilation_cache/cache_hits")
+        monitoring.emit_duration("/jax/compilation_cache/compile_time_saved_sec", 2.5)
+        monitoring.emit_duration(
+            "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
+        )
         return object(), 0.1, 0.01
 
     result = prewarm._run_bucket_compile_attempt(
@@ -398,7 +493,145 @@ def test_strict_public_cache_hit_is_promotable_without_directory_change(
         output=StringIO(),
     )
 
-    assert result[-1]["classification"] == "strict_public_monitoring_hit"
+    evidence = result[-1]
+    assert evidence["classification"] == "strict_public_monitoring_hit"
+    assert evidence["public_monitoring_duration_events"] == {
+        "compile_time_saved_sec": [2.5],
+        "cache_retrieval_time_sec": [0.01],
+    }
+
+
+@pytest.mark.parametrize("mutation", ["added", "changed"])
+def test_public_hit_with_top_level_cache_mutation_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    existing = cache / "jit_model-hit-cache"
+    existing.write_bytes(b"cached")
+    monitoring = _FakeMonitoring()
+    monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
+
+    def compile_bucket() -> tuple[object, float, float]:
+        monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
+        monitoring.emit("/jax/compilation_cache/cache_hits")
+        monitoring.emit_duration("/jax/compilation_cache/compile_time_saved_sec", 2.5)
+        monitoring.emit_duration(
+            "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
+        )
+        if mutation == "added":
+            (cache / "jit_unexpected-added-cache").write_bytes(b"unexpected")
+        else:
+            existing.write_bytes(b"unexpected-change")
+        return object(), 0.1, 0.01
+
+    output = StringIO()
+    with pytest.raises(RuntimeError, match="ambiguous_hit_with_top_level"):
+        prewarm._run_bucket_compile_attempt(
+            bucket=64,
+            cache_path=cache,
+            jax=SimpleNamespace(monitoring=monitoring),
+            compile_fn=compile_bucket,
+            boot_validator=lambda: {
+                "amdgpu_boot_clean": True,
+                "fatal_amdgpu_events": [],
+            },
+            output=output,
+        )
+
+    evidence = json.loads(output.getvalue().splitlines()[-1])["evidence"]
+    assert evidence["classification"] == ("ambiguous_hit_with_top_level_cache_mutation")
+
+
+@pytest.mark.parametrize(
+    ("duration", "metadata", "classification"),
+    [
+        (float("nan"), {}, "malformed_public_monitoring_evidence"),
+        (-0.1, {}, "malformed_public_monitoring_evidence"),
+        (
+            1.0,
+            {"module": "untrusted-attribution"},
+            "malformed_public_monitoring_evidence",
+        ),
+    ],
+)
+def test_malformed_public_duration_evidence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    duration: float,
+    metadata: dict[str, str],
+    classification: str,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monitoring = _FakeMonitoring()
+    monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
+
+    def compile_bucket() -> tuple[object, float, float]:
+        monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
+        monitoring.emit("/jax/compilation_cache/cache_hits")
+        monitoring.emit_duration(
+            "/jax/compilation_cache/compile_time_saved_sec",
+            duration,
+            **metadata,
+        )
+        monitoring.emit_duration(
+            "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
+        )
+        return object(), 0.1, 0.01
+
+    output = StringIO()
+    with pytest.raises(RuntimeError, match="evidence is not promotable"):
+        prewarm._run_bucket_compile_attempt(
+            bucket=64,
+            cache_path=cache,
+            jax=SimpleNamespace(monitoring=monitoring),
+            compile_fn=compile_bucket,
+            boot_validator=lambda: {
+                "amdgpu_boot_clean": True,
+                "fatal_amdgpu_events": [],
+            },
+            output=output,
+        )
+
+    evidence = json.loads(output.getvalue().splitlines()[-1])["evidence"]
+    assert evidence["classification"] == classification
+    assert evidence["public_monitoring_schema_issues"]
+    assert monitoring.listeners == []
+    assert monitoring.duration_listeners == []
+
+
+def test_duplicate_hit_duration_is_ambiguous_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monitoring = _FakeMonitoring()
+    monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
+
+    def compile_bucket() -> tuple[object, float, float]:
+        monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
+        monitoring.emit("/jax/compilation_cache/cache_hits")
+        monitoring.emit_duration("/jax/compilation_cache/compile_time_saved_sec", 2.0)
+        monitoring.emit_duration("/jax/compilation_cache/compile_time_saved_sec", 2.0)
+        monitoring.emit_duration(
+            "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
+        )
+        return object(), 0.1, 0.01
+
+    output = StringIO()
+    with pytest.raises(RuntimeError, match="hit_without_exact"):
+        prewarm._run_bucket_compile_attempt(
+            bucket=64,
+            cache_path=cache,
+            jax=SimpleNamespace(monitoring=monitoring),
+            compile_fn=compile_bucket,
+            boot_validator=lambda: {
+                "amdgpu_boot_clean": True,
+                "fatal_amdgpu_events": [],
+            },
+            output=output,
+        )
 
 
 @pytest.mark.parametrize(
@@ -553,6 +786,7 @@ def _patch_rocm_execution_for_postflight(
     lock_fd = os.open(lock_dir, os.O_RDONLY | os.O_DIRECTORY)
     args = SimpleNamespace(
         execute_rocm=True,
+        compile_optimizer=False,
         buckets=(64,),
         attention_backend="xla",
         model_path=model,
@@ -696,6 +930,7 @@ def test_tool_wide_postflight_covers_all_gpu_capable_failure_stages(
     cache.mkdir()
     args = SimpleNamespace(
         execute_rocm=True,
+        compile_optimizer=False,
         buckets=(64,),
         attention_backend="xla",
         model_path=model,
@@ -892,6 +1127,101 @@ def test_compile_step_only_lowers_and_compiles_without_replay() -> None:
     assert compile_seconds >= 0
 
 
+def test_optimizer_compile_only_uses_exact_backend_signature_without_update() -> None:
+    lowered = _FakeLowered()
+    optimizer_pass = _FakeModelPass(lowered)
+    optimizer = object()
+    backend = SimpleNamespace(
+        mesh="mesh",
+        accumulated_grads="grads",
+        lora_params="lora",
+    )
+
+    compiled, lower_seconds, compile_seconds = prewarm._lower_and_compile_optimizer(
+        _FakeJax(), optimizer_pass, backend, optimizer, "adapter-index"
+    )
+
+    assert isinstance(compiled, _FakeCompiled)
+    assert optimizer_pass.lower_calls == [("grads", "lora", optimizer, "adapter-index")]
+    assert lowered.compile_calls == 1
+    assert lower_seconds >= 0
+    assert compile_seconds >= 0
+
+
+def test_optimizer_compile_attempt_has_separate_cache_and_postflight_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monitoring = _FakeMonitoring()
+    monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
+
+    def compile_optimizer() -> tuple[object, float, float]:
+        monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
+        monitoring.emit("/jax/compilation_cache/cache_misses")
+        (cache / "jit_optimizer-deadbeef-cache").write_bytes(b"compiled")
+        return _FakeCompiled(), 0.2, 0.4
+
+    output = StringIO()
+    result = prewarm._run_optimizer_compile_attempt(
+        cache_path=cache,
+        jax=SimpleNamespace(monitoring=monitoring),
+        compile_fn=compile_optimizer,
+        boot_validator=lambda: {
+            "amdgpu_boot_clean": True,
+            "fatal_amdgpu_events": [],
+        },
+        output=output,
+    )
+
+    assert isinstance(result[0], _FakeCompiled)
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "optimizer_postflight",
+        "optimizer_cache_evidence",
+    ]
+    assert {record["compile_target"] for record in records} == {
+        "sequence_independent_compute_grads_and_update"
+    }
+    assert all(record["optimizer_step_invocations"] == 0 for record in records)
+
+
+def test_optimizer_compile_failure_cleans_monitoring_and_runs_postflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monitoring = _FakeMonitoring()
+    monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
+    order: list[str] = []
+
+    def fail_compile() -> tuple[object, float, float]:
+        order.append("compile")
+        raise RuntimeError("optimizer compiler fault")
+
+    def postflight() -> dict[str, object]:
+        order.append("postflight")
+        return {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []}
+
+    output = StringIO()
+    with pytest.raises(RuntimeError, match="optimizer compiler fault"):
+        prewarm._run_optimizer_compile_attempt(
+            cache_path=cache,
+            jax=SimpleNamespace(monitoring=monitoring),
+            compile_fn=fail_compile,
+            boot_validator=postflight,
+            output=output,
+        )
+
+    assert order == ["compile", "postflight"]
+    assert monitoring.listeners == []
+    assert monitoring.duration_listeners == []
+    record = json.loads(output.getvalue())
+    assert record["record_type"] == "optimizer_postflight"
+    assert record["compile_succeeded"] is False
+    assert record["optimizer_step_invocations"] == 0
+
+
 def test_installed_jax_accepts_exact_bucket_signature_on_cpu() -> None:
     environment = {**os.environ, "JAX_PLATFORMS": "cpu"}
     result = subprocess.run(
@@ -938,15 +1268,22 @@ def test_installed_jax_public_monitoring_listener_api_on_cpu() -> None:
 from jax import monitoring
 
 seen = []
+durations = []
 def listener(event, **metadata):
     seen.append((event, metadata))
+def duration_listener(event, duration_secs, **metadata):
+    durations.append((event, duration_secs, metadata))
 
 monitoring.register_event_listener(listener)
+monitoring.register_event_duration_secs_listener(duration_listener)
 try:
     monitoring.record_event("/skyrl/prewarm/test", bucket=64)
+    monitoring.record_event_duration_secs("/skyrl/prewarm/duration", 1.25)
 finally:
+    monitoring.unregister_event_duration_listener(duration_listener)
     monitoring.unregister_event_listener(listener)
 assert seen == [("/skyrl/prewarm/test", {"bucket": 64})]
+assert durations == [("/skyrl/prewarm/duration", 1.25, {})]
 """,
         ],
         cwd=_REPO,
@@ -979,14 +1316,39 @@ def test_tool_has_no_top_level_jax_import_export_or_executable_call() -> None:
     assert source.count("compiled = lowered.compile()") == 1
     assert "compiled(" not in source
     assert "model_pass(" not in source
+    assert "optimizer_pass(" not in source
+    assert ".optim_step(" not in source
+    assert "optimizer.update(" not in source
+    assert "hipGraph" not in source
+    assert "cuda.graph" not in source
+    forbidden_direct_calls = {
+        "compiled",
+        "model_pass",
+        "optimizer_pass",
+        "_compute_grads_and_update",
+    }
+    assert not any(
+        isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name)
+            and node.func.id in forbidden_direct_calls
+            or isinstance(node.func, ast.Attribute)
+            and node.func.attr in forbidden_direct_calls
+        )
+        for node in ast.walk(module)
+    )
     run_section = source[source.index("def _run_rocm(") : source.index("def _execute(")]
     execute_section = source[source.index("def _execute(") : source.index("def main(")]
     attempt_section = source[
-        source.index("def _run_bucket_compile_attempt(") : source.index(
+        source.index("def _run_compile_attempt(") : source.index(
             "def _validate_inherited_lock("
         )
     ]
     assert "_run_bucket_compile_attempt(" in run_section
+    assert "_run_optimizer_compile_attempt(" in run_section
+    assert run_section.index("for bucket in args.buckets:") < run_section.index(
+        "if args.compile_optimizer:"
+    )
     assert "_revalidate_cache_after_compile(cache_path)" in attempt_section
     assert execute_section.index("_run_rocm(") < execute_section.index(
         "postflight = _require_clean_amdgpu_boot()"
@@ -1007,10 +1369,19 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     source = _LAUNCHER.read_text(encoding="utf-8")
 
     opt_in = 'prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"'
+    optimizer_opt_in = 'prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER:-0}"'
     invocation = "python rocm/prewarm_qwen35_buckets.py"
     final_journal_gate = "python3 -m rocm.amdgpu_safety >/dev/null"
     api_exec = "exec uv run --active --no-sync -m skyrl.tinker.api"
     assert opt_in in source
+    assert optimizer_opt_in in source
+    assert "0|1) ;;" in source
+    assert "prewarm_optimizer_args=(--compile-optimizer)" in source
+    assert '"${prewarm_optimizer_args[@]}"' in source
+    assert "export JAX_ENABLE_PGLE=false" in source
+    assert "export JAX_COMPILATION_CACHE_EXPECT_PGLE=false" in source
+    assert source.count("export JAX_ENABLE_PGLE=") == 1
+    assert source.count("export JAX_COMPILATION_CACHE_EXPECT_PGLE=") == 1
     assert 'if [[ -n "$prewarm_buckets" ]]' in source
     assert "--execute-rocm" in source
     assert "--allow-gpu" in source
@@ -1022,6 +1393,10 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     assert source.index(
         "export XLA_FLAGS=--xla_gpu_enable_command_buffer="
     ) < source.index(invocation)
+    assert source.index("export JAX_ENABLE_PGLE=false") < source.index(invocation)
+    assert source.index("export JAX_COMPILATION_CACHE_EXPECT_PGLE=false") < (
+        source.index(invocation)
+    )
     assert source.index(invocation) < source.index(api_exec)
     assert source.index(invocation) < source.rindex(final_journal_gate)
     assert source.rindex(final_journal_gate) < source.index(api_exec)
@@ -1045,6 +1420,72 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
         "python rocm/prepare_jax_cache_dir.py"
     )
     subprocess.run(["bash", "-n", str(_LAUNCHER)], check=True)
+
+
+@pytest.mark.parametrize(
+    ("optimizer_value", "buckets", "message"),
+    [
+        ("true", "64", "must be exactly 0 or 1"),
+        ("2", "64", "must be exactly 0 or 1"),
+        ("1", "", "requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS"),
+    ],
+)
+def test_launcher_optimizer_opt_in_fails_closed_before_hardware_access(
+    optimizer_value: str, buckets: str, message: str
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("JAX_ENABLE_PGLE", None)
+    environment.pop("JAX_COMPILATION_CACHE_EXPECT_PGLE", None)
+    environment["SKYRL_QWEN35_PREWARM_OPTIMIZER"] = optimizer_value
+    environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = buckets
+
+    result = subprocess.run(
+        ["bash", str(_LAUNCHER), "invalid-opt-in-test"],
+        cwd=_REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "AMDGPU" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("JAX_ENABLE_PGLE", "true"),
+        ("JAX_ENABLE_PGLE", "1"),
+        ("JAX_COMPILATION_CACHE_EXPECT_PGLE", "true"),
+        ("JAX_COMPILATION_CACHE_EXPECT_PGLE", "0"),
+    ],
+)
+def test_launcher_rejects_conflicting_pgle_environment_before_hardware_access(
+    name: str, value: str
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("JAX_ENABLE_PGLE", None)
+    environment.pop("JAX_COMPILATION_CACHE_EXPECT_PGLE", None)
+    environment[name] = value
+    environment["SKYRL_QWEN35_PREWARM_OPTIMIZER"] = "0"
+    environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = ""
+
+    result = subprocess.run(
+        ["bash", str(_LAUNCHER), "invalid-pgle-test"],
+        cwd=_REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert f"{name}={value} conflicts with graph-free startup" in result.stderr
+    assert "AMDGPU" not in result.stderr
 
 
 def test_launcher_status_pattern_postflights_failed_child_and_never_executes_api() -> (

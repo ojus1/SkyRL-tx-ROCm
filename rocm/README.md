@@ -91,6 +91,10 @@ treats cache entries as trusted executable content. This mechanism does not
 enable XLA command buffers or HIP Graphs, does not reduce steady-state VRAM by
 itself, and does not replace shape-specific warmup. It lets later static-bucket
 precompile and ordinary host-driven warmups amortize compilation safely.
+The active trusted namespace
+`~/.cache/skyrl-jax-rocm-private-v1/jax0.10.2-jaxlib0.10.2-rocm-plugin0.10.2-pjrt0.10.2-rocm7.2.4-amdgpu6.16.13-gfx1100-v1`
+was initially empty. The legacy 42 MiB `~/.cache/skyrl-jax` tree is outside this
+namespace and is neither read nor credited as startup evidence.
 
 Static-bucket prewarm is available but default-off. A nonempty canonical bucket
 list runs one compile-only process before the API starts and records a private
@@ -99,30 +103,58 @@ list runs one compile-only process before the API starts and records a private
 ```bash
 # Configuration syntax only; operational execution still requires supervision.
 SKYRL_QWEN35_PREWARM_BUCKETS=64,256 ./rocm/start_qwen35.sh prewarm-t64-t256
+
+# Also compile the one sequence-independent Adam update after both train buckets.
+SKYRL_QWEN35_PREWARM_BUCKETS=64,256 \
+SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
+  ./rocm/start_qwen35.sh prewarm-t64-t256-adam
 ```
 
 Buckets at 512 or above additionally require the explicitly enabled Pallas
 attention path. The tool constructs the exact backend and rank-8 LoRA/Adam
 state, then lowers and compiles forward/backward/accumulation for batch one. It
-does not invoke those executables, precompile the optimizer or sampler, export
-an executable, or replace data-dependent warmup. Compilation can initialize
-ROCm, allocate representative buffers, and run XLA autotuning kernels, so use
-the normal headless/exclusive-device and telemetry discipline and allow a much
-longer startup. Running `python rocm/prewarm_qwen35_buckets.py` without ROCm
-acknowledgements is a CPU-only plan and never imports JAX.
+does not invoke those executables, precompile the sampler, export an executable,
+or replace data-dependent warmup. The optimizer extension is separately
+default-off: the launcher accepts only literal `0` or `1`, and `1` requires a
+nonempty bucket list. After all train buckets pass, it calls `lower().compile()`
+once on the backend's exact `_compute_grads_and_update` JIT using accumulated
+gradients, LoRA state, the live NNX Adam object, and the scalar adapter index.
+This operation is independent of sequence length. The compiled handle is only
+inspected for memory metadata and then discarded; it is never called, so no
+Adam update, gradient reset, or model-state mutation through an optimizer step
+occurs.
+
+Backend/model construction, pinned-weight loading, LoRA parameter and Adam-state
+initialization, array placement, and the explicit `block_until_ready` may still
+perform ordinary setup array work. Compilation can initialize ROCm, allocate
+representative buffers, and run XLA autotuning kernels, so use the normal
+headless/exclusive-device and telemetry discipline and allow a much longer
+startup. Neither path enables command buffers, HIP Graphs, PGLE, executable
+export, an actual warmup/replay, or an in-engine prewarm. The launcher exports
+both `JAX_ENABLE_PGLE=false` and `JAX_COMPILATION_CACHE_EXPECT_PGLE=false`, and
+the direct prewarm tool requires those exact values. Running
+`python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
+CPU-only plan and never imports JAX.
 
 The prewarm execution path is still hardware-unqualified: the implementation
 and tests have not run its multi-bucket ROCm path. Do not use the direct command
 above unsupervised. An operational qualification run must wrap the entire
 launcher in the telemetry guard with an explicit finite timeout, a 90 C maximum
 junction temperature, and a 315 W maximum GPU power limit, while retaining the
-headless-display, exclusive-KFD, fatal-journal, and cleanup gates. Each bucket
-artifact reports JAX 0.10.2's public process-level persistent-cache hit/miss
-events plus top-level cache-directory deltas. Those public events contain no
-module or cache key, so this is useful evidence but not per-key proof of a cache
-write or hit. Startup accepts only one monitored hit, or one monitored miss
-paired with a top-level executable-cache add/change; ambiguous, missing, or
-mixed evidence fails closed.
+headless-display, exclusive-KFD, fatal-journal, and cleanup gates. Each
+train-bucket and optimizer compile has separate timing, compiled-memory,
+postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
+process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`
+and `cache_retrieval_time_sec` events on hits, and top-level cache-directory
+deltas. Those public callbacks contain no module or cache key, so this is useful
+process-level evidence but not per-key proof of a cache write or hit. Startup
+accepts only one monitored hit with exactly one finite nonnegative value for
+each duration and no top-level executable-cache mutation, or one monitored miss
+paired with exactly one newly added top-level executable-cache entry, no changed
+or removed entry, and no duration. Unexpected metadata, malformed/duplicate
+durations, cache additions or changes during a hit, changed-only or multiple-add
+miss deltas, cache removals, and otherwise ambiguous, missing, or mixed evidence
+fail closed.
 
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for

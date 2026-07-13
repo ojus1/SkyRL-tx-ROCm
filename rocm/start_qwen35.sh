@@ -15,7 +15,21 @@ run_id="$1"
 model_repo="Qwen/Qwen3.5-4B"
 model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 memory_mode="${SKYRL_QWEN35_MEMORY_MODE:-growth}"
+prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
+prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER:-0}"
 backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64}'
+
+case "$prewarm_optimizer" in
+  0|1) ;;
+  *)
+    echo "SKYRL_QWEN35_PREWARM_OPTIMIZER must be exactly 0 or 1." >&2
+    exit 2
+    ;;
+esac
+if [[ "$prewarm_optimizer" == "1" && -z "$prewarm_buckets" ]]; then
+  echo "SKYRL_QWEN35_PREWARM_OPTIMIZER=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
+  exit 2
+fi
 
 require_unset_or_exact() {
   local name="$1"
@@ -29,6 +43,23 @@ require_unset_or_exact() {
     fi
   fi
 }
+
+require_unset_or_false() {
+  local name="$1"
+  local value
+  if [[ -v "$name" ]]; then
+    value="${!name}"
+    if [[ "$value" != "false" ]]; then
+      echo "$name=$value conflicts with graph-free startup (required: false)." >&2
+      exit 2
+    fi
+  fi
+}
+
+require_unset_or_false JAX_ENABLE_PGLE
+require_unset_or_false JAX_COMPILATION_CACHE_EXPECT_PGLE
+export JAX_ENABLE_PGLE=false
+export JAX_COMPILATION_CACHE_EXPECT_PGLE=false
 
 case "$memory_mode" in
   growth)
@@ -299,9 +330,12 @@ export XLA_FLAGS=--xla_gpu_enable_command_buffer=
 # Default-off, compile-only static-bucket prewarm. This populates the trusted
 # persistent cache before the API starts, but never invokes a compiled model
 # pass or optimizer step. ROCm compilation may still run bounded autotuning.
-prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
 prewarm_status=0
 if [[ -n "$prewarm_buckets" ]]; then
+  prewarm_optimizer_args=()
+  if [[ "$prewarm_optimizer" == "1" ]]; then
+    prewarm_optimizer_args=(--compile-optimizer)
+  fi
   prewarm_construction=eager
   if [[ "$memory_mode" == "preallocate85" ]]; then
     prewarm_construction=abstract-load
@@ -317,6 +351,7 @@ if [[ -n "$prewarm_buckets" ]]; then
   if python rocm/prewarm_qwen35_buckets.py \
       --execute-rocm \
       --allow-gpu \
+      "${prewarm_optimizer_args[@]}" \
       --buckets "$prewarm_buckets" \
       --model-path "$model_path" \
       --construction "$prewarm_construction" \

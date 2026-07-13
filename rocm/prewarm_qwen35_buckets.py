@@ -9,8 +9,10 @@ cache and disables every XLA GPU command buffer.
 
 The execution path constructs the launcher's exact backend and rank-8 LoRA
 state, then calls ``lower()`` and ``lowered.compile()`` once per fixed sequence
-bucket.  It never invokes a compiled callable, runs an optimizer step, exports
-or serializes an executable, or uses a graph API.  ROCm compilation is still
+bucket.  A separate, default-off option lowers and compiles the exact
+sequence-independent Adam update once, after every requested training bucket.
+It never invokes a compiled callable, runs an optimizer step, exports or
+serializes an executable, or uses a graph API.  ROCm compilation is still
 allowed to initialize the device, allocate representative buffers, and run XLA
 autotuning/profiling kernels; "compile-only" does not mean zero device work.
 """
@@ -21,6 +23,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shlex
 import stat
@@ -56,6 +59,8 @@ _EXPECTED_STACK = {
 }
 _CACHE_ENVIRONMENT = {
     "JAX_ENABLE_COMPILATION_CACHE": "true",
+    "JAX_ENABLE_PGLE": "false",
+    "JAX_COMPILATION_CACHE_EXPECT_PGLE": "false",
     "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true",
     "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": ("xla_gpu_per_fusion_autotune_cache_dir"),
     "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
@@ -143,6 +148,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-gpu",
         action="store_true",
         help="second acknowledgement required with --execute-rocm",
+    )
+    parser.add_argument(
+        "--compile-optimizer",
+        action="store_true",
+        help=(
+            "after all selected train buckets, lower().compile() the exact "
+            "sequence-independent Adam update once without invoking it"
+        ),
     )
     parser.add_argument(
         "--model-path",
@@ -376,6 +389,8 @@ def _executable_cache_snapshot(cache_path: Path) -> dict[str, tuple[int, int]]:
 
 def _cache_evidence(
     events: dict[str, int],
+    durations: dict[str, list[float]],
+    monitoring_issues: list[str],
     before: dict[str, tuple[int, int]],
     after: dict[str, tuple[int, int]],
 ) -> dict[str, Any]:
@@ -391,10 +406,30 @@ def _cache_evidence(
     hits = events.get("/jax/compilation_cache/cache_hits", 0)
     misses = events.get("/jax/compilation_cache/cache_misses", 0)
     requests = events.get("/jax/compilation_cache/compile_requests_use_cache", 0)
-    if requests == 1 and hits == 1 and misses == 0:
+    saved = durations.get("/jax/compilation_cache/compile_time_saved_sec", [])
+    retrieval = durations.get("/jax/compilation_cache/cache_retrieval_time_sec", [])
+    has_exact_hit_durations = len(saved) == 1 and len(retrieval) == 1
+    has_any_durations = bool(saved or retrieval)
+    if monitoring_issues:
+        classification = "malformed_public_monitoring_evidence"
+    elif removed:
+        classification = "ambiguous_top_level_cache_removal"
+    elif requests == 1 and hits == 1 and misses == 0 and (added or changed):
+        classification = "ambiguous_hit_with_top_level_cache_mutation"
+    elif requests == 1 and hits == 1 and misses == 0 and has_exact_hit_durations:
         classification = "strict_public_monitoring_hit"
-    elif requests == 1 and hits == 0 and misses == 1 and (added or changed):
-        classification = "strict_public_monitoring_miss_with_cache_change"
+    elif requests == 1 and hits == 1 and misses == 0:
+        classification = "hit_without_exact_public_duration_evidence"
+    elif has_any_durations:
+        classification = "duration_events_without_single_cache_hit"
+    elif (
+        requests == 1 and hits == 0 and misses == 1 and len(added) == 1 and not changed
+    ):
+        classification = "strict_public_monitoring_miss_with_single_cache_add"
+    elif requests == 1 and hits == 0 and misses == 1 and len(added) > 1:
+        classification = "ambiguous_miss_with_multiple_added_cache_entries"
+    elif requests == 1 and hits == 0 and misses == 1 and changed:
+        classification = "ambiguous_miss_with_changed_cache_entry"
     elif misses > 0 and (added or changed):
         classification = "non_strict_miss_events_with_cache_change"
     elif misses > 0:
@@ -410,6 +445,11 @@ def _cache_evidence(
             "cache_hits": hits,
             "cache_misses": misses,
         },
+        "public_monitoring_duration_events": {
+            "compile_time_saved_sec": saved,
+            "cache_retrieval_time_sec": retrieval,
+        },
+        "public_monitoring_schema_issues": monitoring_issues,
         "top_level_executable_cache": {
             "entries_before": len(before),
             "entries_after": len(after),
@@ -421,16 +461,18 @@ def _cache_evidence(
             "post_manifest_sha256": hashlib.sha256(manifest.encode()).hexdigest(),
         },
         "evidence_limit": (
-            "JAX 0.10.2 public monitoring reports process-level hit/miss events "
-            "without a module or cache key; directory deltas are observable but do "
-            "not prove which key a compile request used"
+            "JAX 0.10.2 public monitoring reports process-level hit/miss and "
+            "duration events without a module or cache key; directory deltas are "
+            "observable but do not prove which key a compile request used"
         ),
     }
 
 
-def _run_bucket_compile_attempt(
+def _run_compile_attempt(
     *,
-    bucket: int,
+    target: str,
+    identity: dict[str, Any],
+    record_prefix: str,
     cache_path: Path,
     jax: Any,
     compile_fn: Callable[[], tuple[Any, float, float]],
@@ -439,20 +481,61 @@ def _run_bucket_compile_attempt(
 ) -> tuple[Any, float, float, dict[str, Any]]:
     before = _executable_cache_snapshot(cache_path)
     events: dict[str, int] = {}
+    durations: dict[str, list[float]] = {}
+    monitoring_issues: list[str] = []
+    event_names = {
+        "/jax/compilation_cache/cache_hits",
+        "/jax/compilation_cache/cache_misses",
+        "/jax/compilation_cache/compile_requests_use_cache",
+    }
+    duration_names = {
+        "/jax/compilation_cache/compile_time_saved_sec",
+        "/jax/compilation_cache/cache_retrieval_time_sec",
+    }
 
-    def listener(event: str, **_metadata: str | int) -> None:
+    def listener(event: str, **metadata: str | int) -> None:
+        if event not in event_names:
+            return
+        if metadata:
+            monitoring_issues.append(f"unexpected event metadata for {event}")
         events[event] = events.get(event, 0) + 1
+
+    def duration_listener(
+        event: str, duration_secs: float, **metadata: str | int
+    ) -> None:
+        if event not in duration_names:
+            return
+        if metadata:
+            monitoring_issues.append(f"unexpected duration metadata for {event}")
+        if (
+            isinstance(duration_secs, bool)
+            or not isinstance(duration_secs, (int, float))
+            or not math.isfinite(duration_secs)
+            or duration_secs < 0
+        ):
+            monitoring_issues.append(f"invalid numeric duration for {event}")
+            return
+        durations.setdefault(event, []).append(float(duration_secs))
 
     result: tuple[Any, float, float] | None = None
     compile_error: BaseException | None = None
     listener_registered = False
+    duration_listener_registered = False
     try:
         jax.monitoring.register_event_listener(listener)
         listener_registered = True
+        jax.monitoring.register_event_duration_secs_listener(duration_listener)
+        duration_listener_registered = True
         result = compile_fn()
     except BaseException as error:
         compile_error = error
     finally:
+        if duration_listener_registered:
+            try:
+                jax.monitoring.unregister_event_duration_listener(duration_listener)
+            except BaseException as error:
+                if compile_error is None:
+                    compile_error = error
         if listener_registered:
             try:
                 jax.monitoring.unregister_event_listener(listener)
@@ -475,19 +558,19 @@ def _run_bucket_compile_attempt(
             or postflight.get("fatal_amdgpu_events") != []
         ):
             raise RuntimeError(
-                f"bucket {bucket} AMDGPU postflight returned invalid manifest "
-                f"{postflight!r}"
+                f"{target} AMDGPU postflight returned invalid manifest {postflight!r}"
             )
     except BaseException as error:
         raise RuntimeError(
-            f"bucket {bucket} AMDGPU postflight failed: {type(error).__name__}: {error}"
+            f"{target} AMDGPU postflight failed: {type(error).__name__}: {error}"
         ) from error
 
     _emit(
         {
-            "record_type": "bucket_postflight",
+            "record_type": f"{record_prefix}_postflight",
             "timestamp": _utc_now(),
-            "bucket": bucket,
+            "compile_target": target,
+            **identity,
             "status": "clean",
             "compile_succeeded": compile_error is None,
             "cache_revalidated": cache_error is None,
@@ -499,26 +582,27 @@ def _run_bucket_compile_attempt(
     )
     if cache_error is not None:
         raise RuntimeError(
-            f"bucket {bucket} trusted cache revalidation failed: "
+            f"{target} trusted cache revalidation failed: "
             f"{type(cache_error).__name__}: {cache_error}"
         ) from cache_error
     if compile_error is not None:
         raise RuntimeError(
-            f"bucket {bucket} compile attempt failed after clean postflight: "
+            f"{target} compile attempt failed after clean postflight: "
             f"{type(compile_error).__name__}: {compile_error}"
         ) from compile_error
     if result is None:
-        raise RuntimeError(f"bucket {bucket} compile attempt returned no result")
-    evidence = _cache_evidence(events, before, after)
+        raise RuntimeError(f"{target} compile attempt returned no result")
+    evidence = _cache_evidence(events, durations, monitoring_issues, before, after)
     accepted = evidence["classification"] in {
         "strict_public_monitoring_hit",
-        "strict_public_monitoring_miss_with_cache_change",
+        "strict_public_monitoring_miss_with_single_cache_add",
     }
     _emit(
         {
-            "record_type": "bucket_cache_evidence",
+            "record_type": f"{record_prefix}_cache_evidence",
             "timestamp": _utc_now(),
-            "bucket": bucket,
+            "compile_target": target,
+            **identity,
             "status": "accepted" if accepted else "rejected",
             "evidence": evidence,
             "model_pass_executable_invocations": 0,
@@ -528,10 +612,51 @@ def _run_bucket_compile_attempt(
     )
     if not accepted:
         raise RuntimeError(
-            f"bucket {bucket} persistent-cache evidence is not promotable: "
+            f"{target} persistent-cache evidence is not promotable: "
             f"{evidence['classification']}"
         )
     return (*result, evidence)
+
+
+def _run_bucket_compile_attempt(
+    *,
+    bucket: int,
+    cache_path: Path,
+    jax: Any,
+    compile_fn: Callable[[], tuple[Any, float, float]],
+    boot_validator: Callable[[], dict[str, Any]],
+    output: TextIO,
+) -> tuple[Any, float, float, dict[str, Any]]:
+    return _run_compile_attempt(
+        target="train_bucket_forward_backward_accumulate",
+        identity={"bucket": bucket},
+        record_prefix="bucket",
+        cache_path=cache_path,
+        jax=jax,
+        compile_fn=compile_fn,
+        boot_validator=boot_validator,
+        output=output,
+    )
+
+
+def _run_optimizer_compile_attempt(
+    *,
+    cache_path: Path,
+    jax: Any,
+    compile_fn: Callable[[], tuple[Any, float, float]],
+    boot_validator: Callable[[], dict[str, Any]],
+    output: TextIO,
+) -> tuple[Any, float, float, dict[str, Any]]:
+    return _run_compile_attempt(
+        target="sequence_independent_compute_grads_and_update",
+        identity={},
+        record_prefix="optimizer",
+        cache_path=cache_path,
+        jax=jax,
+        compile_fn=compile_fn,
+        boot_validator=boot_validator,
+        output=output,
+    )
 
 
 def _validate_inherited_lock(lock_fd: int) -> int:
@@ -627,28 +752,62 @@ def _shape_signature(jax: Any, jnp: Any, backend: Any, bucket: int) -> tuple[Any
     )
 
 
-def _lower_and_compile_bucket(
+def _lower_and_compile(
     jax: Any,
-    model_pass: Any,
     backend: Any,
-    signature: tuple[Any, ...],
+    jitted_function: Any,
+    arguments: tuple[Any, ...],
 ) -> tuple[Any, float, float]:
     lower_start = time.perf_counter()
     mesh_context = (
         jax.set_mesh(backend.mesh) if hasattr(jax, "set_mesh") else nullcontext()
     )
     with mesh_context:
-        lowered = model_pass.lower(
-            backend.accumulated_grads,
-            backend.lora_params,
-            backend.non_lora_params,
-            *signature,
-        )
+        lowered = jitted_function.lower(*arguments)
     lower_seconds = time.perf_counter() - lower_start
     compile_start = time.perf_counter()
     compiled = lowered.compile()
     compile_seconds = time.perf_counter() - compile_start
     return compiled, lower_seconds, compile_seconds
+
+
+def _lower_and_compile_bucket(
+    jax: Any,
+    model_pass: Any,
+    backend: Any,
+    signature: tuple[Any, ...],
+) -> tuple[Any, float, float]:
+    return _lower_and_compile(
+        jax,
+        backend,
+        model_pass,
+        (
+            backend.accumulated_grads,
+            backend.lora_params,
+            backend.non_lora_params,
+            *signature,
+        ),
+    )
+
+
+def _lower_and_compile_optimizer(
+    jax: Any,
+    optimizer_pass: Any,
+    backend: Any,
+    optimizer: Any,
+    adapter_index: Any,
+) -> tuple[Any, float, float]:
+    return _lower_and_compile(
+        jax,
+        backend,
+        optimizer_pass,
+        (
+            backend.accumulated_grads,
+            backend.lora_params,
+            optimizer,
+            adapter_index,
+        ),
+    )
 
 
 def _run_rocm(
@@ -720,9 +879,16 @@ def _run_rocm(
             "adapter_index": adapter_index,
             "setup_seconds": setup_seconds,
             "setup_dispatch_caveat": (
-                "model loading, LoRA/Adam initialization, and synchronization may "
-                "dispatch setup work; no model pass or optimizer step ran"
+                "backend/model construction, pinned-weight loading, LoRA parameter "
+                "and Adam-state initialization, array placement, and explicit "
+                "block_until_ready synchronization may perform ordinary setup array "
+                "work; no training pass or optimizer update executable ran"
             ),
+            "optimizer_compile_requested": args.compile_optimizer,
+            "train_bucket_lower_calls": 0,
+            "train_bucket_compile_calls": 0,
+            "optimizer_lower_calls": 0,
+            "optimizer_compile_calls": 0,
             "model_pass_executable_invocations": 0,
             "optimizer_step_invocations": 0,
         },
@@ -753,6 +919,7 @@ def _run_rocm(
             {
                 "record_type": "bucket_compiled",
                 "timestamp": _utc_now(),
+                "compile_target": "train_bucket_forward_backward_accumulate",
                 "bucket": bucket,
                 "batch_size": 1,
                 "attention_backend": args.attention_backend,
@@ -760,8 +927,58 @@ def _run_rocm(
                 "compile_seconds": compile_seconds,
                 "compiled_memory": memory,
                 "persistent_cache_evidence": cache_evidence,
+                "train_bucket_lower_calls": 1,
+                "train_bucket_compile_calls": 1,
+                "optimizer_lower_calls": 0,
+                "optimizer_compile_calls": 0,
                 "model_pass_executable_invocations": 0,
                 "optimizer_step_invocations": 0,
+                "status": "passed",
+            },
+            output,
+        )
+
+    if args.compile_optimizer:
+        optimizer_pass = backend._compute_grads_and_update
+        if not hasattr(optimizer_pass, "lower"):
+            raise RuntimeError("backend Adam update does not expose lower()")
+        optimizer = backend.optimizers[_MODEL_ID]
+        optimizer_adapter_index = jnp.int32(adapter_index)
+        compiled, lower_seconds, compile_seconds, cache_evidence = (
+            _run_optimizer_compile_attempt(
+                cache_path=cache_path,
+                jax=jax,
+                compile_fn=lambda: _lower_and_compile_optimizer(
+                    jax,
+                    optimizer_pass,
+                    backend,
+                    optimizer,
+                    optimizer_adapter_index,
+                ),
+                boot_validator=boot_validator,
+                output=output,
+            )
+        )
+        memory = compile_probe._compiled_memory(compiled)
+        del compiled
+        _emit(
+            {
+                "record_type": "optimizer_compiled",
+                "timestamp": _utc_now(),
+                "compile_target": "sequence_independent_compute_grads_and_update",
+                "optimizer": "Adam",
+                "sequence_independent": True,
+                "lower_seconds": lower_seconds,
+                "compile_seconds": compile_seconds,
+                "compiled_memory": memory,
+                "persistent_cache_evidence": cache_evidence,
+                "train_bucket_lower_calls": 0,
+                "train_bucket_compile_calls": 0,
+                "optimizer_lower_calls": 1,
+                "optimizer_compile_calls": 1,
+                "model_pass_executable_invocations": 0,
+                "optimizer_step_invocations": 0,
+                "optimizer_state_mutations_through_step": 0,
                 "status": "passed",
             },
             output,
@@ -778,6 +995,11 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             "buckets": list(args.buckets),
             "batch_size": 1,
             "attention_backend": args.attention_backend,
+            "optimizer_compile_requested": args.compile_optimizer,
+            "train_bucket_lower_calls_planned": len(args.buckets),
+            "train_bucket_compile_calls_planned": len(args.buckets),
+            "optimizer_lower_calls_planned": 1 if args.compile_optimizer else 0,
+            "optimizer_compile_calls_planned": 1 if args.compile_optimizer else 0,
             "command_buffers_required_disabled": _DISABLE_COMMAND_BUFFERS,
             "compiled_callable_invocations": 0,
             "optimizer_step_invocations": 0,
@@ -794,6 +1016,7 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 "status": "cpu_plan_only",
                 "jax_imported": False,
                 "gpu_accessed": False,
+                "optimizer_compile_planned": args.compile_optimizer,
                 "note": (
                     "CPU compilation cannot populate the ROCm executable cache; "
                     "execution requires both explicit ROCm acknowledgements"
@@ -918,6 +1141,11 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 "record_type": "complete",
                 "timestamp": _utc_now(),
                 "buckets": list(args.buckets),
+                "optimizer_compiled": args.compile_optimizer,
+                "train_bucket_lower_calls": len(args.buckets),
+                "train_bucket_compile_calls": len(args.buckets),
+                "optimizer_lower_calls": 1 if args.compile_optimizer else 0,
+                "optimizer_compile_calls": 1 if args.compile_optimizer else 0,
                 "cache_revalidated_after_each_compile": True,
                 "amdgpu_postflight_clean": True,
                 "status": "passed",
