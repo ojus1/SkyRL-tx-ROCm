@@ -79,6 +79,18 @@ an exact 402-leaf Qwen3.5 LoRA Adam probe passed repeated GPU updates with
 command buffers disabled, while the earlier full-model failure occurred on
 the second replay of the same optimizer executable.
 
+The launcher now trades startup and disk for repeat-startup savings. It pins a
+private cache namespace to JAX/JAXlib/ROCm plugin/PJRT 0.10.2, ROCm 7.2.4,
+AMDGPU 6.16.13, and gfx1100; rejects an inherited cache path; and stores every
+eligible executable plus per-fusion autotuning data. Serialized executable
+entries use a 16 GiB JAX LRU. The separately unbounded autotune subtree is
+scanned for unsafe objects and must remain at or below 4 GiB at each startup.
+The cache path and all ancestors are owner/mode/symlink validated because JAX
+treats cache entries as trusted executable content. This mechanism does not
+enable XLA command buffers or HIP Graphs, does not reduce steady-state VRAM by
+itself, and does not replace shape-specific warmup. It lets later static-bucket
+precompile and ordinary host-driven warmups amortize compilation safely.
+
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for
 `[1.25] + 2`, and a separate BF16 `16x16` all-ones matrix multiply plus
