@@ -1,8 +1,9 @@
 # Query-bounded native GQA prototype
 
 Status: CPU/Pallas-interpret correctness plus exact T=512 guarded ROCm compile,
-analytic single-forward, and factorized nonzero candidate/replay promotion. The
-prototype is not connected to the model dispatcher.
+analytic single-forward, factorized nonzero candidate/replay, full
+arbitrary-cotangent VJP, and representative T=1024 right-padding promotion.
+The prototype is not connected to the model dispatcher.
 
 The prototype in `skyrl/tx/kernels/query_bounded_gqa.py` is the next safe
 attention architecture for Qwen3.5-4B's `B=1, Hq=16, Hkv=4, D=256` training
@@ -1083,19 +1084,160 @@ and profiler telemetry must be independently audited before advancing that
 case. The representative T=1024 padding gate is complete; backward and model
 integration remain separate gates.
 
+## Exact T=512 full arbitrary-cotangent VJP gate
+
+`rocm/probe_query_bounded_gqa_vjp.py` isolates the first complete GPU backward
+promotion. Its immutable signature is BF16 `B=1, T=512, Hq=16, Hkv=4, D=256`,
+an all-valid int32 key mask, explicit scale `3/32`, independent deterministic
+nonzero PCG64 Q/K/V arrays, and an independently seeded nonzero BF16 output
+cotangent. The reference is an independent NumPy FP32 three-pass causal-GQA
+forward/VJP. It streams over 32-query by 32-key tiles, does not construct a
+full T-by-T matrix, and gates the forward output, dQ, dK, and dV separately.
+
+The default path imports no JAX and emits only an abstract refusal. The guarded
+runtime command uses a fresh mode-`0600` artifact and the full practical VRAM
+ceiling while retaining the 90 C and 315 W hardware stops:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-t512-vjp-runtime.telemetry.jsonl \
+  --card card1 \
+  --interval 0.1 \
+  --baseline-seconds 2 \
+  --timeout 180 \
+  --sensor-grace-seconds 15 \
+  --max-junction-temp-c 90 \
+  --max-gpu-power-watts 315 \
+  --max-vram-gib 24 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_vjp.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-t512-vjp-runtime.jsonl
+```
+
+Before releasing a one-use executable capability, the probe requires exactly
+one q0 forward, one q0 dQ, and one q0 dK/dV ROCm Triton call in both StableHLO
+and optimized HLO, with canonical `query_start=0` and `query_size=512`. All
+three calls must be owned directly by the sole entry computation. Optimized
+HLO may contain only the observed fusion instructions directly owned by entry,
+each with one resolved helper callee. Every helper must be acyclic and contain
+zero custom calls. Other
+callable/control-flow schemas, nested targets, duplicate ownership, unresolved
+references, and outer `while` operations fail closed. Argument, output, and
+alias bytes must be exact and temporary storage must not exceed 64 MiB.
+
+### Fail-closed structural progression
+
+The first runtime-shaped precursor compiled but was rejected before capability
+release because the original HLO parser decoded local escaped payloads before
+masking them and therefore undercounted calls. It performed no input placement,
+invocation, or retrieval. Compilation took `3.090511984 s`; compiler memory was
+10,487,808 argument bytes, 10,485,792 output bytes, 2,130,688 temporary bytes,
+and zero aliases. Its child, telemetry, and summary SHA-256 values were
+`8728b46ada81e9afb3f7e3bf77481df7d059149e48660ee93a896044d03639f8`,
+`b1c4323c83519427ed4639ec297854d71887eaef3d72e49f55ec9517680973db`, and
+`aac39b28fac5df3029f8026204ba2e666cf02806205f25b635543d15a896c0cb`.
+Peak physical VRAM was 711,991,296 bytes, junction temperature 49 C, and power
+129 W. All three child journal checkpoints and the safety postflight were
+clean; the profiler returned 1 because the child failed closed. This is
+rejected parser evidence, not runtime promotion.
+
+A separate compile-diagnostic mode was then added. It can emit sanitized
+structural graphs but can never release an executable, construct inputs or a
+reference, invoke a candidate, or retrieve outputs. The first diagnostic made
+the StableHLO parser pass but correctly withheld release because the initial
+optimized-HLO policy rejected the compiler's unrelated fusion instructions
+directly owned by entry. Its child, telemetry, and summary SHA-256 values were
+`9587ad5d919fdfc0f31410e2e6f4988347f1a5f37bc8fba13b6af14aba8a9c57`,
+`d5e0a689305469025b875548a87e5ffdeead6ac0159273afc3d2fa0b16cc0db5`, and
+`96dad066395f67cee90e313a7b3bbd0013089f95f5df84917bf7d2199ebb6f69`.
+All runtime/reference/placement/retrieval counters were zero; peak physical
+VRAM was 711,999,488 bytes, temperature 48 C, and power 129 W.
+
+After independently qualifying the narrow fusion-helper rule, a fresh second
+diagnostic passed both dialects. It found three direct entry-level custom calls
+and three resolved acyclic helpers containing no custom calls. Compiler memory
+remained exactly 10,487,808 argument bytes, 10,485,792 output bytes, 2,130,688
+temporary bytes, and zero aliases. Capability release, invocation, reference,
+placement, retrieval, and lowered-callable counters all remained zero; no
+replay was possible because no executable was released.
+Its mode-`0600` artifacts and SHA-256 values were:
+
+- `/tmp/query-bounded-gqa-t512-vjp-compile-diagnostic-boot54ccf56c-run2.jsonl`:
+  `b58e8b5f47043bdd87d5665bc82bc0401227d44c0737c022632be96415a78bf9`;
+- `/tmp/query-bounded-gqa-t512-vjp-compile-diagnostic-boot54ccf56c-run2.telemetry.jsonl`:
+  `0448bcfcb6ffb2349ec3e5136695d2efd1fa9bd90d3e992cc76923b2896d40b9`;
+- its summary:
+  `f8a557b8002d153ca107826a178390aba1b06cb2fe4358c8208cd295533de4c1`.
+
+Across that diagnostic, physical VRAM peaked at 711,991,296 bytes, junction
+temperature at 48 C, power at 129 W, minimum host-available memory at
+59,821,445,120 bytes, and swap at zero. The profiler and all journal checks
+were clean. This diagnostic authorized one fresh runtime attempt; it was not
+itself execution evidence.
+
+### ROCm 7.2.4 full-VJP runtime result
+
+The independently audited one-shot gate passed on clean commit `81cbe794` and
+boot `54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. Lowering took `0.354011060 s`
+and compilation `3.119457503 s`. Both IR dialects retained exactly the one
+forward, one dQ, and one dK/dV boundary described above. The three optimized
+HLO fusion helpers were resolved, acyclic, and contained zero custom calls.
+Compiler memory was again 10,487,808 argument bytes, 10,485,792 output bytes,
+2,130,688 temporary bytes, and zero aliases.
+
+The sole checked executable invocation, including its three logical custom
+calls, completed in `11.905352 ms`, below the 75 ms promotion and 100 ms safety
+ceilings. Against the independent FP32 host oracle, all four BF16 outputs were
+finite and had exact shape, dtype, and byte counts:
+
+| Tensor | Relative L2 | Cosine | Maximum absolute error | BF16 output SHA-256 |
+|---|---:|---:|---:|---|
+| output | `0.0020381862` | `0.9999979229` | `0.0026158094` | `ae0e9bf7825cd390eb9efba243b466d3ce95242e214d51446a8109fa84d4a05e` |
+| dQ | `0.0024569103` | `0.9999969827` | `0.0004360378` | `e3c9c6798ef14d7fce2c11a38177d77c1de0615425a397b0b77551868f93570d` |
+| dK | `0.0024569559` | `0.9999969823` | `0.0010348558` | `1e5a7ed228d832e4c2c96490a6bd47b74c524cf0dae855547713451c20d836f3` |
+| dV | `0.0022557682` | `0.9999974558` | `0.0047817230` | `32b8652feb28fc365999306d0c4d15b890b607ed6d504b3e6a62eaad597d2773` |
+
+Final accounting recorded exactly one lower, compile, checked capability
+release, host-reference construction, input tuple placement, checked
+invocation, and retrieval. Lowered-callable, warmup, replay, second-VJP,
+accelerator-reference, device-reduction, and model invocations were all zero.
+
+The profiler returned zero with no signal and retained an available kernel
+log. Across 506 measured samples, peak physical VRAM was 903,041,024 bytes,
+peak junction temperature was 57 C, peak board power was 134 W, minimum
+host-available memory was 59,578,871,808 bytes, and swap remained zero. All
+eight child journal checkpoints and the final safety postflight were clean.
+The mode-`0600` evidence artifacts and SHA-256 values are:
+
+- `/tmp/query-bounded-gqa-t512-vjp-runtime-boot54ccf56c-run1.jsonl`:
+  `bb15b56826a18f28c071a5eee39971180f6ca55dbad7e13f927dd90af67b469c`;
+- `/tmp/query-bounded-gqa-t512-vjp-runtime-boot54ccf56c-run1.telemetry.jsonl`:
+  `74a7a18ca7a39879c3400bff73b64ecac1ae010058deefe20e3d12a68c649946`;
+- its summary:
+  `cb79d906888073355c699de539a17a8aa14e0df68653d909720221995bdea70d`.
+
+This promotes only the exact isolated BF16 B1/T512/Hq16/Hkv4/D256, all-valid,
+scale-3/32 forward and full arbitrary-cotangent VJP on the pinned
+gfx1100/ROCm/JAX stack. It does not promote padding, another sequence length,
+replay, repeated-latency claims, model integration, optimizer behavior, SFT,
+GRPO, or a return-to-idle VRAM claim. Do not replay this evidence run.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
 all gates pass in fresh, profiler-controlled processes:
 
 1. Compile only the Qwen shape at T=512 and inspect the generated artifacts as
-   described above. The returned attention executable must not be invoked.
-2. Run the exact single-forward T=512 analytic gate above. Do not add a replay,
-   random input, GPU reference, padding case, or backward work to that process.
+   described above. This gate is complete; its returned attention executable
+   was not invoked.
+2. Run the exact single-forward T=512 analytic gate above. This gate is also
+   complete and remained isolated from replay, random input, a GPU reference,
+   padding, and backward work.
 3. In fresh later gates, qualify the remaining T=512 forward-only input matrix
    before advancing through 1K, 2K, 4K, 8K, 16K, 24K, and 32K.
 4. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
-   gradients where the reference fits.
+   gradients where the reference fits. The all-valid T=512 gate is complete;
+   padding and every longer bucket remain unpromoted.
 5. Repeat padding boundaries including valid lengths 1, `T-1`, and `T`.
 6. Repeat every promoted bucket enough times to expose replay and cleanup
    faults, with command buffers disabled and kernel/journal monitoring active.
