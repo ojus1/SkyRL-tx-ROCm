@@ -119,12 +119,18 @@ fi
 # Keep the desktop on the iGPU: a compute reset must not also take down the
 # active display. Ignore virtual writeback connectors, whose state is unknown.
 amd_cards=0
+amd_device_ids=()
 connected_amd_connectors=()
 for card_path in /sys/class/drm/card[0-9]*; do
   [[ "${card_path##*/}" =~ ^card[0-9]+$ ]] || continue
   [[ -r "$card_path/device/vendor" ]] || continue
   [[ "$(<"$card_path/device/vendor")" == "0x1002" ]] || continue
   ((amd_cards += 1))
+  if [[ ! -r "$card_path/device/device" ]]; then
+    echo "refusing to launch because the AMD PCI device ID is unreadable at $card_path" >&2
+    exit 2
+  fi
+  amd_device_ids+=("$(<"$card_path/device/device")")
   for status_path in "$card_path"-*/status; do
     [[ -r "$status_path" ]] || continue
     [[ "${status_path%/status}" == *Writeback* ]] && continue
@@ -133,8 +139,8 @@ for card_path in /sys/class/drm/card[0-9]*; do
     fi
   done
 done
-if ((amd_cards == 0)); then
-  echo "refusing to launch because no AMD DRM card was found" >&2
+if ((amd_cards != 1)) || [[ "${amd_device_ids[0]:-}" != "0x744c" ]]; then
+  echo "refusing to launch without exactly one AMD DRM GPU at PCI device 0x744c (observed: ${amd_device_ids[*]:-none})" >&2
   exit 2
 fi
 if ((${#connected_amd_connectors[@]} > 0)) && [[ "${SKYRL_ALLOW_AMD_DISPLAY:-0}" != "1" ]]; then
@@ -273,6 +279,7 @@ if ! jax_cache_dir="$(
 fi
 export JAX_COMPILATION_CACHE_DIR="$jax_cache_dir"
 export JAX_ENABLE_COMPILATION_CACHE=true
+export JAX_RAISE_PERSISTENT_CACHE_ERRORS=true
 export JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES=xla_gpu_per_fusion_autotune_cache_dir
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1
@@ -288,6 +295,54 @@ export SKYRL_ROCM_PALLAS_ATTENTION="${SKYRL_ROCM_PALLAS_ATTENTION:-0}"
 # gfx1100 command-stream opcode. Disable XLA HIP-graph command-buffer capture
 # until the isolated replay probe establishes a narrower safe configuration.
 export XLA_FLAGS=--xla_gpu_enable_command_buffer=
+
+# Default-off, compile-only static-bucket prewarm. This populates the trusted
+# persistent cache before the API starts, but never invokes a compiled model
+# pass or optimizer step. ROCm compilation may still run bounded autotuning.
+prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
+prewarm_status=0
+if [[ -n "$prewarm_buckets" ]]; then
+  prewarm_construction=eager
+  if [[ "$memory_mode" == "preallocate85" ]]; then
+    prewarm_construction=abstract-load
+  fi
+  case "$SKYRL_ROCM_PALLAS_ATTENTION" in
+    0) prewarm_attention=xla ;;
+    1) prewarm_attention=pallas ;;
+    *)
+      echo "SKYRL_ROCM_PALLAS_ATTENTION must be 0 or 1 for startup prewarm." >&2
+      exit 2
+      ;;
+  esac
+  if python rocm/prewarm_qwen35_buckets.py \
+      --execute-rocm \
+      --allow-gpu \
+      --buckets "$prewarm_buckets" \
+      --model-path "$model_path" \
+      --construction "$prewarm_construction" \
+      --attention-backend "$prewarm_attention" \
+      --launcher-lock-fd "$launch_lock_fd" \
+      --output "$run_dir/prewarm.jsonl"; then
+    prewarm_status=0
+  else
+    prewarm_status=$?
+  fi
+fi
+
+final_journal_status=0
+if python3 -m rocm.amdgpu_safety >/dev/null; then
+  final_journal_status=0
+else
+  final_journal_status=$?
+fi
+if ((final_journal_status != 0)); then
+  echo "refusing API start because the final AMDGPU boot-journal postflight failed" >&2
+  exit 2
+fi
+if ((prewarm_status != 0)); then
+  echo "refusing API start because startup prewarm failed with status $prewarm_status" >&2
+  exit "$prewarm_status"
+fi
 
 exec uv run --active --no-sync -m skyrl.tinker.api \
   --base-model "$model_path" \

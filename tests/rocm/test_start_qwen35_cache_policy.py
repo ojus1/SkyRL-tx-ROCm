@@ -63,6 +63,7 @@ def test_cache_populates_executables_and_only_qualified_autotuning() -> None:
     source = _source()
 
     assert "export JAX_ENABLE_COMPILATION_CACHE=true" in source
+    assert "export JAX_RAISE_PERSISTENT_CACHE_ERRORS=true" in source
     assert "export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0" in source
     assert "export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1" in source
     assert (
@@ -78,6 +79,7 @@ def test_installed_jax_recognizes_exact_cache_environment() -> None:
         "JAX_PLATFORMS": "cpu",
         "JAX_COMPILATION_CACHE_DIR": "/tmp/skyrl-cache-policy-test",
         "JAX_ENABLE_COMPILATION_CACHE": "true",
+        "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true",
         "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": (
             "xla_gpu_per_fusion_autotune_cache_dir"
         ),
@@ -95,6 +97,7 @@ from jax import config
 values = config.values
 assert values["jax_compilation_cache_dir"] == "/tmp/skyrl-cache-policy-test"
 assert values["jax_enable_compilation_cache"] is True
+assert values["jax_raise_persistent_cache_errors"] is True
 assert values["jax_persistent_cache_enable_xla_caches"] == "xla_gpu_per_fusion_autotune_cache_dir"
 assert values["jax_persistent_cache_min_compile_time_secs"] == 0.0
 assert values["jax_persistent_cache_min_entry_size_bytes"] == -1

@@ -85,11 +85,44 @@ AMDGPU 6.16.13, and gfx1100; rejects an inherited cache path; and stores every
 eligible executable plus per-fusion autotuning data. Serialized executable
 entries use a 16 GiB JAX LRU. The separately unbounded autotune subtree is
 scanned for unsafe objects and must remain at or below 4 GiB at each startup.
+Persistent-cache read/write errors are fatal rather than downgraded to warnings.
 The cache path and all ancestors are owner/mode/symlink validated because JAX
 treats cache entries as trusted executable content. This mechanism does not
 enable XLA command buffers or HIP Graphs, does not reduce steady-state VRAM by
 itself, and does not replace shape-specific warmup. It lets later static-bucket
 precompile and ordinary host-driven warmups amortize compilation safely.
+
+Static-bucket prewarm is available but default-off. A nonempty canonical bucket
+list runs one compile-only process before the API starts and records a private
+`prewarm.jsonl` in the new run directory:
+
+```bash
+# Configuration syntax only; operational execution still requires supervision.
+SKYRL_QWEN35_PREWARM_BUCKETS=64,256 ./rocm/start_qwen35.sh prewarm-t64-t256
+```
+
+Buckets at 512 or above additionally require the explicitly enabled Pallas
+attention path. The tool constructs the exact backend and rank-8 LoRA/Adam
+state, then lowers and compiles forward/backward/accumulation for batch one. It
+does not invoke those executables, precompile the optimizer or sampler, export
+an executable, or replace data-dependent warmup. Compilation can initialize
+ROCm, allocate representative buffers, and run XLA autotuning kernels, so use
+the normal headless/exclusive-device and telemetry discipline and allow a much
+longer startup. Running `python rocm/prewarm_qwen35_buckets.py` without ROCm
+acknowledgements is a CPU-only plan and never imports JAX.
+
+The prewarm execution path is still hardware-unqualified: the implementation
+and tests have not run its multi-bucket ROCm path. Do not use the direct command
+above unsupervised. An operational qualification run must wrap the entire
+launcher in the telemetry guard with an explicit finite timeout, a 90 C maximum
+junction temperature, and a 315 W maximum GPU power limit, while retaining the
+headless-display, exclusive-KFD, fatal-journal, and cleanup gates. Each bucket
+artifact reports JAX 0.10.2's public process-level persistent-cache hit/miss
+events plus top-level cache-directory deltas. Those public events contain no
+module or cache key, so this is useful evidence but not per-key proof of a cache
+write or hit. Startup accepts only one monitored hit, or one monitored miss
+paired with a top-level executable-cache add/change; ambiguous, missing, or
+mixed evidence fails closed.
 
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for
