@@ -162,7 +162,71 @@ runtime occupancy and latency measurements.
 
 The build took 3.57 seconds wall time, used at most 181,552 KiB host RSS, and
 reported zero swaps. `/dev/kfd` and the AMD render node were unowned before and
-after the build, so no GPU program was submitted. This build result does not
-validate JAX registration, physical HLO layouts, one-call lowering, numerical
-correctness, launch safety, or performance. Those remain separate guarded
-compile and runtime probes; the operation is still default-off and unwired.
+after the build, so no GPU program was submitted. This native-build result by
+itself does not validate JAX registration, physical HLO layouts, one-call
+lowering, numerical correctness, launch safety, or performance. Registration
+and lowering are qualified separately below; runtime remains unqualified. The
+operation is still default-off and unwired.
+
+## ROCm 7.2.4 compile-only result
+
+The independently audited compile-only gate passed from committed source
+`3acb6775` on boot `54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`, using the exact
+80,232-byte shared object and SHA-256 above. The original canonical path and
+the sealed mode-`0600` memfd snapshot both matched that digest and size; all
+required seals were present and the snapshot descriptor remained retained.
+The external source path was rehashed and matched its original
+device/inode/size/mtime identity after compilation.
+
+Lowering took 0.016507 seconds and compilation took 0.022301 seconds.
+StableHLO and optimized HLO each contained exactly one
+`skyrl_gdn_prepare_s512_f32_v1` call, no other custom call, no `while`, and no
+alias metadata. The four ordered FP32 inputs and three FP32 outputs were bound
+to their exact shapes and physical row-major layouts in both dialects. The
+SHA-256 values of the unemitted full text were respectively
+`720a123befc3ea374a16e3393f285741cc2394525e8388a92280804f391d73dd`
+and
+`36ecccf4983ab1c67d9e8f9fdd38f4368b5c5191ee7e5617271ebbed67ed6585`.
+
+Compiler memory accounting reported the exact 12,713,984 argument bytes,
+16,842,776 tuple-root-inclusive output bytes, zero temporary bytes, zero alias
+bytes, and 29,556,760 bytes combined. Counters were exactly one backend
+initialization, registration, Python FFI trace, lower, and compile, with zero
+constructed user arrays, lowered or compiled executable invocations, device
+puts/gets, synchronizations, numerical checks, or model calls. All six journal
+checkpoints were clean, including the unconditional postcompile library
+identity check.
+
+The profiler completed in 30.862 seconds with return code zero. Maximum
+physical VRAM was 711,995,392 B, maximum junction temperature 51 C, maximum
+power 137 W, minimum host-available memory 61,577,949,184 B, and swap stayed
+zero. The process exited, `/dev/kfd` and the AMD render node became unowned,
+the current-boot journal remained fault-free, and the card returned to runtime
+suspend. All three artifacts are mode `0600`:
+
+- `/tmp/gdn-prepare-s512-compile-boot54ccf56c-run2.jsonl`
+- `/tmp/gdn-prepare-s512-compile-boot54ccf56c-run2.telemetry.jsonl`
+- `/tmp/gdn-prepare-s512-compile-boot54ccf56c-run2.telemetry.jsonl.summary.json`
+
+Their SHA-256 values are respectively
+`45143325643b28a51fa021a7756f61248990ebc6f1a222847a146606193d9be8`,
+`26fbe38daecf6dffb6a43b581bec095fdd2c86e22d2fd5b57ad4d0bc3f3731ed`,
+and
+`3d14b90c6da535287389fa1b4a83e38fc61b5cdb0e6f5eb0d6d20c14a0bb897c`.
+
+The precursor run from `999d02c4` compiled without invoking the executable but
+failed closed on two metadata assumptions: it omitted XLA's exact 24-byte
+three-result tuple-root table and expected optimized HLO to repeat operand
+types inline rather than reference separately defined instructions. The
+corrected probe distinguishes logical payload from compiler output, resolves
+each ordered operand to one unique unquoted top-level definition in the full
+optimized-HLO module, rejects spoofed or ambiguous definitions, and always
+performs the original-path postcheck. The
+precursor is diagnostic evidence only, not a promoted result.
+
+This result promotes only exact S512 registration, lowering, compilation,
+layouts, compiler memory, and zero-invocation accounting. It does not validate
+the HIP launch, numerical U/W/G values, watchdog safety, runtime latency,
+occupancy, masking, recurrence, VJP, model integration, SFT, or GRPO. A first
+guarded numerical runtime probe may now be designed and reviewed, but this
+compile result does not authorize executing it.
