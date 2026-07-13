@@ -79,8 +79,9 @@ an exact 402-leaf Qwen3.5 LoRA Adam probe passed repeated GPU updates with
 command buffers disabled, while the earlier full-model failure occurred on
 the second replay of the same optimizer executable.
 
-The launcher now trades startup and disk for repeat-startup savings. It pins a
-private cache namespace to JAX/JAXlib/ROCm plugin/PJRT 0.10.2, ROCm 7.2.4,
+The launcher is intended to trade startup and disk for potential repeat-startup
+savings. It pins a private cache namespace to JAX/JAXlib/ROCm plugin/PJRT
+0.10.2, ROCm 7.2.4,
 AMDGPU 6.16.13, and gfx1100; rejects an inherited cache path; and stores every
 eligible executable plus per-fusion autotuning data. Serialized executable
 entries use a 16 GiB JAX LRU. The separately unbounded autotune subtree is
@@ -89,8 +90,9 @@ Persistent-cache read/write errors are fatal rather than downgraded to warnings.
 The cache path and all ancestors are owner/mode/symlink validated because JAX
 treats cache entries as trusted executable content. This mechanism does not
 enable XLA command buffers or HIP Graphs, does not reduce steady-state VRAM by
-itself, and does not replace shape-specific warmup. It lets later static-bucket
-precompile and ordinary host-driven warmups amortize compilation safely.
+itself, and does not replace shape-specific warmup. It is designed to let later
+static-bucket precompile and ordinary host-driven warmups amortize compilation;
+those hit and warmup paths require separate qualification.
 The active trusted namespace
 `~/.cache/skyrl-jax-rocm-private-v1/jax0.10.2-jaxlib0.10.2-rocm-plugin0.10.2-pjrt0.10.2-rocm7.2.4-amdgpu6.16.13-gfx1100-v1`
 was initially empty. The legacy 42 MiB `~/.cache/skyrl-jax` tree is outside this
@@ -136,12 +138,14 @@ the direct prewarm tool requires those exact values. Running
 `python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
 CPU-only plan and never imports JAX.
 
-The prewarm execution path is still hardware-unqualified: the implementation
-and tests have not run its multi-bucket ROCm path. Do not use the direct command
-above unsupervised. An operational qualification run must wrap the entire
-launcher in the telemetry guard with an explicit finite timeout, a 90 C maximum
-junction temperature, and a 315 W maximum GPU power limit, while retaining the
-headless-display, exclusive-KFD, fatal-journal, and cleanup gates. Each
+The exact cold T64-plus-Adam direct-tool path described below is now
+hardware-qualified for compile-only cache population. The multi-bucket path,
+launcher-to-API transition, cache-hit path, and actual warmup remain
+unqualified. Do not use the direct command above unsupervised. Every operational
+qualification must use the telemetry guard with an explicit finite timeout, a
+90 C maximum junction temperature, and a 315 W maximum GPU power limit, while
+retaining the headless-display, exclusive-KFD, fatal-journal, and cleanup gates.
+Each
 train-bucket and optimizer compile has separate timing, compiled-memory,
 postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
 process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`
@@ -155,6 +159,87 @@ or removed entry, and no duration. Unexpected metadata, malformed/duplicate
 durations, cache additions or changes during a hit, changed-only or multiple-add
 miss deltas, cache removals, and otherwise ambiguous, missing, or mixed evidence
 fail closed.
+
+### ROCm 7.2.4 cold T64 plus Adam cache-population result
+
+Using the audited relevant sources from commit
+`a414cec194ad7d724d15fbef4828527fc7f4d4c0` on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`, a separate pre-run filesystem check
+found the versioned trusted namespace empty before process start. The first
+output path used `/tmp` directly and was refused before `_execute`, JAX import,
+or GPU access because the child artifact requires a private mode-`0700` parent.
+That validation precursor returned 2 in
+2.009 s, created no child artifact, and had zero measured VRAM/GTT or write-byte
+delta. Its profiler telemetry and summary SHA-256 values are
+`82215b202fc8b87d2df0f57004bc199c80b49f4ba038e14234efa077f39ef169` and
+`5c0eb79185ccc0314908d5c86ce525c681ed2991c6446465a9197edc8ea4f206`.
+The refusal cause is reconstructed from the pinned source and attempted path;
+the redacted telemetry does not embed stderr.
+
+The corrected fresh process used a private directory and compiled one T64 XLA
+forward/backward/accumulation executable followed by the sequence-independent
+Adam executable. Backend/model setup took `39.588969 s`. It legitimately
+populated 185 small top-level setup entries totaling 879,185 bytes before the
+two monitored targets. These entries came from backend/model construction,
+pinned-weight loading, LoRA and Adam initialization, array placement, and
+synchronization; they are not hidden train or optimizer-step invocations.
+
+The T64 target lowered in `6.398382 s` and compiled in `48.291319 s`.
+`CompiledMemoryStats` reported 8,549,564,220 argument bytes, 69,029,424 output
+bytes, 196,230,704 temporary bytes, and 69,025,800 alias bytes. Its one public
+cache request was one strict miss with no hit or duration event, adding exactly
+one 3,834,842-byte executable entry and changing or removing none. That entry's
+SHA-256 is
+`4bc6a2472759483ea593737d5ee5f04bc982d3179c25dccd0e30ee4697bf1877`.
+
+Adam then lowered in `3.028201 s` and compiled in `17.290585 s`. Compiler memory
+was 276,103,204 argument bytes, 345,145,162 output bytes, 120,360 temporary
+bytes, and zero aliases. Its separately monitored request was also exactly one
+strict miss with no hit or duration event, adding one 880,688-byte entry and
+changing or removing none. Its SHA-256 is
+`4880755376c24b921b4db1f34ef1ce5ec589ad88e990db898adb388b13d2199a`.
+Both targets recorded exactly one lower and compile and zero model-pass or
+optimizer-step executable invocations. Per-target and final AMDGPU postflights
+were clean.
+
+The final namespace contained 187 executable entries totaling 5,594,715 bytes,
+187 atime files totaling 1,496 bytes, and 365 per-fusion autotune textprotos
+totaling 47,775 bytes. The complete 739-file payload was 5,643,986 bytes with no
+symlink or special object; autotune content remained far below its 4 GiB
+ceiling. The artifact's final executable-cache manifest SHA-256 was
+`35a04f7f55949e110f5ba93fd276464576bc9fa464836c40b415ff891b68cafa`.
+JAX's callbacks remain process-level evidence and do not cryptographically bind
+the observed event to a filename.
+
+The profiler returned zero with no signal in `143.439143 s`. Across 1,389
+measured samples, peak physical VRAM was 17,929,101,312 bytes (69.62% of the
+card), junction temperature 72 C, board power 235 W, minimum host-available
+memory 55,799,439,360 bytes, and swap zero. Sensors were unavailable for the
+first 101 measured samples but recovered at 12.225 s within the 60 s grace.
+The process exited and the final postflight was clean. Final sampled VRAM was
+519,909,376 bytes versus a 27,947,008-byte baseline, so full return to baseline
+was not established before the profiler stopped.
+
+The independently audited mode-`0600` evidence under the private mode-`0700`
+directory is:
+
+- `/tmp/skyrl-qwen35-prewarm-a414cec1/qwen35-prewarm-t64-adam-cold-boot54ccf56c-run1.jsonl`:
+  `11882a98a89475c65ef3c97f56acefa5c8607a9d31e05669c3145d528739fe66`;
+- its telemetry:
+  `4708bc44470f55cc4a847830d8751caa2641f3c45914379555d57a069d727004`;
+- its summary:
+  `45144fde088d53b4f3a16f635979f313536bf1fd63427f84f60c617c19ee59cd`.
+
+Command-buffer disabling is explicit in the child. PGLE disabling is indirect
+artifact-and-pinned-source evidence: reaching `backend_ready` required the
+pinned validator to accept both PGLE variables as `false`. The profiler records
+its own pinned script hash, but the child schema does not yet embed the prewarm
+script hash or Git HEAD, so source identity was reconstructed externally from
+the audited relevant files matching that commit and the run-directory name.
+This run proves cold compile-only population and its resource cost. It does not
+measure a cache hit or startup time saved, invoke a training pass or Adam
+update, validate optimizer-step correctness, authorize a warmup or replay, or
+establish a steady-state speed or memory gain.
 
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for

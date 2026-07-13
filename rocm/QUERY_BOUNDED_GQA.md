@@ -1087,12 +1087,14 @@ integration remain separate gates.
 ## Exact T=512 full arbitrary-cotangent VJP gate
 
 `rocm/probe_query_bounded_gqa_vjp.py` isolates the first complete GPU backward
-promotion. Its immutable signature is BF16 `B=1, T=512, Hq=16, Hkv=4, D=256`,
-an all-valid int32 key mask, explicit scale `3/32`, independent deterministic
-nonzero PCG64 Q/K/V arrays, and an independently seeded nonzero BF16 output
-cotangent. The reference is an independent NumPy FP32 three-pass causal-GQA
-forward/VJP. It streams over 32-query by 32-key tiles, does not construct a
-full T-by-T matrix, and gates the forward output, dQ, dK, and dV separately.
+promotion. Its default immutable signature is BF16
+`B=1, T=512, Hq=16, Hkv=4, D=256`, an all-valid int32 key mask, explicit scale
+`3/32`, independent deterministic nonzero PCG64 Q/K/V arrays, and an
+independently seeded nonzero BF16 output cotangent. The only admitted padded
+case is the separately pinned `valid385` loss-masked variant described below.
+The reference is an independent NumPy FP32 three-pass causal-GQA forward/VJP.
+It streams over 32-query by 32-key tiles, does not construct a full T-by-T
+matrix, and gates the forward output, dQ, dK, and dV separately.
 
 The default path imports no JAX and emits only an abstract refusal. The guarded
 runtime command uses a fresh mode-`0600` artifact and the full practical VRAM
@@ -1222,6 +1224,91 @@ gfx1100/ROCm/JAX stack. It does not promote padding, another sequence length,
 replay, repeated-latency claims, model integration, optimizer behavior, SFT,
 GRPO, or a return-to-idle VRAM claim. Do not replay this evidence run.
 
+### ROCm 7.2.4 valid385 loss-masked VJP result
+
+The only padded VJP case uses the same Q/K/V arrays as the all-valid gate, an
+int32 key mask with 385 ones followed by 127 zeros, and the same independently
+seeded cotangent before host loss masking. Rows 385 through 511 of that
+cotangent are replaced with bitwise positive zero before device placement. The
+raw cotangent retains the all-valid SHA-256
+`23b69593d1dde3c5a9bea2d5679fe78891e5d96d083e31b5fc4fa1460d3c0622`;
+the final key mask and loss-masked cotangent SHA-256 values are respectively
+`7fe610e6a15b1f19c3266fff71c6c63030a974bf986266a719a388f76f7b9299` and
+`2641e35a3b1dcdd277a6aa44ccc341552112617b77f3d12585eac15cd74c905b`.
+
+With a loss-masked cotangent, causality makes dQ, dK, and dV mathematically
+insensitive to ignoring the key mask: active queries cannot attend later
+padded keys, while padded queries have zero cotangent. Therefore the gate does
+not claim a backward key-mask signal. Instead, an all-valid wrong-mask control
+must fail the affected forward rows, off-by-one `valid384` and `valid386`
+controls must fail rows 384 and 385 individually, and the all-valid control
+must fail row 511 individually. A separate unmasked-cotangent control must fail
+all three full-gradient gates and the padded-dQ zero gate while leaving the
+forward output unchanged. All controls, alternative references, norms,
+scratch accounting, and input/reference hashes are pinned.
+
+The fresh compile diagnostic and runtime passed on clean commit `a414cec1` and
+boot `54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. The diagnostic retained exactly one
+direct entry-owned q0 forward, dQ, and dK/dV call in each IR dialect, with the
+same three resolved optimized-HLO helpers containing zero custom calls. Exact
+memory remained 10,487,808 argument bytes, 10,485,792 output bytes, 2,130,688
+temporary bytes, and zero aliases. Lowering took `0.378567279 s` and compilation
+`3.157568495 s`. Capability release, reference/input construction, placement,
+invocation, and retrieval counters were all zero. Across 286 measured samples,
+peak physical VRAM was 712,003,584 bytes, junction temperature 48 C, board
+power 129 W, minimum host-available memory 59,691,499,520 bytes, and swap zero.
+The independently audited mode-`0600` artifacts are:
+
+- `/tmp/query-bounded-gqa-t512-valid385-vjp-compile-diagnostic-boot54ccf56c-run1.jsonl`:
+  `a1e74c578bb94a9b4c9fad3c2621a74451ce5599e6d256215f439f898a73e6c9`;
+- its telemetry:
+  `688e5052572773d109fbe8ec1301c6de508130edffd1376bf9d4e271047345eb`;
+- its summary:
+  `64f189f74b04c53132242d50c20baa4d8ef6f3ef1be2113919064c9096d82349`.
+
+The one authorized runtime then passed. Lowering took `0.360088563 s`,
+compilation `3.159197699 s`, and the sole checked forward-plus-VJP invocation
+`12.417200 ms`, below both duration ceilings. Full-tensor results were:
+
+| Tensor | Relative L2 | Cosine | Maximum absolute error | BF16 output SHA-256 |
+|---|---:|---:|---:|---|
+| output | `0.0020401074` | `0.9999979190` | `0.0026158094` | `c6942ea7749dac987ecac219fb0d27e14a496a51cafad7740974c63ccbdc2aca` |
+| dQ | `0.0024639114` | `0.9999969656` | `0.0004360378` | `3acde56e0eeec316a29380d1390b528fe5efc9b7d54bd81270b5e47f9fcfc9b1` |
+| dK | `0.0024699336` | `0.9999969525` | `0.0011165738` | `66ee2f5ccb7f7e47e4557b8c290466d7f76d1f09354f49f35ccd74b48f8a25f0` |
+| dV | `0.0022795490` | `0.9999974021` | `0.0043239594` | `467e172a19ca0e912e289e8f13c22e6cd683ad175b1a408b7fc00cae0696ccae` |
+
+Rows 385 through 511 passed as an affected-output group. Rows 384, 385, and
+511 also passed independently with relative L2 values `0.0022941276`,
+`0.0023817320`, and `0.0022817342`. Active dQ/dK/dV passed independently, and
+candidate dQ query rows and dK/dV key rows 385 through 511 were finite and
+numerically exactly zero. Their sign bits were diagnostic only, although this
+run produced bitwise positive zero for every tail.
+
+Final accounting recorded exactly one lower, compile, capability release,
+host-reference construction, input placement, checked invocation, and
+retrieval. Warmup, replay, second VJP, GPU reference, device reduction,
+and lowered-callable invocation counters were zero; the model dispatcher was
+disconnected. The profiler returned zero with no signal. Across 545 measured
+samples, peak physical VRAM was 903,028,736 bytes, junction temperature 52 C,
+board power 129 W, minimum host-available memory 59,440,631,808 bytes, and swap
+zero. All eight journal checkpoints and the final postflight were clean. The
+mode-`0600`
+runtime artifacts are:
+
+- `/tmp/query-bounded-gqa-t512-valid385-vjp-runtime-boot54ccf56c-run1.jsonl`:
+  `783e5cbd14d7ce20fc27492d7052c18c440d9df3e79476981e23d5ce0fbe3f9c`;
+- its telemetry:
+  `ef52df04e141b8e495f6e88441730453ae96d0c13e9ec4b039b740110139cf82`;
+- its summary:
+  `6157314d58b23fa7283ad1500fc75f1987cafdc742bbca936537130b355317c3`.
+
+This promotes only exact BF16 B1/T512/Hq16/Hkv4/D256, right-padded
+`valid385`, scale 3/32, loss-masked active-token-cotangent forward plus full VJP
+on gfx1100 with ROCm 7.2.4/JAX 0.10.2. It does not promote another padding
+boundary, an unrestricted cotangent, replay, a latency distribution, model
+integration, optimizer behavior, SFT, GRPO, or a speedup claim. Do not replay
+this evidence run.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
@@ -1236,8 +1323,10 @@ all gates pass in fresh, profiler-controlled processes:
 3. In fresh later gates, qualify the remaining T=512 forward-only input matrix
    before advancing through 1K, 2K, 4K, 8K, 16K, 24K, and 32K.
 4. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
-   gradients where the reference fits. The all-valid T=512 gate is complete;
-   padding and every longer bucket remain unpromoted.
+   gradients where the reference fits. The all-valid T=512 arbitrary-cotangent
+   gate and exact `valid385` loss-masked active-token-cotangent gate are
+   complete; every other padding boundary and every longer bucket remain
+   unpromoted.
 5. Repeat padding boundaries including valid lengths 1, `T-1`, and `T`.
 6. Repeat every promoted bucket enough times to expose replay and cleanup
    faults, with command buffers disabled and kernel/journal monitoring active.
