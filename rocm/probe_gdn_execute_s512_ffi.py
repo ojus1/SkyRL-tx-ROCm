@@ -308,7 +308,7 @@ def _outer_profile_contract() -> dict[str, Any]:
         "direct_parent_and_source_hash_proven_by_child": True,
         "timeout_seconds_maximum": 300.0,
         "sampling_interval_seconds_maximum": 0.10,
-        "sensor_grace_seconds_maximum": 15.0,
+        "sensor_grace_seconds_maximum": 60.0,
         "maximum_vram_gib": 24.0,
         "maximum_junction_temperature_c": 90.0,
         "maximum_gpu_power_watts": 315.0,
@@ -824,7 +824,10 @@ def _validate_profile_argv(
     checks = {
         "timeout": 0 < values["timeout"] <= 300.0,
         "interval": 0 < values["interval"] <= 0.10,
-        "sensor_grace": 0 <= values["sensor_grace"] <= 15.0,
+        # Runtime constructs and validates the complete CPU oracle before it
+        # initializes ROCm.  A headless runtime-suspended card therefore has
+        # no readable thermal sensor during that intentional CPU-only phase.
+        "sensor_grace": 0 <= values["sensor_grace"] <= 60.0,
         "temperature": 0 < values["temperature"] <= 90.0,
         "power": 0 < values["power"] <= 315.0,
         "vram": 0 < values["vram"] <= 24.0,

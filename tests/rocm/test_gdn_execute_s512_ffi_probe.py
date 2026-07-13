@@ -136,7 +136,7 @@ def _profile_argv(
         "--interval",
         "0.1",
         "--sensor-grace-seconds",
-        "15",
+        "60",
         "--max-junction-temp-c",
         "90",
         "--max-gpu-power-watts",
@@ -467,6 +467,7 @@ def test_contract_pins_exact_abi_counts_memory_thresholds_and_resource_caps() ->
     assert outer["maximum_junction_temperature_c"] == 90
     assert outer["maximum_gpu_power_watts"] == 315
     assert outer["maximum_swap_gib"] == 8
+    assert outer["sensor_grace_seconds_maximum"] == 60
 
 
 def test_counter_contracts_are_exact_and_compile_diagnostic_has_no_runtime_work() -> (
@@ -625,7 +626,7 @@ def test_profile_argv_validator_accepts_exact_private_supervision(
     [
         ("--timeout", "300.001"),
         ("--interval", "0.101"),
-        ("--sensor-grace-seconds", "15.1"),
+        ("--sensor-grace-seconds", "60.1"),
         ("--max-junction-temp-c", "90.1"),
         ("--max-gpu-power-watts", "315.1"),
         ("--max-vram-gib", "24.1"),
