@@ -1370,23 +1370,23 @@ def _valid_independent_ir_pair() -> tuple[str, str]:
     stable = (
         "module {\n"
         "  func.func public @main(%arg0: tensor<3x64xbf16>, "
-        "%arg1: tensor<64x17xi8>, %arg2: tensor<1x17xbf16>, "
-        "%arg3: tensor<64x8xbf16>, %arg4: tensor<8x17xbf16>, "
+        "%arg1: tensor<64x32xi8>, %arg2: tensor<1x32xbf16>, "
+        "%arg3: tensor<64x8xbf16>, %arg4: tensor<8x32xbf16>, "
         "%arg5: tensor<f32>) -> (tensor<3x17xbf16> "
         '{jax.result_info = "result"}) {\n'
         "    %0 = stablehlo.custom_call @__gpu$xla.gpu.triton() "
         f'{{mhlo.backend_config = {{ir = "payload\\00{marker}\\00", '
-        f'name = "{marker}"}}}} : () -> tensor<16x17xbf16>\n'
-        "    %1 = stablehlo.slice %0 : tensor<16x17xbf16>\n"
+        f'name = "{marker}"}}}} : () -> tensor<16x32xbf16>\n'
+        "    %1 = stablehlo.slice %0 : tensor<16x32xbf16>\n"
         "    return %1 : tensor<3x17xbf16>\n"
         "  }\n"
         "}\n"
     )
     optimized = (
-        "ENTRY %main.6 (%x: bf16[3,64], %codes: s8[64,17], "
-        "%scales: bf16[1,17], %a: bf16[64,8], %b: bf16[8,17], "
+        "ENTRY %main.6 (%x: bf16[3,64], %codes: s8[64,32], "
+        "%scales: bf16[1,32], %a: bf16[64,8], %b: bf16[8,32], "
         "%scale: f32[]) -> bf16[3,17] {\n"
-        "  %0 = bf16[16,17] custom-call(), "
+        "  %0 = bf16[16,32] custom-call(), "
         'custom_call_target="__gpu$xla.gpu.triton", '
         f'metadata={{op_name="jit(candidate)/{marker}/pallas_call"}}, '
         f'backend_config={{ir="payload\\00{marker}\\00", name="{marker}"}}\n'
@@ -1401,8 +1401,8 @@ def test_independent_ir_gate_rejects_signature_tokens_supplied_only_in_comments(
 ):
     stable = (
         "func.func public @main(%arg0: tensor<1xf32>) -> tensor<1xf32> {\n"
-        "  // tensor<3x64xbf16> tensor<64x17xi8> tensor<1x17xbf16> "
-        "tensor<64x8xbf16> tensor<8x17xbf16> tensor<f32> tensor<3x17xbf16>\n"
+        "  // tensor<3x64xbf16> tensor<64x32xi8> tensor<1x32xbf16> "
+        "tensor<64x8xbf16> tensor<8x32xbf16> tensor<f32> tensor<3x17xbf16>\n"
         "  %0 = stablehlo.custom_call @__gpu$xla.gpu.triton() "
         '{mhlo.backend_config={name="skyrl_qwen35_w8a8_lora_forward"}} : '
         "() -> tensor<1xf32>\n"
@@ -1411,7 +1411,7 @@ def test_independent_ir_gate_rejects_signature_tokens_supplied_only_in_comments(
     )
     optimized = (
         "ENTRY %main (%x: f32[1]) -> f32[1] {\n"
-        "  // bf16[3,64] s8[64,17] bf16[1,17] bf16[64,8] bf16[8,17] "
+        "  // bf16[3,64] s8[64,32] bf16[1,32] bf16[64,8] bf16[8,32] "
         "f32[] bf16[3,17]\n"
         '  ROOT %0 = f32[1] custom-call(), custom_call_target="__gpu$xla.gpu.triton", '
         'metadata={op_name="jit(candidate)/skyrl_qwen35_w8a8_lora_forward/pallas_call"}, '
@@ -1476,7 +1476,7 @@ def test_independent_ir_gate_rejects_backend_map_scope_decoys() -> None:
 def test_independent_ir_gate_rejects_dead_call_and_control_dependency() -> None:
     stable, optimized = _valid_independent_ir_pair()
     dead_stable = stable.replace(
-        "    %1 = stablehlo.slice %0 : tensor<16x17xbf16>\n",
+        "    %1 = stablehlo.slice %0 : tensor<16x32xbf16>\n",
         "    %1 = stablehlo.constant dense<0> : tensor<3x17xbf16>\n",
     )
     dead_optimized = optimized.replace(
@@ -1495,24 +1495,24 @@ def test_independent_ir_gate_rejects_call_owned_only_by_dead_helper() -> None:
     )
     stable_without_live_call = stable.replace(
         stable_call,
-        "    %0 = stablehlo.constant dense<0> : tensor<16x17xbf16>",
+        "    %0 = stablehlo.constant dense<0> : tensor<16x32xbf16>",
     )
     dead_stable = (
         stable_without_live_call.removesuffix("}\n")
-        + "  func.func private @dead() -> tensor<16x17xbf16> {\n"
+        + "  func.func private @dead() -> tensor<16x32xbf16> {\n"
         + stable_call
-        + "\n    return %0 : tensor<16x17xbf16>\n  }\n}\n"
+        + "\n    return %0 : tensor<16x32xbf16>\n  }\n}\n"
     )
     optimized_call = next(
         line for line in optimized.splitlines() if "custom-call" in line
     )
     optimized_without_live_call = optimized.replace(
-        optimized_call, "  %0 = bf16[16,17] constant(0)"
+        optimized_call, "  %0 = bf16[16,32] constant(0)"
     )
     dead_optimized = (
         "%dead {\n"
         + optimized_call
-        + "\n  ROOT %dead_root = bf16[16,17] copy(%0)\n}\n\n"
+        + "\n  ROOT %dead_root = bf16[16,32] copy(%0)\n}\n\n"
         + optimized_without_live_call
     )
 
@@ -2177,10 +2177,10 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
         "phase": "execute",
         "inputs": [
             {"name": "x", "shape": [3, 64], "dtype": "bfloat16"},
-            {"name": "weight_codes", "shape": [64, 17], "dtype": "int8"},
-            {"name": "weight_scales", "shape": [1, 17], "dtype": "bfloat16"},
+            {"name": "weight_codes", "shape": [64, 32], "dtype": "int8"},
+            {"name": "weight_scales", "shape": [1, 32], "dtype": "bfloat16"},
             {"name": "lora_a", "shape": [64, 8], "dtype": "bfloat16"},
-            {"name": "lora_b", "shape": [8, 17], "dtype": "bfloat16"},
+            {"name": "lora_b", "shape": [8, 32], "dtype": "bfloat16"},
             {"name": "lora_scaling", "shape": [], "dtype": "float32"},
         ],
         "output": {"shape": [3, 17], "dtype": "bfloat16"},
@@ -2189,6 +2189,9 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "block_m": 16,
             "block_n": 16,
             "row_superblock": 16,
+            "logical_out_features": 17,
+            "physical_out_features": 32,
+            "full_output_tiles_only": True,
         },
         "dispatch_plan": runtime_plan,
         "runtime_numerical_gate_evaluated": True,

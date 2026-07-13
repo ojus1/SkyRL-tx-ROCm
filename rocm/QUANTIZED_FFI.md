@@ -101,9 +101,12 @@ The experiment also caps K at 9,216 and N at 18,432, the largest non-vocabulary
 Qwen3.5-4B projection dimensions. The tied 248,320-column head is deliberately
 outside this path.
 
-CPU Pallas-interpreter tests currently prove only semantics. The fixed
-`M=3,K=64,N=17` tail case is bitwise equal to the portable W8A8 forward. Against
-the stronger portable FP32-dequant backward, relative L2 errors were 0.3341%
+CPU Pallas-interpreter tests currently prove only semantics. Logical output
+tails are now zero-padded outside Pallas to complete physical `block_n` tiles;
+the kernels themselves contain no row/column tail predicates. The fixed
+`M=3,K=64,N=17` case therefore calls Pallas with physical `N=32`, slices back to
+17 columns, and remains bitwise equal to the portable W8A8 forward. Against the
+stronger portable FP32-dequant backward, relative L2 errors were 0.3341%
 for `dX`, 0.2435% for `dA`, 0.3220% for `dB`, and 0.0000703% for `dscale`, all
 inside the retained 1% CPU regression gate. A `M=1025` JAXPR test proves a
 three-iteration row scan whose sole forward Pallas grid covers exactly 512
@@ -140,11 +143,16 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer=
 ```
 
 The fixed source requests the base-W8A8 plus LoRA-B/scaling Pallas epilogue at
-`M=3,K=64,N=17`, group 64, `block_m=block_n=16`, and physical grid `1x2`.
+logical `M=3,K=64,N=17`, physical `M=16,N=32`, group 64,
+`block_m=block_n=16`, and physical grid `1x2`.
 Activation quantization and the LoRA-A contraction remain ordinary JAX work
 outside that Pallas call, so this is not an entire-forward megakernel. The
 compile phase invokes no returned executable. A separately guarded
-`--phase execute` branch is now implemented but **has not been run**. After
+`--phase execute` branch is implemented. Its first released invocation of the
+former masked-`N=17` artifact hit the exact five-second dispatch watchdog and
+was killed/reaped without an AMDGPU fault or reset; the bracket contained five
+GPU kernels plus output readiness, so it does not prove that Pallas itself
+stalled. The corrected full-tile source has not been compiled or run. After
 fresh compilation it requalifies the exact nested gfx1100 code object before
 permitting one six-leaf input transfer, one compiled forward invocation with
 readiness, one output transfer, and a host-only comparison against the
@@ -186,9 +194,10 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
     --platform rocm --phase compile --allow-gpu --run-dir "$run_dir"
 ```
 
-The guarded execute branch has **not been invoked**. Only after its source,
-tests, and documentation are committed in a reviewed, clean tree may the exact
-one-shot request be made with:
+The exact former execute capability was consumed and must not be retried. Only
+after the corrected full-tile source is committed, freshly compiled, and its
+complete thunk/ISA evidence receives an explicit offline GO may a new one-shot
+request be made with:
 
 ```bash
 umask 077
@@ -200,8 +209,9 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
     --platform rocm --phase execute --allow-gpu --run-dir "$run_dir"
 ```
 
-Even a passing invocation would establish only fixed `M=3,K=64,N=17`,
-group-64, rank-8 forward correctness under the retained W8 gate. It would not
+Even a passing invocation would establish only fixed logical
+`M=3,K=64,N=17`, physical `M=16,N=32`, group-64, rank-8 forward correctness
+under the retained W8 gate. It would not
 establish promotion, throughput, memory savings, backward correctness,
 warmup/replay safety, or model integration.
 

@@ -182,8 +182,14 @@ def test_contract_is_exact_tiny_forward_and_never_backward() -> None:
         "block_m": 16,
         "block_n": 16,
         "row_superblock": 16,
+        "logical_out_features": 17,
+        "physical_out_features": 32,
+        "full_output_tiles_only": True,
     }
     assert compile_contract["inputs"][0]["shape"] == [3, 64]
+    assert compile_contract["inputs"][1]["shape"] == [64, 32]
+    assert compile_contract["inputs"][2]["shape"] == [1, 32]
+    assert compile_contract["inputs"][4]["shape"] == [8, 32]
     assert compile_contract["output"]["shape"] == [3, 17]
     assert compile_contract["dispatch_plan"]["compiled_executable_invocations"] == 0
     assert compile_contract["execute_rung_enabled"] is False
@@ -378,7 +384,10 @@ def test_host_case_is_deterministic_and_matches_portable_oracle() -> None:
         jnp.asarray(scaling),
         activation_bits=8,
     )
-    np.testing.assert_array_equal(np.asarray(actual), first_expected)
+    np.testing.assert_array_equal(np.asarray(actual)[:, :17], first_expected)
+    np.testing.assert_array_equal(codes[:, 17:], 0)
+    np.testing.assert_array_equal(scales[:, 17:], 0)
+    np.testing.assert_array_equal(lora_b[:, 17:], 0)
     assert np.any(codes < 0)
     assert np.any(codes > 0)
 
@@ -399,14 +408,14 @@ def test_host_case_detects_every_missing_lora_rank_and_output_column() -> None:
             jnp.asarray(scaling),
             activation_bits=8,
         )
-        difference = np.asarray(actual, dtype=np.float32) - expected_fp32
+        difference = np.asarray(actual, dtype=np.float32)[:, :17] - expected_fp32
         return float(np.linalg.norm(difference.ravel()) / denominator)
 
     for rank in range(lora_b.shape[0]):
         missing = lora_b.copy()
         missing[rank, :] = 0
         assert relative_with(missing) > 0.01
-    for column in range(lora_b.shape[1]):
+    for column in range(17):
         missing = lora_b.copy()
         missing[:, column] = 0
         assert relative_with(missing) > 0.01

@@ -2,8 +2,9 @@
 """Fail-closed gfx1100 qualification for one bounded W8A8+LoRA tile.
 
 The default abstract mode emits a refusal without importing JAX.  The sole
-ROCm contract is one ``M=3,K=64,N=17`` BF16/W8-group64/rank-8 forward.  A
-controller must hold and pass SkyRL's global ROCm lock through
+ROCm contract is one logical ``M=3,K=64,N=17`` BF16/W8-group64/rank-8 forward,
+using full physical ``M=16,N=32`` Pallas tiles before the logical output slice.
+A controller must hold and pass SkyRL's global ROCm lock through
 ``profile_rocm.py``.  The child validates that inherited descriptor, the exact
 RX 7900 XTX and render node, a clean boot, a headless AMD card, the exact sole
 command-buffer-disable flag, and a hardware power cap no greater than 315 W.
@@ -38,6 +39,7 @@ from typing import Any, Callable, TextIO
 _ROWS = 3
 _IN_FEATURES = 64
 _OUT_FEATURES = 17
+_PADDED_OUT_FEATURES = 32
 _RANK = 8
 _GROUP_SIZE = 64
 _BLOCK_M = 16
@@ -97,16 +99,16 @@ _EXPECTED_RUNTIME_BINARY_SHA256 = {
 }
 _EXPECTED_HOST_SHA256 = {
     "x": "97f28a640f7747f5a18725c2dffc67baff13068673b2edf0d600671d6132c765",
-    "weight_codes": "7b2d71ade420170140481aea83796639238df7cb0cd4c85ecc12f197654dd5be",
-    "weight_scales": "5aa21b6c4171062f63d5cae19f23d9d2874e3a173ce0238454e156cca6f843fb",
+    "weight_codes": "eb56a17a7879d4c9e2074032f7c1ed6245fc11feaa49909d0cbf9318ea1c1ba2",
+    "weight_scales": "0400e891d735538d98f99325bf961625b3307c2518794247db07d560bd88709f",
     "lora_a": "d293daaf4d695061960a610bc0c03cebcb45907094cfbfecb4cef28a1dccf857",
-    "lora_b": "1e9f8813f39862777be04e019879000d772b7c8ef2e87768deef64cc2134200d",
+    "lora_b": "177c70ae57385793bd76b6d322190dc173dbe94dfcb67f8e3419b6cf15383592",
     "lora_scaling": "9a8208635e00348ab64aac2b759e76391fd47089e9a749bbcec770d9eb5c6421",
     "expected": "964b0c1fe5f5c4cdbd60658717fee50a835006adf03011717b4914061ab4f88f",
 }
 _EXPECTED_SOURCE_SHA256 = {
     "isa_inspector": "1a46c05700e5fbe6b5747632cfb23e872919f3b39fa77119c701836ce92cda07",
-    "kernel": "1dec42508856d5e38a656bc4292dcb7033d4437bf8458f7b88030be4b4b4490a",
+    "kernel": "af119fec39f53ba0dd0c500398589e0fc333a6fda752ffb464c2a578738bbded",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
     "handoff": "4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392",
@@ -402,12 +404,12 @@ def _exact_contract(phase: str) -> dict[str, Any]:
             {"name": "x", "shape": [_ROWS, _IN_FEATURES], "dtype": "bfloat16"},
             {
                 "name": "weight_codes",
-                "shape": [_IN_FEATURES, _OUT_FEATURES],
+                "shape": [_IN_FEATURES, _PADDED_OUT_FEATURES],
                 "dtype": "int8",
             },
             {
                 "name": "weight_scales",
-                "shape": [_IN_FEATURES // _GROUP_SIZE, _OUT_FEATURES],
+                "shape": [_IN_FEATURES // _GROUP_SIZE, _PADDED_OUT_FEATURES],
                 "dtype": "bfloat16",
             },
             {
@@ -417,7 +419,7 @@ def _exact_contract(phase: str) -> dict[str, Any]:
             },
             {
                 "name": "lora_b",
-                "shape": [_RANK, _OUT_FEATURES],
+                "shape": [_RANK, _PADDED_OUT_FEATURES],
                 "dtype": "bfloat16",
             },
             {"name": "lora_scaling", "shape": [], "dtype": "float32"},
@@ -428,6 +430,9 @@ def _exact_contract(phase: str) -> dict[str, Any]:
             "block_m": _BLOCK_M,
             "block_n": _BLOCK_N,
             "row_superblock": _ROW_SUPERBLOCK,
+            "logical_out_features": _OUT_FEATURES,
+            "physical_out_features": _PADDED_OUT_FEATURES,
+            "full_output_tiles_only": True,
         },
         "dispatch_plan": {
             "host_oracle_attempts": 1,
@@ -979,7 +984,7 @@ def _host_oracle(arguments: tuple[Any, ...]) -> Any:
         "mgk,gkn->mgn",
         x_codes.astype(np.int32),
         np.asarray(weight_codes, dtype=np.int8)
-        .reshape((-1, _GROUP_SIZE, _OUT_FEATURES))
+        .reshape((-1, _GROUP_SIZE, _PADDED_OUT_FEATURES))
         .astype(np.int32),
         dtype=np.int32,
     )
@@ -992,9 +997,10 @@ def _host_oracle(arguments: tuple[Any, ...]) -> Any:
     )
     z = np.matmul(x_f32, np.asarray(lora_a, dtype=np.float32), dtype=np.float32)
     low_rank = np.matmul(z, np.asarray(lora_b, dtype=np.float32), dtype=np.float32)
-    return (base + np.asarray(scaling, dtype=np.float32) * low_rank).astype(
+    physical = (base + np.asarray(scaling, dtype=np.float32) * low_rank).astype(
         ml_dtypes.bfloat16
     )
+    return np.ascontiguousarray(physical[:, :_OUT_FEATURES])
 
 
 def _relative_l2(candidate: Any, expected: Any) -> float:
@@ -1097,6 +1103,16 @@ def _construct_host_case() -> tuple[tuple[Any, ...], list[dict[str, Any]], Any]:
         .reshape((_IN_FEATURES, _OUT_FEATURES))
     )
     weight_scales = weight_scales_f32.astype(ml_dtypes.bfloat16)
+    weight_codes = np.pad(
+        weight_codes,
+        ((0, 0), (0, _PADDED_OUT_FEATURES - _OUT_FEATURES)),
+        constant_values=0,
+    )
+    weight_scales = np.pad(
+        weight_scales,
+        ((0, 0), (0, _PADDED_OUT_FEATURES - _OUT_FEATURES)),
+        constant_values=0,
+    )
 
     rank_index = np.arange(_RANK, dtype=np.int32)
     lora_a = (
@@ -1111,6 +1127,11 @@ def _construct_host_case() -> tuple[tuple[Any, ...], list[dict[str, Any]], Any]:
         ).astype(np.float32)
         / 16.0
     ).astype(ml_dtypes.bfloat16)
+    lora_b = np.pad(
+        lora_b,
+        ((0, 0), (0, _PADDED_OUT_FEATURES - _OUT_FEATURES)),
+        constant_values=0,
+    )
     scaling = np.asarray(_SCALING, dtype=np.float32)
 
     arguments = (x, weight_codes, weight_scales, lora_a, lora_b, scaling)
@@ -2002,7 +2023,7 @@ def _run_rocm(
                 block_m=_BLOCK_M,
                 block_n=_BLOCK_N,
             ),
-            out_shape=jax.ShapeDtypeStruct((_BLOCK_M, _OUT_FEATURES), x.dtype),
+            out_shape=jax.ShapeDtypeStruct((_BLOCK_M, _PADDED_OUT_FEATURES), x.dtype),
             grid=(1, 2),
             compiler_params=w8a8_lora_module._compiler_params(),
             interpret=False,
@@ -2016,7 +2037,7 @@ def _run_rocm(
             z,
             lora_b,
             scaling,
-        )[:_ROWS]
+        )[:_ROWS, :_OUT_FEATURES]
 
     limits_before_lower = _read_hardware_limits(device_root)
     lower_start = time.perf_counter()

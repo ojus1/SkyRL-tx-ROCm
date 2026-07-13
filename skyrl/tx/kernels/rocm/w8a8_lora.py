@@ -15,13 +15,16 @@ accumulation.  This is close to, but not bit-identical to, the stronger FP32
 backward oracle in :mod:`skyrl.tx.kernels.quantized_lora`; it therefore needs
 an explicit numerical gate before any model integration.
 
-Every forward Pallas program covers at most ``block_m`` rows and ``block_n``
-output features while scanning the explicitly capped K-group domain.  Each
-input-pullback program covers ``block_m`` rows and one 64-value output K group,
-but scans the explicitly capped N domain.  Row scans bound the logical grid;
-the physical duration of both inner scans remains a hardware qualification
-item.  This
-source calls no explicit graph, command-buffer, capture, replay,
+Every forward Pallas program covers exactly ``block_m`` physical rows and
+``block_n`` physical output features while scanning the explicitly capped
+K-group domain.  Row and output-feature tails are zero-padded outside the
+kernel and sliced back to their logical shapes, so compiler-generated dot
+barriers never coexist with a source-level tail mask.  Each input-pullback
+program uses the same full-tile rule while covering one 64-value input group
+and scanning the explicitly capped padded-N domain.  Row scans bound the
+logical grid; the physical duration of both inner scans remains a hardware
+qualification item.  This source calls no explicit graph, command-buffer,
+capture, replay,
 persistent-kernel, cross-program synchronization, or atomic-reduction API.
 Importing the module imports JAX but does not enumerate devices or initialize
 an accelerator backend.
@@ -192,7 +195,7 @@ def _w8a8_base_tile(
     *,
     block_m: int,
     block_n: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
 
@@ -200,31 +203,20 @@ def _w8a8_base_tile(
     column_start = pl.program_id(1) * block_n
     rows = row_start + jnp.arange(block_m)
     columns = column_start + jnp.arange(block_n)
-    row_mask = rows < x_codes_ref.shape[0]
-    column_mask = columns < weight_codes_ref.shape[1]
-    output_mask = row_mask[:, None] & column_mask[None, :]
     accumulator = jnp.zeros((block_m, block_n), dtype=jnp.float32)
 
     def consume_group(group_index, previous):
         k = group_index * W8A8_GROUP_SIZE + jnp.arange(W8A8_GROUP_SIZE)
         x_codes = plgpu.load(
             x_codes_ref.at[rows[:, None], k[None, :]],
-            mask=row_mask[:, None],
-            other=0,
         )
         weight_codes = plgpu.load(
             weight_codes_ref.at[k[:, None], columns[None, :]],
-            mask=column_mask[None, :],
-            other=0,
         )
         integer_product = plgpu.dot(x_codes, weight_codes).astype(jnp.float32)
-        x_scale = plgpu.load(
-            x_scales_ref.at[rows, group_index], mask=row_mask, other=0.0
-        ).astype(jnp.float32)
+        x_scale = plgpu.load(x_scales_ref.at[rows, group_index]).astype(jnp.float32)
         weight_scale = plgpu.load(
             weight_scales_ref.at[group_index, columns],
-            mask=column_mask,
-            other=0.0,
         ).astype(jnp.float32)
         return previous + integer_product * x_scale[:, None] * weight_scale[None, :]
 
@@ -234,7 +226,7 @@ def _w8a8_base_tile(
         consume_group,
         accumulator,
     )
-    return rows, columns, row_mask, column_mask, output_mask, accumulator
+    return rows, columns, accumulator
 
 
 def _w8a8_base_forward_kernel(
@@ -249,7 +241,7 @@ def _w8a8_base_forward_kernel(
 ) -> None:
     from jax.experimental.pallas import triton as plgpu
 
-    rows, columns, _, _, output_mask, accumulator = _w8a8_base_tile(
+    rows, columns, accumulator = _w8a8_base_tile(
         x_codes_ref,
         x_scales_ref,
         weight_codes_ref,
@@ -260,7 +252,6 @@ def _w8a8_base_forward_kernel(
     plgpu.store(
         output_ref.at[rows[:, None], columns[None, :]],
         accumulator.astype(output_ref.dtype),
-        mask=output_mask,
     )
 
 
@@ -279,7 +270,7 @@ def _w8a8_forward_kernel(
 ) -> None:
     from jax.experimental.pallas import triton as plgpu
 
-    rows, columns, row_mask, column_mask, output_mask, accumulator = _w8a8_base_tile(
+    rows, columns, accumulator = _w8a8_base_tile(
         x_codes_ref,
         x_scales_ref,
         weight_codes_ref,
@@ -291,13 +282,9 @@ def _w8a8_forward_kernel(
     rank_indices = jnp.arange(W8A8_LORA_RANK)
     z = plgpu.load(
         z_ref.at[rows[:, None], rank_indices[None, :]],
-        mask=row_mask[:, None],
-        other=0.0,
     ).astype(jnp.float32)
     lora_b = plgpu.load(
         lora_b_ref.at[rank_indices[:, None], columns[None, :]],
-        mask=column_mask[None, :],
-        other=0.0,
     ).astype(jnp.float32)
     low_rank = jnp.sum(z[:, :, None] * lora_b[None, :, :], axis=1)
     scaling = lora_scaling_ref[...].astype(jnp.float32)
@@ -305,7 +292,6 @@ def _w8a8_forward_kernel(
     plgpu.store(
         output_ref.at[rows[:, None], columns[None, :]],
         output.astype(output_ref.dtype),
-        mask=output_mask,
     )
 
 
@@ -326,27 +312,19 @@ def _w8a16_input_vjp_kernel(
     group_index = pl.program_id(1)
     rows = row_start + jnp.arange(block_m)
     k = group_index * W8A8_GROUP_SIZE + jnp.arange(W8A8_GROUP_SIZE)
-    row_mask = rows < output_cotangent_ref.shape[0]
     accumulator = jnp.zeros((block_m, W8A8_GROUP_SIZE), dtype=jnp.float32)
-    column_blocks = pl.cdiv(output_cotangent_ref.shape[1], block_n)
+    column_blocks = output_cotangent_ref.shape[1] // block_n
 
     def consume_columns(column_block, previous):
         columns = column_block * block_n + jnp.arange(block_n)
-        column_mask = columns < output_cotangent_ref.shape[1]
         dy = plgpu.load(
             output_cotangent_ref.at[rows[:, None], columns[None, :]],
-            mask=row_mask[:, None] & column_mask[None, :],
-            other=0.0,
         )
         codes = plgpu.load(
             weight_codes_ref.at[k[:, None], columns[None, :]],
-            mask=column_mask[None, :],
-            other=0,
         ).astype(jnp.float32)
         scales = plgpu.load(
             weight_scales_ref.at[group_index, columns],
-            mask=column_mask,
-            other=0.0,
         ).astype(jnp.float32)
         # This BF16 conversion is the experiment's explicit relaxed-backward
         # policy.  The portable semantic oracle instead contracts FP32
@@ -358,7 +336,6 @@ def _w8a16_input_vjp_kernel(
     plgpu.store(
         input_cotangent_ref.at[rows[:, None], k[None, :]],
         accumulator.astype(input_cotangent_ref.dtype),
-        mask=row_mask[:, None],
     )
 
 
@@ -402,6 +379,19 @@ def _pad_row_blocks(
     )
 
 
+def _padded_output_features(out_features: int, block_n: int) -> int:
+    return ((out_features + block_n - 1) // block_n) * block_n
+
+
+def _pad_output_features(value: jax.Array, padded_out_features: int) -> jax.Array:
+    padding = padded_out_features - value.shape[-1]
+    if padding < 0:
+        raise ValueError("padded output-feature count is smaller than the input")
+    if padding == 0:
+        return value
+    return jnp.pad(value, ((0, 0), (0, padding)))
+
+
 def _base_forward_impl(
     x: jax.Array,
     weight_codes: jax.Array,
@@ -416,11 +406,15 @@ def _base_forward_impl(
     from jax.experimental import pallas as pl
 
     row_count = math.prod(x.shape[:-1])
+    out_features = weight_codes.shape[1]
+    padded_out_features = _padded_output_features(out_features, block_n)
     flat_x = x.reshape((row_count, x.shape[-1]))
     effective_rows, padded_rows = _row_block_geometry(
         row_count, row_superblock, block_m
     )
     blocked_x = _pad_row_blocks(flat_x, effective_rows, padded_rows)
+    padded_weight_codes = _pad_output_features(weight_codes, padded_out_features)
+    padded_weight_scales = _pad_output_features(weight_scales, padded_out_features)
 
     def one_row_superblock(x_block: jax.Array) -> jax.Array:
         x_codes, x_scales = _dynamic_group64_quantize(x_block)
@@ -431,21 +425,28 @@ def _base_forward_impl(
                 block_n=block_n,
             ),
             out_shape=jax.ShapeDtypeStruct(
-                (effective_rows, weight_codes.shape[1]), x.dtype
+                (effective_rows, padded_out_features), x.dtype
             ),
             grid=(
                 effective_rows // block_m,
-                pl.cdiv(weight_codes.shape[1], block_n),
+                padded_out_features // block_n,
             ),
             compiler_params=_compiler_params(),
             interpret=interpret,
             name="skyrl_qwen35_w8a8_frozen_forward",
         )
-        return run(x_codes, x_scales, weight_codes, weight_scales)
+        return run(
+            x_codes,
+            x_scales,
+            padded_weight_codes,
+            padded_weight_scales,
+        )
 
     blocked_output = lax.map(one_row_superblock, blocked_x)
-    flat_output = blocked_output.reshape((-1, weight_codes.shape[1]))[:row_count]
-    return flat_output.reshape((*x.shape[:-1], weight_codes.shape[1]))
+    flat_output = blocked_output.reshape((-1, padded_out_features))[
+        :row_count, :out_features
+    ]
+    return flat_output.reshape((*x.shape[:-1], out_features))
 
 
 def _forward_impl(
@@ -465,6 +466,8 @@ def _forward_impl(
     from jax.experimental import pallas as pl
 
     row_count = math.prod(x.shape[:-1])
+    out_features = weight_codes.shape[1]
+    padded_out_features = _padded_output_features(out_features, block_n)
     flat_x = x.reshape((row_count, x.shape[-1]))
     # A small Pallas program does not by itself bound a GPU launch: its grid
     # could still cover all 32K rows.  Pad and map fixed row superblocks so the
@@ -474,6 +477,9 @@ def _forward_impl(
         row_count, row_superblock, block_m
     )
     blocked_x = _pad_row_blocks(flat_x, effective_rows, padded_rows)
+    padded_weight_codes = _pad_output_features(weight_codes, padded_out_features)
+    padded_weight_scales = _pad_output_features(weight_scales, padded_out_features)
+    padded_lora_b = _pad_output_features(lora_b, padded_out_features)
 
     def one_row_superblock(x_block: jax.Array) -> tuple[jax.Array, jax.Array]:
         x_codes, x_scales = _dynamic_group64_quantize(x_block)
@@ -483,7 +489,7 @@ def _forward_impl(
             left_contract=1,
             right_contract=0,
         )
-        output_shape = (effective_rows, weight_codes.shape[1])
+        output_shape = (effective_rows, padded_out_features)
         run = pl.pallas_call(
             partial(
                 _w8a8_forward_kernel,
@@ -493,7 +499,7 @@ def _forward_impl(
             out_shape=jax.ShapeDtypeStruct(output_shape, x.dtype),
             grid=(
                 effective_rows // block_m,
-                pl.cdiv(weight_codes.shape[1], block_n),
+                padded_out_features // block_n,
             ),
             compiler_params=_compiler_params(),
             interpret=interpret,
@@ -502,18 +508,20 @@ def _forward_impl(
         output_block = run(
             x_codes,
             x_scales,
-            weight_codes,
-            weight_scales,
+            padded_weight_codes,
+            padded_weight_scales,
             z_block,
-            lora_b,
+            padded_lora_b,
             lora_scaling,
         )
         return output_block, z_block
 
     blocked_output, blocked_z = lax.map(one_row_superblock, blocked_x)
-    flat_output = blocked_output.reshape((-1, weight_codes.shape[1]))[:row_count]
+    flat_output = blocked_output.reshape((-1, padded_out_features))[
+        :row_count, :out_features
+    ]
     z = blocked_z.reshape((-1, W8A8_LORA_RANK))[:row_count]
-    return flat_output.reshape((*x.shape[:-1], weight_codes.shape[1])), z
+    return flat_output.reshape((*x.shape[:-1], out_features)), z
 
 
 def _base_input_vjp(
@@ -528,7 +536,12 @@ def _base_input_vjp(
 ) -> jax.Array:
     from jax.experimental import pallas as pl
 
-    flat_dy = output_cotangent.reshape((-1, output_cotangent.shape[-1]))
+    out_features = output_cotangent.shape[-1]
+    padded_out_features = _padded_output_features(out_features, block_n)
+    flat_dy = output_cotangent.reshape((-1, out_features))
+    flat_dy = _pad_output_features(flat_dy, padded_out_features)
+    padded_weight_codes = _pad_output_features(weight_codes, padded_out_features)
+    padded_weight_scales = _pad_output_features(weight_scales, padded_out_features)
     input_features = weight_codes.shape[0]
     row_count = flat_dy.shape[0]
     effective_rows, padded_rows = _row_block_geometry(
@@ -554,7 +567,7 @@ def _base_input_vjp(
             interpret=interpret,
             name="skyrl_qwen35_w8a16_lora_input_vjp",
         )
-        return run(dy_block, weight_codes, weight_scales)
+        return run(dy_block, padded_weight_codes, padded_weight_scales)
 
     blocked_dx = lax.map(one_row_superblock, blocked_dy)
     return blocked_dx.reshape((-1, input_features))[:row_count]

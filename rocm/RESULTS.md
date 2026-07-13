@@ -135,15 +135,49 @@ The verifier now pins the deterministic empty ELF and exact 16-byte identifier
 shape while retaining caller-bound whole-cache SHA-256 integrity. CPU-only
 regression inspection passes both the previously qualified cache and the
 failed-attempt cache, which contain the same exact 8,440-byte W8 HSACO. A GPU
-retry remains a separate guarded rung.
+retry remained a separate guarded rung.
 
-Peak observed physical VRAM, junction temperature, and sampled average power
-were 867,360,768 bytes, 51 C, and 113 W. Swap did not grow, all monitored
-limits passed, no driver fault appeared, and the device returned to its exact
-suspended/unowned idle baseline. Artifacts are under
-`/tmp/skyrl-w8a8-compile-1783972228`. The next permitted risk rung remains one
-fresh-cache, fresh-ISA-qualified, host-checked forward invocation; no warmup,
-replay, backward, model integration, or throughput run is implied.
+That one guarded retry was consumed at revision `8eb3c7d7` in
+`/tmp/skyrl-w8a8-runtime-1783982504`. The exact five-kernel executable plus its
+final device-to-device slice did not complete inside the controller's five
+second dispatch watchdog. The probe emitted `dispatch_started`, but no
+post-attempt checkpoint, dispatch completion, device-get, numerical-validation,
+or completion record. The controller killed the complete cgroup, reaped it in
+0.071485 seconds, and restored the exact suspended/unowned VRAM/GTT baseline
+after three consecutive idle samples. The whole-boot AMDGPU journal remained
+clean: this was a fail-closed executable timeout, not evidence of a driver reset
+or another machine crash.
+
+The retained executable contains, in order, input pad/reduce, A8 conversion,
+BF16 LoRA-A GEMM, scale select, the Pallas W8 call, and a final slice. Because
+the watchdog bracket covered `compiled(...)` and output readiness together, it
+does not identify which stage stalled. GPU-busy telemetry is also not
+attributable: it reached 100% about 56 seconds before dispatch and showed the
+same pre-dispatch behavior in the earlier run that never released an
+executable. The exact Pallas thunk used grid `1x2x1`, 128 threads, and 1,024
+bytes of dynamic LDS. Its 8,440-byte HSACO has four signed-IU8 WMMAs, nine
+barriers, no spills/private stack, and extensive EXEC-mask control for the
+single-column `N=17` tail. These facts make the masked multi-wave lowering a
+plausible hypothesis, not a proven cause.
+
+The replacement source therefore zero-pads logical output features to complete
+physical `block_n` tiles outside Pallas, omits row/column tail predicates from
+the forward and base-input-VJP kernels, and slices only after the custom call.
+For the qualification case this changes logical `N=17` to physical `N=32`;
+aligned Qwen projection sizes require no padding. CPU/interpreter and mock
+coverage now proves bitwise tail-forward equivalence, the retained 1% W8
+gradient gates, physical call shapes, and absence of `lt`/`and` tail predicates
+in both kernel JAXPRs. This corrected source has not yet been compiled or
+executed on the GPU; a fresh compile, complete thunk/ISA audit, and explicit
+offline GO remain mandatory before any further dispatch.
+
+For the original compile-only artifacts under
+`/tmp/skyrl-w8a8-compile-1783972228`, peak observed physical VRAM, junction
+temperature, and sampled average power were 867,360,768 bytes, 51 C, and 113 W.
+Swap did not grow, all monitored limits passed, no driver fault appeared, and
+the device returned to its exact suspended/unowned idle baseline. That
+historical compile evidence justified the now-consumed one-shot rung; it does
+not authorize another invocation of the same artifact.
 
 ### Stable-source T1024 executable-cache qualification
 

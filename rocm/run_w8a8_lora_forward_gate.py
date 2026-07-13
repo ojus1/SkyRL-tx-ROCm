@@ -7,11 +7,11 @@ captures an exact suspended/unowned RX 7900 XTX baseline, wraps the child
 directly in ``profile_rocm.py``, then requires the exact three-sample idle
 handoff and a final whole-boot journal check before releasing the lock.
 
-All limits and paths are fixed for the first ``M=3,K=64,N=17`` rung.  The
-runtime phase has a separate five-second dispatch watchdog and exactly one
-compiled invocation.  This controller exposes no shape, repetition, warmup,
-backward, graph, or replay option.  The child separately refuses a hardware
-power cap above 315 W.
+All limits and paths are fixed for the first logical ``M=3,K=64,N=17`` rung,
+whose Pallas call uses full physical ``M=16,N=32`` tiles.  The runtime phase has
+a separate five-second dispatch watchdog and exactly one compiled invocation.
+This controller exposes no shape, repetition, warmup, backward, graph, or
+replay option.  The child separately refuses a hardware power cap above 315 W.
 """
 
 from __future__ import annotations
@@ -84,17 +84,17 @@ _EXPECTED_HOST_MANIFESTS = [
     },
     {
         "name": "weight_codes",
-        "shape": [64, 17],
+        "shape": [64, 32],
         "dtype": "int8",
-        "nbytes": 1088,
-        "sha256": "7b2d71ade420170140481aea83796639238df7cb0cd4c85ecc12f197654dd5be",
+        "nbytes": 2048,
+        "sha256": "eb56a17a7879d4c9e2074032f7c1ed6245fc11feaa49909d0cbf9318ea1c1ba2",
     },
     {
         "name": "weight_scales",
-        "shape": [1, 17],
+        "shape": [1, 32],
         "dtype": "bfloat16",
-        "nbytes": 34,
-        "sha256": "5aa21b6c4171062f63d5cae19f23d9d2874e3a173ce0238454e156cca6f843fb",
+        "nbytes": 64,
+        "sha256": "0400e891d735538d98f99325bf961625b3307c2518794247db07d560bd88709f",
     },
     {
         "name": "lora_a",
@@ -105,10 +105,10 @@ _EXPECTED_HOST_MANIFESTS = [
     },
     {
         "name": "lora_b",
-        "shape": [8, 17],
+        "shape": [8, 32],
         "dtype": "bfloat16",
-        "nbytes": 272,
-        "sha256": "1e9f8813f39862777be04e019879000d772b7c8ef2e87768deef64cc2134200d",
+        "nbytes": 512,
+        "sha256": "177c70ae57385793bd76b6d322190dc173dbe94dfcb67f8e3419b6cf15383592",
     },
     {
         "name": "lora_scaling",
@@ -198,12 +198,12 @@ namespace = {
 exec(compile(payload, profile, "exec"), namespace)
 """
 _EXPECTED_SOURCE_SHA256 = {
-    "child": "4916a81b56fc161041404c69cf5af5298f1d581b080e82c2cd6d6bca4d56157a",
+    "child": "48f34f89feb566c2d36b570ff35a1aea8695441e21569be32c2cd753f77980c0",
     "isa_inspector": "1a46c05700e5fbe6b5747632cfb23e872919f3b39fa77119c701836ce92cda07",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
     "handoff": "4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392",
     "profiler": "ed230758101a2a540b3a09e7f84ac92256d2bb41c70dbc399b9466fe0b979684",
-    "kernel": "1dec42508856d5e38a656bc4292dcb7033d4437bf8458f7b88030be4b4b4490a",
+    "kernel": "af119fec39f53ba0dd0c500398589e0fc333a6fda752ffb464c2a578738bbded",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "package_skyrl": "667d4a15b970b851e20d17510224670c14646cfb6d5a1e388ca6b9cc6da8bf41",
     "package_tx": "a7abb3e76d66df1f4472bb7a02b032ef31b959ca937fd351637b4e9b4a8fa95a",
@@ -386,7 +386,7 @@ def _contract(phase: str) -> dict[str, Any]:
     execute = phase == "execute"
     return {
         "phase": phase,
-        "child_case": "M3_K64_N17_W8A8_group64_rank8_LoRA_forward",
+        "child_case": "M3_K64_N17logical_N32physical_W8A8_group64_rank8_LoRA_forward",
         "compiled_executable_invocations": 1 if execute else 0,
         "compiled_executable_completions": 1 if execute else 0,
         "runtime_promotion": False,
@@ -2362,19 +2362,19 @@ def _independent_ir_gate(stable_text: str, optimized_text: str) -> dict[str, Any
     optimized_block = optimized_blocks[0] if len(optimized_blocks) == 1 else ""
     expected_stable_signature = [
         "tensor<3x64xbf16>",
-        "tensor<64x17xi8>",
-        "tensor<1x17xbf16>",
+        "tensor<64x32xi8>",
+        "tensor<1x32xbf16>",
         "tensor<64x8xbf16>",
-        "tensor<8x17xbf16>",
+        "tensor<8x32xbf16>",
         "tensor<f32>",
         "tensor<3x17xbf16>",
     ]
     expected_optimized_signature = [
         "bf16[3,64]",
-        "s8[64,17]",
-        "bf16[1,17]",
+        "s8[64,32]",
+        "bf16[1,32]",
         "bf16[64,8]",
-        "bf16[8,17]",
+        "bf16[8,32]",
         "f32[]",
         "bf16[3,17]",
     ]
@@ -3013,14 +3013,14 @@ def _audit_runtime_profile_outputs(
         "phase": "execute",
         "inputs": [
             {"name": "x", "shape": [3, 64], "dtype": "bfloat16"},
-            {"name": "weight_codes", "shape": [64, 17], "dtype": "int8"},
+            {"name": "weight_codes", "shape": [64, 32], "dtype": "int8"},
             {
                 "name": "weight_scales",
-                "shape": [1, 17],
+                "shape": [1, 32],
                 "dtype": "bfloat16",
             },
             {"name": "lora_a", "shape": [64, 8], "dtype": "bfloat16"},
-            {"name": "lora_b", "shape": [8, 17], "dtype": "bfloat16"},
+            {"name": "lora_b", "shape": [8, 32], "dtype": "bfloat16"},
             {"name": "lora_scaling", "shape": [], "dtype": "float32"},
         ],
         "output": {"shape": [3, 17], "dtype": "bfloat16"},
@@ -3029,6 +3029,9 @@ def _audit_runtime_profile_outputs(
             "block_m": 16,
             "block_n": 16,
             "row_superblock": 16,
+            "logical_out_features": 17,
+            "physical_out_features": 32,
+            "full_output_tiles_only": True,
         },
         "dispatch_plan": expected_runtime_dispatch_plan,
         "runtime_numerical_gate_evaluated": True,

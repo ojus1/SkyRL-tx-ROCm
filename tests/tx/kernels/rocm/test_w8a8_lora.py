@@ -17,6 +17,8 @@ from skyrl.tx.kernels.quantized_lora import (
 from skyrl.tx.kernels.rocm.w8a8_lora import (
     W8A8_GROUP_SIZE,
     W8A8_LORA_RANK,
+    _pad_output_features,
+    _padded_output_features,
     _w8a8_lora_linear_fwd,
     w8a8_frozen_linear,
     w8a8_lora_linear,
@@ -91,10 +93,11 @@ def test_opt_in_flags_require_exact_boole(name: str, value: object) -> None:
 
 
 @pytest.mark.parametrize("inputs", [64, 128])
+@pytest.mark.parametrize("outputs", [17, 19, 31, 33])
 def test_interpret_forward_is_bitwise_equal_to_grouped_oracle_with_tails(
-    inputs: int,
+    inputs: int, outputs: int
 ) -> None:
-    x, weight, lora_a, lora_b = _case(rows=3, inputs=inputs, outputs=17)
+    x, weight, lora_a, lora_b = _case(rows=3, inputs=inputs, outputs=outputs)
 
     actual = w8a8_lora_linear(
         x,
@@ -116,9 +119,80 @@ def test_interpret_forward_is_bitwise_equal_to_grouped_oracle_with_tails(
         activation_bits=8,
     )
 
-    assert actual.shape == (3, 17)
+    assert actual.shape == (3, outputs)
     assert actual.dtype == jnp.bfloat16
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_output_feature_padding_is_identity_when_aligned() -> None:
+    value = jnp.zeros((64, 16), dtype=jnp.int8)
+
+    assert _padded_output_features(16, 16) == 16
+    assert _pad_output_features(value, 16) is value
+
+
+@pytest.mark.parametrize(
+    ("out_features", "block_n", "expected"),
+    [(2560, 64, 2560), (18432, 64, 18432), (32, 64, 64), (32, 32, 32)],
+)
+def test_qwen_output_feature_geometry(
+    out_features: int, block_n: int, expected: int
+) -> None:
+    assert _padded_output_features(out_features, block_n) == expected
+
+
+def test_tail_forward_and_input_vjp_use_full_unmasked_physical_tiles() -> None:
+    x, weight, lora_a, lora_b = _case(rows=3, inputs=64, outputs=17)
+
+    def objective(x_arg, a_arg, b_arg):
+        output = w8a8_lora_linear(
+            x_arg,
+            weight,
+            a_arg,
+            b_arg,
+            1.0,
+            enabled=True,
+            interpret=True,
+            block_m=16,
+            block_n=16,
+            row_superblock=16,
+        )
+        return jnp.sum(output.astype(jnp.float32))
+
+    closed = jax.make_jaxpr(jax.grad(objective, argnums=(0, 1, 2)))(x, lora_a, lora_b)
+    calls = {
+        equation.params["name"]: equation
+        for equation in _equations_recursive(closed.jaxpr)
+        if equation.primitive.name == "pallas_call"
+    }
+    forward = calls["skyrl_qwen35_w8a8_lora_forward"]
+    input_vjp = calls["skyrl_qwen35_w8a16_lora_input_vjp"]
+
+    assert forward.params["grid_mapping"].grid == (1, 2)
+    assert [value.aval.shape for value in forward.invars] == [
+        (16, 64),
+        (16, 1),
+        (64, 32),
+        (1, 32),
+        (16, 8),
+        (8, 32),
+        (),
+    ]
+    assert [value.aval.shape for value in forward.outvars] == [(16, 32)]
+    assert input_vjp.params["grid_mapping"].grid == (1, 1)
+    assert [value.aval.shape for value in input_vjp.invars] == [
+        (16, 32),
+        (64, 32),
+        (1, 32),
+    ]
+    assert [value.aval.shape for value in input_vjp.outvars] == [(16, 64)]
+
+    for call in (forward, input_vjp):
+        kernel = getattr(call.params["jaxpr"], "jaxpr", call.params["jaxpr"])
+        primitives = {
+            equation.primitive.name for equation in _equations_recursive(kernel)
+        }
+        assert primitives.isdisjoint({"lt", "and"})
 
 
 def test_three_row_superblocks_match_forward_and_gradient_contract() -> None:
