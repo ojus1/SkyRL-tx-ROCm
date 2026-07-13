@@ -120,6 +120,94 @@ upside. It must retain no BF16 shadow and remains blocked on guarded gfx1100
 compile, ISA, correctness, memory, and throughput gates before NNX/checkpoint
 integration.
 
+### Guarded gfx1100 qualification entrypoint
+
+`rocm/run_w8a8_lora_forward_gate.py` and
+`rocm/probe_w8a8_lora_forward.py` implement only the first hardware rung. Their
+default invocations emit an abstract refusal without importing JAX. The ROCm
+controller holds the global launch lock across an exact suspended/unowned
+RX 7900 XTX baseline, hash-bound `profile_rocm.py` supervision, the child, three
+consecutive one-second idle-handoff samples, and a final whole-boot journal
+check. The profiler is itself loaded from hash-verified source under
+`python -I -S -B`, with its Linux `psutil` runtime hash-bound before imports.
+The child separately validates the inherited lock, exact PCI/render
+identity, disconnected AMD display, unowned KFD/render nodes, fixed stack and
+selected native-library/source hashes, and the exact sole environment value:
+
+```text
+XLA_FLAGS=--xla_gpu_enable_command_buffer=
+```
+
+The fixed source requests the base-W8A8 plus LoRA-B/scaling Pallas epilogue at
+`M=3,K=64,N=17`, group 64, `block_m=block_n=16`, and physical grid `1x2`.
+Activation quantization and the LoRA-A contraction remain ordinary JAX work
+outside that Pallas call, so this is not an entire-forward megakernel. The only
+enabled hardware phase is an unpromoted compile diagnostic; it invokes no
+returned executable. `--phase execute` is rejected until retained gfx1100 ISA
+is qualified in a later source revision. The diagnostic contains no backward,
+warmup, repetition, replay, graph, model, or benchmark work.
+
+The controller fixes sampled-sysfs thresholds of 2 GiB VRAM, 90 C junction,
+and 315 W `power1_average`, plus an 85 C child launch gate, 300-second child
+timeout, 330-second independent supervisor watchdog, and relaxed 0 GiB
+host-available/8 GiB swap limits. It records and bounds the largest observed
+sample gap, but this remains reactive evidence rather than a continuous
+measurement. The child also refuses a reported hardware `power1_cap` above
+315 W; that configuration still does not prove that every instantaneous
+electrical transient stayed below the cap. The process uses a fresh private
+7.5%-of-VRAM BFC allocator limit and fresh JAX,
+Triton, compiler-dump, and `TF_XLA_HSACO_CACHE_DIR` directories. Longer compile
+startup is intentional and cannot be replaced by command-buffer capture. The
+BFC setting and XLA buffer-plan estimate are allocator/compiler constraints,
+not independent proof of peak physical VRAM.
+
+The safe defaults are:
+
+```bash
+.venv/bin/python rocm/run_w8a8_lora_forward_gate.py
+.venv/bin/python rocm/probe_w8a8_lora_forward.py
+```
+
+After committing a clean source tree, a fresh compile-only artifact can be
+requested with:
+
+```bash
+umask 077
+run_dir="/tmp/skyrl-w8a8-compile-$(date +%s)"
+XLA_FLAGS=--xla_gpu_enable_command_buffer= \
+  .venv/bin/python -I -S -B \
+    -X "pycache_prefix=$run_dir/python-cache" \
+    rocm/run_w8a8_lora_forward_gate.py \
+    --platform rocm --phase compile --allow-gpu --run-dir "$run_dir"
+```
+
+Controller completion still does not establish runtime correctness or native
+INT8 ISA. It establishes only an unpromoted compile diagnostic whose private
+probe, telemetry, compiler, handoff, and final-journal artifacts must be
+reviewed together. Optimized HLO proving one
+Triton custom call is not an
+INT8 ISA proof, and surrounding optimized-HLO fusions may still launch separate
+kernels. The probe therefore persists raw StableHLO and optimized HLO and marks
+the result `passed_compile_diagnostic_unpromoted`. Promotion requires
+correlating an actual retained Pallas code object with the forward symbol,
+gfx1100 disassembly, resource use, and a later runtime trace that proves both
+the dispatched symbol and absence of graph/capture APIs. If that chain is not
+available, the result remains only a Pallas Triton custom-call compile proof.
+Version/origin checks and selected binary hashes do not constitute a complete
+hash closure over every JAX, NumPy, ML-dtypes, ROCm, and system runtime file;
+the untouched installed stack remains a recorded trust assumption.
+
+Only after the tiny compile diagnostic is reviewed and a separate source
+revision safely enables the one-shot forward will the ladder change one risk
+dimension at a time: signed base-only semantics;
+`K=128`; three row superblocks; small base/fused VJPs; K-scan lengths 8/40/144;
+N-scan lengths 8/32/128/288; then the first real `K=2560,N=18432` gate/up
+rectangle. The artificial `K=9216,N=18432` rectangle is not a model shape and
+must not be run. Every rung retains a strict sub-100-ms candidate-dispatch gate
+and a fresh-process exact-idle handoff. The user's 3% allowance applies to
+Pallas attention gradients, not this quantized projection; the W8 CPU and
+forward gates deliberately remain at 1%.
+
 ## Forward operation
 
 For flattened input `X[M,K]`, rank `R=8`, and group size `G=64`, the JAX-visible
