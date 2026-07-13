@@ -760,6 +760,71 @@ logits or scale behavior, padding, earlier query chunks, the full static call
 schedule, replay, backward, model integration, SFT, or GRPO. Those require
 separate fresh-process gates; this ladder authorizes no additional GPU work.
 
+## Exact T=1024/C=256 nonzero-scale sentinel gate
+
+`rocm/probe_query_bounded_gqa_nonzero_scale.py` is a separate, default-refusing
+forward gate for the first limitation left by the zero-Q/K length ladder. It
+uses the final 256 queries at T=1024, an all-valid mask, and independent
+per-feature host PCG64 BF16 Q/K/V values from nonzero signed magnitudes 1
+through 96 divided by 128. The candidate scale is passed explicitly as the
+exact binary fraction 3/32. A required host-only wrong-scale control at 1/16
+has relative L2 about 0.098449 against the candidate-scale oracle, so the input
+detects a missing or incorrect scale decisively.
+
+The independent FP32 stable-softmax oracle streams one query head over
+32-query and 64-key tiles; it does not allocate a full 256-by-1024 logits or
+probability matrix. CPU calibration observes a maximum absolute valid logit of
+about 1.431713. Its conservative explicit NumPy-array scratch accounting is
+332,288 bytes, including simultaneously live validity, gathered-logit,
+logit/probability, tile, accumulator-update, row-state, and position arrays.
+That is accounting rather than a measured allocator peak and excludes
+Python/NumPy object overhead and internal BLAS workspace. The exact
+production-size oracle is also checked in unit tests against a separate dense
+implementation restricted to small shapes.
+
+Before environment setup or JAX import, the guarded path pins the delegated
+length-probe, compile-helper, safety-helper, and query-kernel sources and binds,
+validates, and retains the exact safety callables. It then
+allows one lower, one compile, one input-tuple device placement, one checked
+executable invocation, and one device retrieval. StableHLO and optimized HLO
+must each prove exactly one q768 ROCm Triton custom call, no other bounded
+marker, no outer `while`, explicitly present exact `query_start=768` and
+`query_size=256` metadata without lookalikes, duplicates, prefixes, or value
+suffixes. An independent raw-IR check requires canonical integer text, so forms
+such as `768x`, `768garbage`, `768e2`, and `768.0` fail closed even if a
+delegated numeric-prefix parser recognizes `768`. Compiler memory must prove
+6,295,552 argument bytes,
+2,097,152 output bytes, zero alias bytes, and at most 64 MiB temporary memory.
+There is no warmup, replay, backward path, accelerator reference or reduction,
+or model invocation.
+
+The default mode imports no JAX and only emits a refusal manifest. A later
+independently authorized hardware run should use a fresh supervised process:
+
+```bash
+.venv/bin/python rocm/profile_rocm.py \
+  --output /tmp/query-bounded-gqa-c256-t1024-nonzero-scale.telemetry.jsonl \
+  --card card1 \
+  --interval 0.1 \
+  --baseline-seconds 2 \
+  --timeout 120 \
+  --sensor-grace-seconds 15 \
+  --max-junction-temp-c 70 \
+  --max-gpu-power-watts 315 \
+  --max-vram-gib 2 \
+  --min-host-available-gib 8 \
+  --max-swap-gib 0.001 \
+  -- .venv/bin/python rocm/probe_query_bounded_gqa_nonzero_scale.py \
+       --platform rocm --allow-gpu \
+       --output /tmp/query-bounded-gqa-c256-t1024-nonzero-scale.jsonl
+```
+
+Promotion requires finite output, relative L2 below 0.01, cosine at least
+0.9999, maximum absolute error at most 0.02, candidate duration below the
+100 ms hard limit and 75 ms promotion ceiling, and a clean outer profiler
+artifact. This source and command do not claim a hardware result or authorize
+padding, replay, backward, another length/chunk, or model integration.
+
 ## GPU promotion gates
 
 This prototype should remain disconnected from `dot_product_attention` until
