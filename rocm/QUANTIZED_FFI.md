@@ -7,8 +7,8 @@ is enabled in model code yet.
 
 ## What is proven locally
 
-The installed stack is HIP/ROCm 7.2.0, Clang 22, Composable Kernel 1.2.0,
-rocWMMA 2.2.0, hipBLASLt 1.2.1, and JAX/JAXlib 0.10.2. Inspection and
+The installed stack is ROCm 7.2.4, Clang 22, Composable Kernel 1.2.0,
+rocWMMA 2.2.0, hipBLASLt 1.2.2, and JAX/JAXlib 0.10.2. Inspection and
 compile-only checks establish the following:
 
 - Clang accepts gfx1100's signed IU8 and IU4 WMMA builtins. Both accumulate
@@ -38,8 +38,8 @@ rocm/compile_probes/compile_quant_wmma_gfx1100.sh
 
 It runs `hipcc -O3 --genco --no-gpu-bundle-output
 --offload-arch=gfx1100`, writes only to a private directory under `${TMPDIR:-/tmp}`,
-and disassembles the code object. On the installed stack it produced a
-6,304-byte HSACO containing both:
+and disassembles the code object. A post-upgrade rerun on ROCm 7.2.4 on
+2026-07-13 reproduced a 6,304-byte HSACO containing both:
 
 ```text
 v_wmma_i32_16x16x16_iu8 v[0:7], v[8:11], v[12:15], v[0:7]
@@ -72,6 +72,53 @@ IU8 and IU4 avoids making W4 depend on an incomplete wrapper. The packed W4
 checkpoint layout is not automatically a WMMA fragment layout: an offline or
 load-time permutation must create the canonical device weight. Do not perform
 that permutation on every forward.
+
+## Default-off Pallas W8A8 feasibility rung
+
+`skyrl/tx/kernels/rocm/w8a8_lora.py` now provides a smaller experiment before
+the production HIP work. JAX 0.10.2's local Pallas primitive assigns signed
+integer dots an INT32 result, and its Triton lowering accepts signed INT8
+inputs and emits a Triton `dot`. That source-level fact does **not** prove the
+gfx1100 backend selects an IU8 matrix instruction; only retained code-object
+disassembly or equivalent ISA evidence can establish that.
+
+The prototype is explicit opt-in and is not imported or selected by model
+code. It keeps W8 group-64 codes/scales compact, quantizes A8 once per bounded
+row superblock, computes one INT32 dot per K group, applies the row and weight
+scales in FP32, and adds rank-8 LoRA in the same epilogue before one BF16 cast.
+It also exposes a base-only custom-VJP route so a future compact layer can use
+the existing `LoRAMixin.apply_lora` implementation for no-adapter and genuine
+multi-adapter batches; the fused epilogue is only the already-selected
+single-adapter fast path.
+Its relaxed input pullback dequantizes one W8 tile to BF16 and uses a BF16 dot
+with FP32 accumulation. The source maps all forward and backward row work in
+at most 512 rows by default, with an enforced 2,048-row maximum; one small
+Pallas program is not incorrectly treated as proof of a bounded whole-grid
+launch. Each forward program still scans the capped K domain, up to 144
+group-64 dots, and each input-pullback workgroup scans the capped N domain, up
+to 18,432 columns. The physical duration of both scans remains unproven.
+The experiment also caps K at 9,216 and N at 18,432, the largest non-vocabulary
+Qwen3.5-4B projection dimensions. The tied 248,320-column head is deliberately
+outside this path.
+
+CPU Pallas-interpreter tests currently prove only semantics. The fixed
+`M=3,K=64,N=17` tail case is bitwise equal to the portable W8A8 forward. Against
+the stronger portable FP32-dequant backward, relative L2 errors were 0.3341%
+for `dX`, 0.2435% for `dA`, 0.3220% for `dB`, and 0.0000703% for `dscale`, all
+inside the retained 1% CPU regression gate. A `M=1025` JAXPR test proves a
+three-iteration row scan whose sole forward Pallas grid covers exactly 512
+rows per iteration. A separate `M=33,K=128,N=19` interpreter test executes
+three 16-row superblocks and checks bitwise forward equality plus all four
+pullbacks against the same 1% gate. These are CPU structural/numerical results,
+not GPU lowering, runtime, memory, or speed results.
+
+The first useful model family remains all 32 MLP gate/up matrices, each exactly
+`K=2560,N=18432`. Compact W8 codes plus BF16 group-64 scales save exactly
+1,462,763,520 bytes (1.362304688 GiB) versus their BF16 kernels. This one shared
+callsite is the smallest projection family with more than 1 GiB capacity
+upside. It must retain no BF16 shadow and remains blocked on guarded gfx1100
+compile, ISA, correctness, memory, and throughput gates before NNX/checkpoint
+integration.
 
 ## Forward operation
 
