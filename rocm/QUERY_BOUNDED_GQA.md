@@ -798,8 +798,10 @@ delegated numeric-prefix parser recognizes `768`. Compiler memory must prove
 There is no warmup, replay, backward path, accelerator reference or reduction,
 or model invocation.
 
-The default mode imports no JAX and only emits a refusal manifest. A later
-independently authorized hardware run should use a fresh supervised process:
+The default mode imports no JAX and only emits a refusal manifest. After
+independent source review, the following command was executed exactly once in
+a fresh supervised process. It must not be replayed as part of reproducing
+this documentation change:
 
 ```bash
 .venv/bin/python rocm/profile_rocm.py \
@@ -819,11 +821,43 @@ independently authorized hardware run should use a fresh supervised process:
        --output /tmp/query-bounded-gqa-c256-t1024-nonzero-scale.jsonl
 ```
 
-Promotion requires finite output, relative L2 below 0.01, cosine at least
+Promotion required finite output, relative L2 below 0.01, cosine at least
 0.9999, maximum absolute error at most 0.02, candidate duration below the
-100 ms hard limit and 75 ms promotion ceiling, and a clean outer profiler
-artifact. This source and command do not claim a hardware result or authorize
-padding, replay, backward, another length/chunk, or model integration.
+100 ms hard limit and 75 ms promotion ceiling, and a clean outer profiler.
+The guarded run passed all gates. Its sole checked candidate dispatch took
+`6.87041300261626 ms`. The BF16 output SHA-256 was
+`590e462e2c0fc03e56ce72ee1aabd33ebbae09f8f1d309803ea9e486100f7f91`;
+against the independent FP32 oracle, relative L2 was
+`0.002357022718211298`, cosine was `0.9999972222493951`, and maximum
+absolute error was `0.00022630393505096436`. The required wrong-scale control
+retained relative L2 `0.09844902832132886` before device placement.
+
+Both IR dialects contained one sole q768 ROCm Triton call, no outer `while`,
+and exact parsed and raw `query_start=768`/`query_size=256` metadata. Compiler
+memory was 6,295,552 argument bytes, 2,097,152 output bytes, 16,640 temporary
+bytes, and zero alias bytes. Final accounting recorded exactly one lower,
+compile, input-tuple placement, checked invocation, and output retrieval. It
+recorded zero warmups, replays, lowered-callable invocations, backward calls,
+accelerator references or reductions, and model calls.
+
+The profiler completed with return code zero and no signal. Across 392
+measured samples, peak physical VRAM was `745213952` bytes, peak junction
+temperature was `48 C`, peak board power was `128 W`, minimum host-available
+memory was `60000137216` bytes, and swap use remained zero. All eight child
+journal checkpoints and the child preflight/postflight were clean.
+
+The mode-`0600` evidence artifacts and SHA-256 values are:
+
+- `/tmp/query-bounded-gqa-c256-t1024-nonzero-scale.jsonl`:
+  `504ed6136215b9871be7077174ab4c40aaa4eae57a79630753516535e6c89e5d`;
+- `/tmp/query-bounded-gqa-c256-t1024-nonzero-scale.telemetry.jsonl`:
+  `438aedd4622b28bbb3f4fc59f2429fd37c78d35679043eeaaa78632ae672684d`;
+- `/tmp/query-bounded-gqa-c256-t1024-nonzero-scale.telemetry.jsonl.summary.json`:
+  `1545f35f7c77abf0fd94037755dcac9240ae1478e9dd3c89d04bed1daf2409a3`.
+
+This promotes only the exact all-valid final-C256 T=1024 nonzero-scale forward
+sentinel. It does not authorize padding, another query chunk or length, replay,
+backward, model integration, SFT, GRPO, or a latency-distribution claim.
 
 ## GPU promotion gates
 
