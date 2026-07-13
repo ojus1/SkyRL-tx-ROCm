@@ -92,7 +92,7 @@ treats cache entries as trusted executable content. This mechanism does not
 enable XLA command buffers or HIP Graphs, does not reduce steady-state VRAM by
 itself, and does not replace shape-specific warmup. It is designed to let later
 static-bucket precompile and ordinary host-driven warmups amortize compilation;
-those hit and warmup paths require separate qualification.
+each additional hit, bucket, and warmup path requires separate qualification.
 The active trusted namespace
 `~/.cache/skyrl-jax-rocm-private-v1/jax0.10.2-jaxlib0.10.2-rocm-plugin0.10.2-pjrt0.10.2-rocm7.2.4-amdgpu6.16.13-gfx1100-v1`
 was initially empty. The legacy 42 MiB `~/.cache/skyrl-jax` tree is outside this
@@ -138,14 +138,14 @@ the direct prewarm tool requires those exact values. Running
 `python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
 CPU-only plan and never imports JAX.
 
-The exact cold T64-plus-Adam direct-tool path described below is now
-hardware-qualified for compile-only cache population. The multi-bucket path,
-launcher-to-API transition, cache-hit path, and actual warmup remain
-unqualified. Do not use the direct command above unsupervised. Every operational
-qualification must use the telemetry guard with an explicit finite timeout, a
-90 C maximum junction temperature, and a 315 W maximum GPU power limit, while
-retaining the headless-display, exclusive-KFD, fatal-journal, and cleanup gates.
-Each
+The exact cold T64-plus-Adam direct-tool population and one matched compile-only
+cache-hit process described below are now hardware-qualified. The multi-bucket
+path, launcher-to-API transition, additional/repeated hits, and actual warmup
+remain unqualified. Do not use the direct command above unsupervised. Every
+operational qualification must use the telemetry guard with an explicit finite
+timeout, a 90 C maximum junction temperature, and a 315 W maximum GPU power
+limit, while retaining the headless-display, exclusive-KFD, fatal-journal, and
+cleanup gates. Each
 train-bucket and optimizer compile has separate timing, compiled-memory,
 postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
 process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`
@@ -240,6 +240,84 @@ This run proves cold compile-only population and its resource cost. It does not
 measure a cache hit or startup time saved, invoke a training pass or Adam
 update, validate optimizer-step correctness, authorize a warmup or replay, or
 establish a steady-state speed or memory gain.
+
+### ROCm 7.2.4 matched T64 plus Adam cache-hit result
+
+One separately authorized fresh process repeated the exact T64-plus-Adam
+compile-only path against the unchanged populated cache. HEAD `292387b1`
+changed only documentation relative to the cold run; prewarm, launcher,
+backend, cache helper, profiler, and test bytes were unchanged. Before the
+process, the executable manifest still contained 187 entries totaling
+5,594,715 bytes with SHA-256
+`35a04f7f55949e110f5ba93fd276464576bc9fa464836c40b415ff891b68cafa`.
+The T64 and Adam executable hashes remained `4bc6a2472759483ea593737d5ee5f04bc982d3179c25dccd0e30ee4697bf1877`
+and `4880755376c24b921b4db1f34ef1ce5ec589ad88e990db898adb388b13d2199a`.
+
+Both monitored targets passed the strict hit contract independently: one cache
+request, one hit, zero misses, exactly one finite nonnegative saved-time and
+retrieval-time event, no schema issue, and no executable-cache addition,
+change, or removal. Entry count, byte count, and manifest stayed exact before
+and after each target. All 365 autotune files totaling 47,775 bytes retained
+their pre-hit mtimes. Exactly 185 setup atime companions were refreshed before
+`backend_ready`, followed by the T64 and Adam atimes in their target windows;
+these are expected cache-access bookkeeping writes, not executable or autotune
+content mutations and not target timing evidence.
+
+The paired cold-to-hit compile results were:
+
+| Target | Cold compile | Cache-hit compile | Reduction | Speedup |
+|---|---:|---:|---:|---:|
+| T64 forward/backward/accumulate | `48.291319 s` | `4.720658 s` | `90.22%` | `10.23x` |
+| Adam update | `17.290585 s` | `1.628718 s` | `90.58%` | `10.62x` |
+| Combined target compilation | `65.581903 s` | `6.349376 s` | `90.32%` | `10.33x` |
+
+Including lowering, the two targets fell from `75.008486 s` to `15.466490 s`,
+a 79.38% reduction or 4.85x speedup. Matched profiler elapsed time fell from
+`143.439143 s` to `75.865997 s`, saving `67.573147 s`: a 47.11% reduction or
+1.89x paired profiled direct-tool speedup. Backend/model setup itself changed from
+`39.588969 s` to `32.429409 s`; this 18.08% observed reduction was outside the
+target listeners, so the setup atime reads support cache-access attribution but
+not a public per-target duration claim.
+
+JAX's callbacks separately reported `41.386720 s` saved and `4.613280 s`
+retrieval for T64, plus `14.470795 s` saved and `1.529205 s` retrieval for Adam.
+The combined callback values are `55.857515 s` saved and `6.142485 s`
+retrieval. Those internal estimates use different accounting and must not be
+equated with the paired wall-time difference.
+
+Compiled argument, output, temporary, and alias memory fields matched the cold
+run. Deserialized handles reported generated-code sizes 16 bytes larger for
+each target, so the complete memory-analysis records were not byte-identical.
+Peak physical VRAM was 17,900,191,744 bytes versus 17,929,101,312 bytes cold,
+only 0.16% lower and not a demonstrated memory saving. Peak process RSS fell
+from 5,759,397,888 to 4,211,974,144 bytes (26.87%), and command-tree writes fell
+from 54,505,472 to 1,134,592 bytes (97.92%). These are startup host-resource
+observations, not steady-state training measurements.
+
+The profiler completed with return zero and no signal. Across 708 measured
+samples, peak junction temperature was 55 C, peak board power 168 W, minimum
+host-available memory 56,863,875,072 bytes, and swap zero. Per-target and final
+AMDGPU postflights were clean. Telemetry stopped shortly after process exit at
+520,364,032 bytes VRAM, but a bounded independent settle check later found the
+process gone, KFD unowned, the card suspended, no fatal journal event, and VRAM
+exactly back at its 27,947,008-byte baseline.
+
+The independently audited mode-`0600` artifacts under a fresh private
+mode-`0700` directory are:
+
+- `/tmp/skyrl-qwen35-prewarm-hit-292387b1/qwen35-prewarm-t64-adam-hit-boot54ccf56c-run1.jsonl`:
+  `ae600260a0d949e5988f0ae2b913ec026ff3e6f76d71b461465aa168e08acdab`;
+- its telemetry:
+  `1674af56660ccc6fcecb44a21e2623d7d079076630e194b2fc2533c9cc9415e1`;
+- its summary:
+  `cc900f388ecd50ce81e8673eea0f6af46a35cd743dae0bafcf455ca580df8092`.
+
+This is one paired compile-only result on the exact pinned stack, source, and
+cache. Public callbacks remain process-level rather than per-key proof. It does
+not establish repeatability, steady-state training throughput, optimizer-update
+speed, sampler performance, another bucket, actual warmup safety, or a runtime
+VRAM gain. No additional hit, warmup, or compiled-call invocation is authorized
+by this result.
 
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for
