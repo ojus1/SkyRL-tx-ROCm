@@ -82,11 +82,13 @@ returned to idle after each process. Artifacts:
 This advances context 2,048 to **compile-only capacity**, not validated
 training. The exact-one-update client protocol has now passed independent
 source review plus CPU/mocked tests and the context-64 hardware gate below. It
-is not permission to invoke the context-2,048 executable. The 2,048-token
-Pallas backward path must also pass its numerical promotion criterion: the
-isolated `dq`/`dk` relative-L2 errors remain about 1.1%, above the 1% threshold.
-Neither compile success nor bounded autotuning qualifies that attention
-implementation for training.
+is not permission to invoke the context-2,048 executable. The isolated Pallas
+numerical blocker has since been cleared through 2,048 tokens. The
+user-authorized gradient relative-L2 outer ceiling is 3%, while the guarded
+FP32-delta path retains and passes the stricter 1% regression gate: its worst
+observed result was dK at `0.003628` (about 0.363%). The separate full-model and
+safety gates remain; neither compile success nor bounded autotuning qualifies
+the complete training path.
 
 ### Exact S512 GDN execute forward gate
 
@@ -450,22 +452,30 @@ Local private artifacts are:
 
 ## Isolated evidence and known failures
 
-- The bounded correctness probe completed 512-token BF16 Pallas attention for
+The next three bullets preserve the pre-FP32-delta measurements, whose dQ/dK
+relative-L2 errors were about 1.1%. They describe the former unpatched
+implementation under the initial 1% promotion criterion, not the current
+guarded path. The user-authorized outer ceiling is 3%; the current FP32-delta
+path retains the stricter 1% regression gate and passed it through 2,048
+tokens, with worst observed dK relative L2 `0.003628` (about 0.363%).
+
+- Before the FP32-delta patch, the bounded correctness probe completed
+  512-token BF16 Pallas attention for
   both an all-valid sequence and a 385-valid/127-padded sequence. For the
   all-valid case, median forward/backward latency was 0.850/1.824 ms after one
   compile run, JAX peak allocation was 171,963,648 B, maximum junction
   temperature was 60 C, and no fatal driver event occurred. Against the
   16-query-token-block FP32 reference, output relative L2/cosine was
   0.00202/0.999998. The `dq` and `dk` relative-L2 errors were 0.0113 and
-  0.0108, slightly outside the initial 0.01 promotion gate, so this remains
-  experimental despite its otherwise clean result. The padded result was
-  materially the same. Telemetry is in
+  0.0108, slightly outside the initial 0.01 promotion gate, so the then-unpatched
+  path remained experimental despite its otherwise clean result. The padded
+  result was materially the same. Telemetry is in
   `/tmp/pallas512-reference-1783855014.telemetry.jsonl` and
   `/tmp/pallas512-pad385-1783855051.telemetry.jsonl`.
 - The same bounded reference at 1,024 tokens completed with 1.194/4.645 ms
   median forward/backward, 339,747,840 B JAX peak allocation, and no driver
   event. Output relative L2 was 0.00206; `dq`/`dk` remained 0.0113/0.0107, so
-  the numerical promotion decision did not change. Telemetry is in
+  the pre-patch numerical promotion decision did not change. Telemetry is in
   `/tmp/pallas1024-reference-1783857107.telemetry.jsonl`.
 - At 2,048 tokens the isolated path also passed: median forward/backward was
   2.942/15.347 ms, JAX peak allocation was 948,325,888 B, maximum junction was
@@ -495,7 +505,10 @@ The post-fix full-model SFT validation frontier is currently context 1,024. A
 fixed-rollout GRPO learner control is verified at context 64; real sampling,
 fixed-real-rollout replay, KL/reward comparison, and end-to-end GRPO remain
 unverified. Contexts above 1,024, quantized model execution, and fused-kernel
-execution also remain unverified. The Pallas gradient result remains just
-outside its initial promotion gate, so it is still opt-in despite the clean
-integrated runs. The staged gates in [`MEGAKERNELS.md`](MEGAKERNELS.md) must be
-followed; no quantized or custom-kernel path is enabled by default.
+execution also remain unverified. The isolated Pallas numerical blocker is
+cleared through 2,048 tokens: the user-authorized outer ceiling is 3%, and the
+current guarded FP32-delta path's worst observed dK result, `0.003628` (about
+0.363%), passes its retained stricter 1% regression gate. Pallas remains opt-in
+while the separate full-model, long-context, and safety matrix is incomplete.
+The staged gates in [`MEGAKERNELS.md`](MEGAKERNELS.md) must be followed; no
+quantized or custom-kernel path is enabled by default.

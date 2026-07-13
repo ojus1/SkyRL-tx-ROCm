@@ -11,11 +11,14 @@ The bootstrap is intentionally stdlib-only.  Its operational invocation is::
 
 The snapshot must be a normalized, owner-private copy of the *entire* tracked
 tree: directories are mode 0700, Git 100644 blobs are mode 0600, and Git
-100755 blobs are mode 0700.  No other node is accepted.  The source manifest is
-checked against fixed, sanitized ``/usr/bin/git`` commands before and after the
-snapshot read.  Python's site initialization and ``.pth`` processing remain
-disabled; the one explicitly validated venv site-packages directory is added
-to ``sys.path`` directly.
+100755 blobs are mode 0700.  No other node is accepted.  A separate preparation
+mode creates or revalidates that snapshot at a stable private path keyed only by
+the exact Git commit.  Stable source filenames are required for JAX executable
+cache keys to survive process restarts.  The source manifest is checked against
+fixed, sanitized ``/usr/bin/git`` commands before and after the snapshot read.
+Python's site initialization and ``.pth`` processing remain disabled; the one
+explicitly validated venv site-packages directory is added to ``sys.path``
+directly.
 
 Threat model: these checks fail closed for accidental source changes, Git index
 flags, path substitution by a different UID, and ordinary filesystem races.
@@ -48,6 +51,8 @@ class SourceVerificationError(RuntimeError):
 
 _GIT = "/usr/bin/git"
 _GIT_TIMEOUT_SECONDS = 120
+_TAR = "/usr/bin/tar"
+_TAR_TIMEOUT_SECONDS = 120
 _GIT_ENVIRONMENT = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -77,6 +82,7 @@ _ALLOWED_MODULES = {
     "rocm.qwen35_prewarm_handoff": "rocm/qwen35_prewarm_handoff.py",
 }
 _SOURCE_MANIFEST_FORMAT = "skyrl-verified-source-v1"
+_SOURCE_CACHE_NAMESPACE = "skyrl-source-snapshots-private-v1"
 _EXCLUDED_THREATS = (
     "malicious process running as the same UID",
     "parent process or pre-Python dynamic-loader environment",
@@ -103,6 +109,16 @@ class GitState:
     object_format: str
     blobs: tuple[GitBlob, ...]
     index_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SourceCachePaths:
+    """Canonical locations for one commit-keyed private source snapshot."""
+
+    cache_root: Path
+    commit_root: Path
+    archive: Path
+    snapshot: Path
 
 
 def _canonical_directory(
@@ -573,6 +589,216 @@ def _validate_snapshot_tree(snapshot_root: Path, state: GitState) -> tuple[list[
     return records, total_bytes
 
 
+def _canonical_commit_key(value: str) -> str:
+    try:
+        encoded = value.encode("ascii", "strict")
+    except UnicodeEncodeError as error:
+        raise SourceVerificationError("source-cache commit key is not ASCII") from error
+    if len(encoded) == 40:
+        object_format = "sha1"
+    elif len(encoded) == 64:
+        object_format = "sha256"
+    else:
+        raise SourceVerificationError(
+            "source-cache commit key must be one full SHA-1 or SHA-256 object ID"
+        )
+    return _canonical_oid(encoded, object_format, "source-cache commit key")
+
+
+def source_cache_paths(account_home: Path | str, git_head: str) -> SourceCachePaths:
+    """Return paths whose source filenames depend only on the account and commit."""
+    home = Path(account_home)
+    if not home.is_absolute():
+        raise SourceVerificationError("source-cache account home must be absolute")
+    if any(character in str(home) for character in "\r\n\t"):
+        raise SourceVerificationError(
+            "source-cache account home must not contain line-control characters"
+        )
+    commit = _canonical_commit_key(git_head)
+    cache_root = home / ".cache" / _SOURCE_CACHE_NAMESPACE
+    commit_root = cache_root / commit
+    return SourceCachePaths(
+        cache_root=cache_root,
+        commit_root=commit_root,
+        archive=commit_root / "source-head.tar",
+        snapshot=commit_root / "source-head",
+    )
+
+
+def _create_or_validate_private_directory(path: Path, label: str) -> Path:
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise SourceVerificationError(f"cannot create {label}: {error}") from error
+    return _canonical_directory(path, label, exact_mode=0o700)
+
+
+def _create_private_directory(path: Path, label: str) -> Path:
+    try:
+        os.mkdir(path, 0o700)
+    except OSError as error:
+        raise SourceVerificationError(f"cannot create new {label}: {error}") from error
+    return _canonical_directory(path, label, exact_mode=0o700)
+
+
+def _write_private_file_exclusive(path: Path, payload: bytes, label: str) -> None:
+    required_flags = ("O_CLOEXEC", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required_flags):
+        raise SourceVerificationError("private file creation requires Linux O_NOFOLLOW")
+    _directory_metadata(path.parent, f"{label} parent")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise SourceVerificationError(f"cannot create {label}: {error}") from error
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short private source-cache write")
+            view = view[written:]
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        endpoint = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or _file_fingerprint(metadata) != _file_fingerprint(endpoint)
+        ):
+            raise OSError("created private source-cache file failed metadata checks")
+    except OSError as error:
+        raise SourceVerificationError(f"cannot populate {label}: {error}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _extract_private_source_archive(archive: Path, snapshot: Path) -> None:
+    environment = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+    previous_umask = os.umask(0o077)
+    try:
+        result = subprocess.run(
+            [
+                _TAR,
+                "--extract",
+                "--no-same-owner",
+                "--no-same-permissions",
+                f"--file={archive}",
+                f"--directory={snapshot}",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=_TAR_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SourceVerificationError(
+            "fixed private source-cache extraction failed"
+        ) from error
+    finally:
+        os.umask(previous_umask)
+    if result.returncode != 0 or result.stdout != b"" or result.stderr != b"":
+        raise SourceVerificationError(
+            "fixed private source-cache extraction returned a nonzero or noisy result"
+        )
+
+
+def _validate_source_cache_pair(
+    paths: SourceCachePaths,
+    state: GitState,
+    expected_archive: bytes,
+) -> tuple[list[dict[str, Any]], int, str]:
+    _canonical_directory(paths.commit_root, "source-cache commit root", exact_mode=0o700)
+    try:
+        with os.scandir(paths.commit_root) as iterator:
+            entry_names = sorted(entry.name for entry in iterator)
+    except OSError as error:
+        raise SourceVerificationError(
+            f"cannot enumerate source-cache commit root: {error}"
+        ) from error
+    if entry_names != ["source-head", "source-head.tar"]:
+        raise SourceVerificationError(
+            "source-cache commit root must contain exactly source-head and "
+            "source-head.tar"
+        )
+
+    snapshot = _canonical_directory(
+        paths.snapshot, "source-cache snapshot", exact_mode=0o700
+    )
+    archive = _read_snapshot_file(paths.archive, 0o600)
+    expected_sha256 = hashlib.sha256(expected_archive).hexdigest()
+    observed_sha256 = hashlib.sha256(archive).hexdigest()
+    if len(archive) != len(expected_archive) or observed_sha256 != expected_sha256:
+        raise SourceVerificationError(
+            "source-cache archive does not equal fixed Git archive output"
+        )
+    records, total_bytes = _validate_snapshot_tree(snapshot, state)
+    return records, total_bytes, observed_sha256
+
+
+def prepare_source_cache(
+    *, repo_root: Path, git_head: str, account_home: Path
+) -> dict[str, Any]:
+    """Create or revalidate one stable, private, full-HEAD source snapshot."""
+    home = _canonical_directory(account_home, "source-cache account home")
+    before = _inspect_git_repository(repo_root, git_head)
+    paths = source_cache_paths(home, before.head)
+
+    cache_parent = _create_or_validate_private_directory(
+        home / ".cache", "private account cache directory"
+    )
+    if paths.cache_root.parent != cache_parent:
+        raise SourceVerificationError("source-cache root escaped the private account cache")
+    _create_or_validate_private_directory(paths.cache_root, "source-cache root")
+
+    expected_archive = _run_git(
+        before.repo_root, "archive", "--format=tar", before.head
+    )
+    try:
+        paths.commit_root.lstat()
+    except FileNotFoundError:
+        cache_status = "created"
+        _create_private_directory(paths.commit_root, "source-cache commit root")
+        _create_private_directory(paths.snapshot, "source-cache snapshot")
+        _write_private_file_exclusive(
+            paths.archive, expected_archive, "source-cache archive"
+        )
+        _extract_private_source_archive(paths.archive, paths.snapshot)
+    except OSError as error:
+        raise SourceVerificationError(
+            f"cannot inspect source-cache commit root: {error}"
+        ) from error
+    else:
+        cache_status = "reused"
+
+    records, total_bytes, archive_sha256 = _validate_source_cache_pair(
+        paths, before, expected_archive
+    )
+    after = _inspect_git_repository(repo_root, git_head)
+    if after != before:
+        raise SourceVerificationError(
+            "Git HEAD, index, status, or blob contents changed during source-cache "
+            "preparation"
+        )
+    return {
+        "cache_status": cache_status,
+        "format": "skyrl-private-source-cache-v1",
+        "git_head": before.head,
+        "git_tree": before.tree,
+        "source_archive_path": str(paths.archive),
+        "source_archive_sha256": archive_sha256,
+        "source_file_count": len(records),
+        "source_snapshot_root": str(paths.snapshot),
+        "source_total_bytes": total_bytes,
+        "full_head_tree_validated": True,
+    }
+
+
 def _validate_venv_site_packages(raw_path: Path | str) -> Path:
     site_packages = _canonical_directory(raw_path, "venv site-packages")
     expected_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -847,8 +1073,60 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _source_cache_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create or revalidate a stable, private, commit-keyed source snapshot."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--git-head", required=True)
+    parser.add_argument("--account-home", type=Path, required=True)
+    return parser
+
+
+def _prepare_source_cache_cli(argv: Sequence[str]) -> int:
+    args = _source_cache_parser().parse_args(argv)
+    try:
+        _validate_runtime_policy()
+        if __file__ != "<stdin>" or sys.argv[0] != "-":
+            raise SourceVerificationError(
+                "source-cache preparation must execute the exact Git bootstrap blob "
+                "from standard input"
+            )
+        result = prepare_source_cache(
+            repo_root=args.repo_root,
+            git_head=args.git_head,
+            account_home=args.account_home,
+        )
+        fields = (
+            result["source_archive_path"],
+            result["source_archive_sha256"],
+            result["source_snapshot_root"],
+            result["cache_status"],
+        )
+        if any(
+            not isinstance(value, str)
+            or any(character in value for character in "\r\n\t")
+            for value in fields
+        ):
+            raise SourceVerificationError(
+                "source-cache result cannot be represented as fixed launcher lines"
+            )
+    except SourceVerificationError as error:
+        print(f"verified-source cache preparation refused: {error}", file=sys.stderr)
+        return 2
+    for value in fields:
+        print(value)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["--prepare-source-cache"]:
+        return _prepare_source_cache_cli(arguments[1:])
+    args = _parser().parse_args(arguments)
     module_arguments = list(args.module_args)
     if module_arguments[:1] == ["--"]:
         module_arguments = module_arguments[1:]

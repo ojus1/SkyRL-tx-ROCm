@@ -80,11 +80,24 @@ def _fake_verified_source_contract(
     original_repo.mkdir(mode=0o700)
     run_dir = tmp_path / "run"
     run_dir.mkdir(mode=0o700)
-    snapshot = run_dir / "source-head"
+    git_head = "d" * 40
+    source_commit_root = (
+        tmp_path
+        / "account-home"
+        / ".cache"
+        / "skyrl-source-snapshots-private-v1"
+        / git_head
+    )
+    source_commit_root.mkdir(parents=True, mode=0o700)
+    for parent in source_commit_root.parents:
+        if parent == tmp_path.parent:
+            break
+        parent.chmod(0o700)
+    snapshot = source_commit_root / "source-head"
     snapshot.mkdir(mode=0o700)
     pycache = run_dir / "python-cache-empty"
     pycache.mkdir(mode=0o700)
-    archive = run_dir / "source-head.tar"
+    archive = source_commit_root / "source-head.tar"
     archive.write_bytes(b"exact private HEAD archive")
     archive.chmod(0o600)
     site_packages = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
@@ -110,7 +123,7 @@ def _fake_verified_source_contract(
     manifest: dict[str, object] = {
         "status": "passed",
         "files": list(records.values()),
-        "git_head": "d" * 40,
+        "git_head": git_head,
         "git_tree": "e" * 40,
         "git_object_format": "sha1",
         "original_repo_root": str(original_repo),
@@ -265,6 +278,23 @@ def test_source_attestation_rejects_hardlinked_archive(
     os.link(environment["SKYRL_QWEN35_SOURCE_ARCHIVE_PATH"], tmp_path / "archive-link")
 
     with pytest.raises(RuntimeError, match="singly linked"):
+        prewarm._validated_source_attestation(
+            launcher_required=True,
+            repo_root=snapshot,
+            environment=environment,
+            snapshot_validator=lambda **_kwargs: manifest,
+        )
+
+
+def test_source_attestation_rejects_archive_without_exact_private_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot, environment, manifest = _fake_verified_source_contract(
+        monkeypatch, tmp_path
+    )
+    Path(environment["SKYRL_QWEN35_SOURCE_ARCHIVE_PATH"]).chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="required exact mode"):
         prewarm._validated_source_attestation(
             launcher_required=True,
             repo_root=snapshot,
@@ -1781,9 +1811,16 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     assert 'source_blob_oid rocm/start_qwen35.sh 100755' in source
     assert 'source_blob_oid rocm/prewarm_qwen35_buckets.py 100644' in source
     assert 'source_blob_oid rocm/verified_source_bootstrap.py 100644' in source
-    assert '"${source_git[@]}" archive' in source
-    assert '--no-same-permissions' in source
-    assert 'source_snapshot="$run_dir/source-head"' in source
+    assert '--prepare-source-cache' in source
+    assert 'cat-file blob "$bootstrap_source_blob_oid" |' in source
+    assert 'skyrl-source-snapshots-private-v1' in source
+    assert 'source_commit_root="$source_cache_root/$source_git_head"' in source
+    assert 'source_snapshot="${source_cache_fields[2]}"' in source
+    bootstrap_source = (
+        _REPO / "rocm" / "verified_source_bootstrap.py"
+    ).read_text(encoding="utf-8")
+    assert '"archive", "--format=tar", before.head' in bootstrap_source
+    assert '"--no-same-permissions"' in bootstrap_source
     assert '/usr/bin/python3.12' in source
     for flag in ("-I", "-S", "-B", "-P"):
         assert f"    {flag}\n" in source
@@ -2025,8 +2062,13 @@ def test_source_archive_extraction_strips_inherited_tar_options(
 
     assert result.returncode == 0, result.stderr
     assert (destination / "tracked.txt").read_text(encoding="utf-8") == "tracked\n"
-    launcher = _LAUNCHER.read_text(encoding="utf-8")
-    assert "LC_ALL=C PATH=/usr/bin:/bin /usr/bin/tar" in launcher
+    bootstrap_source = (
+        _REPO / "rocm" / "verified_source_bootstrap.py"
+    ).read_text(encoding="utf-8")
+    assert '_TAR = "/usr/bin/tar"' in bootstrap_source
+    assert 'environment = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}' in (
+        bootstrap_source
+    )
 
 
 @pytest.mark.parametrize(

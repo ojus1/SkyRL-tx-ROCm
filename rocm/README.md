@@ -142,13 +142,20 @@ route while engine startup attestation remains unavailable.
 Every operational launcher prewarm also requires a clean Git worktree before
 the first hardware or JAX access. Fixed, sanitized Git commands bind the exact
 commit and raw launcher/bootstrap/prewarm blobs to both their Git object IDs and
-SHA-256 digests. The launcher extracts the entire tracked HEAD tree into a
-private normalized snapshot, then every ROCm helper starts through the tracked
-stdlib-only bootstrap under Python `-I -S -B -P` with an empty private bytecode
-cache prefix and an allowlisted environment. For those Python helpers and
-module imports, this prevents executable `.pth`, `sitecustomize`, user-site,
-stale bytecode, ignored import shadows, and mutable working-tree modules from
-running before the full snapshot is checked. The launcher itself necessarily
+SHA-256 digests. Source-cache preparation feeds the exact content-addressed
+bootstrap HEAD blob from sanitized Git directly to isolated Python over standard
+input; it does not reopen mutable working-tree Python by pathname. That
+stdlib-only bootstrap creates or revalidates the entire tracked HEAD tree at the
+fixed private path
+`$ACCOUNT_HOME/.cache/skyrl-source-snapshots-private-v1/$GIT_HEAD/source-head`.
+The absolute path depends on the commit, never the run ID; this preserves Python
+`__file__`/code filenames and therefore JAX executable-cache keys across fresh
+processes. Every ROCm helper then starts from that normalized snapshot under
+Python `-I -S -B -P` with an empty per-run private bytecode-cache prefix and an
+allowlisted environment. For those Python helpers and module imports, this
+prevents executable `.pth`, `sitecustomize`, user-site, stale bytecode, ignored
+import shadows, and mutable working-tree modules from running before the full
+snapshot is checked. The launcher itself necessarily
 begins as working-tree shell code; it uses `/bin/bash -p`, no pre-gate external
 path lookup, and an exact HEAD-blob check rather than claiming snapshot
 execution. A tracked regular `rocm` package plus explicit package-search and
@@ -172,12 +179,15 @@ cryptographically attested. Verified Python helper startup/execution in the
 prewarm-only path uses this isolation; this paragraph does not claim that the
 launcher, later API, or nested engine process is isolated by the same bootstrap.
 
-Archive creation/extraction and repeated full-tree Git-blob plus SHA-256
-validation deliberately spend extra startup CPU, wall time, RAM, and disk. That
-overhead has not yet been measured separately from compilation and must be
-reported before enabling this path by default; retaining both the tar archive
-and extracted snapshot also consumes roughly twice the tracked-tree bytes per
-run.
+Initial archive creation/extraction and every-launch full-tree Git-blob,
+deterministic-archive, and SHA-256 validation deliberately spend extra startup
+CPU, wall time, RAM, and disk. That overhead has not yet been measured separately
+from compilation and must be reported before enabling this path by default.
+The tar archive and extracted snapshot consume roughly twice the tracked-tree
+bytes once per retained commit, rather than once per run. Existing complete
+entries are validation-only and are never repaired or rewritten; partial,
+altered, symlinked, hardlinked, foreign-owned, or incorrectly permissioned
+entries fail closed before helper or hardware access.
 
 Backend/model construction, pinned-weight loading, LoRA parameter and Adam-state
 initialization, array placement, and the explicit `block_until_ready` may still
@@ -632,9 +642,12 @@ Its fail-closed protocol, cleanup paths, direct-script invocation, and normal
 at context 64 on ROCm 7.2.4: exactly one update completed, cleanup unloaded the
 adapter, and the device returned to idle without a fatal driver event. This
 validates the protocol and the short-context post-upgrade model path, not
-steady-state throughput. Context-2,048 execution remains blocked until Pallas
-is numerically qualified: isolated `dq`/`dk` relative-L2 error is about 1.1%,
-above the 1% promotion threshold. Exact results are in [`RESULTS.md`](RESULTS.md).
+steady-state throughput. The isolated Pallas numerical blocker is now cleared
+through context 2,048. The user-authorized gradient relative-L2 outer ceiling
+is 3%, while the guarded FP32-delta path retains and passes the stricter 1%
+regression gate: its worst observed result was dK at `0.003628` (about 0.363%).
+Context-2,048 execution still requires the separate full-model and safety gates.
+Exact results are in [`RESULTS.md`](RESULTS.md).
 
 The fixed-rollout GRPO learner harness follows the Cookbook's causal shift,
 group-mean advantage, mask-removal, `importance_sampling`, and Adam call order

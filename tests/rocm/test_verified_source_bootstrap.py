@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -105,6 +106,37 @@ def _make_venv_site(tmp_path: Path) -> Path:
     return site_packages.resolve()
 
 
+def _make_account_home(tmp_path: Path) -> Path:
+    home = tmp_path / "account-home"
+    home.mkdir(mode=0o700)
+    return home.resolve()
+
+
+def _cache_fingerprint(root: Path) -> tuple[tuple[object, ...], ...]:
+    records: list[tuple[object, ...]] = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        metadata = path.lstat()
+        payload_sha256 = (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if stat.S_ISREG(metadata.st_mode)
+            else None
+        )
+        records.append(
+            (
+                str(path.relative_to(root)),
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                payload_sha256,
+            )
+        )
+    return tuple(records)
+
+
 def _validate(
     repo: Path,
     head: str,
@@ -121,6 +153,176 @@ def _validate(
         target_module=target_module,
         require_runtime_policy=False,
     )
+
+
+def test_source_cache_paths_are_stable_per_commit_and_change_across_commits(
+    tmp_path: Path,
+) -> None:
+    home = _make_account_home(tmp_path)
+    head = "a" * 40
+
+    first_run = bootstrap.source_cache_paths(home, head)
+    second_run = bootstrap.source_cache_paths(home, head)
+    changed_commit = bootstrap.source_cache_paths(home, "b" * 40)
+
+    assert first_run == second_run
+    assert first_run.snapshot == (
+        home
+        / ".cache"
+        / "skyrl-source-snapshots-private-v1"
+        / head
+        / "source-head"
+    )
+    assert first_run.archive == first_run.snapshot.parent / "source-head.tar"
+    assert changed_commit.commit_root != first_run.commit_root
+
+
+def test_prepare_source_cache_reuses_without_mutating_stable_entry(
+    tmp_path: Path,
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    site_packages = _make_venv_site(tmp_path)
+
+    created = bootstrap.prepare_source_cache(
+        repo_root=repo, git_head=head, account_home=home
+    )
+    snapshot = Path(created["source_snapshot_root"])
+    archive = Path(created["source_archive_path"])
+    commit_root = snapshot.parent
+    before = _cache_fingerprint(commit_root)
+    expected_archive = _git(repo, "archive", "--format=tar", head)
+
+    reused = bootstrap.prepare_source_cache(
+        repo_root=repo, git_head=head, account_home=home
+    )
+    after = _cache_fingerprint(commit_root)
+
+    assert created["cache_status"] == "created"
+    assert reused["cache_status"] == "reused"
+    assert reused["source_snapshot_root"] == created["source_snapshot_root"]
+    assert reused["source_archive_path"] == created["source_archive_path"]
+    assert reused["source_archive_sha256"] == hashlib.sha256(
+        expected_archive
+    ).hexdigest()
+    assert archive.read_bytes() == expected_archive
+    assert stat.S_IMODE(commit_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(snapshot.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    assert archive.stat().st_nlink == 1
+    assert before == after
+    assert _validate(repo, head, snapshot, site_packages)["status"] == "passed"
+
+
+@pytest.mark.parametrize("present", ["snapshot", "archive"])
+def test_prepare_source_cache_rejects_partial_commit_pair(
+    tmp_path: Path, present: str
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    paths = bootstrap.source_cache_paths(home, head)
+    (home / ".cache").mkdir(mode=0o700)
+    paths.cache_root.mkdir(mode=0o700)
+    paths.commit_root.mkdir(mode=0o700)
+    if present == "snapshot":
+        paths.snapshot.mkdir(mode=0o700)
+    else:
+        paths.archive.write_bytes(b"partial archive")
+        paths.archive.chmod(0o600)
+
+    with pytest.raises(
+        bootstrap.SourceVerificationError,
+        match="must contain exactly source-head",
+    ):
+        bootstrap.prepare_source_cache(
+            repo_root=repo, git_head=head, account_home=home
+        )
+
+
+@pytest.mark.parametrize(
+    ("condition", "message"),
+    [
+        ("archive_mode", "mode mismatch"),
+        ("archive_hardlink", "must not be hardlinked"),
+        ("archive_symlink", "cannot safely open"),
+        ("snapshot_mode", "mode must be 0700"),
+        ("extra_entry", "must contain exactly source-head"),
+        ("mutated_file", "does not equal HEAD blob"),
+    ],
+)
+def test_prepare_source_cache_rejects_unsafe_or_changed_reuse(
+    tmp_path: Path, condition: str, message: str
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    result = bootstrap.prepare_source_cache(
+        repo_root=repo, git_head=head, account_home=home
+    )
+    snapshot = Path(result["source_snapshot_root"])
+    archive = Path(result["source_archive_path"])
+    commit_root = snapshot.parent
+    if condition == "archive_mode":
+        archive.chmod(0o644)
+    elif condition == "archive_hardlink":
+        os.link(archive, tmp_path / "archive-hardlink")
+    elif condition == "archive_symlink":
+        archive_copy = tmp_path / "archive-copy"
+        archive_copy.write_bytes(archive.read_bytes())
+        archive.unlink()
+        archive.symlink_to(archive_copy)
+    elif condition == "snapshot_mode":
+        snapshot.chmod(0o755)
+    elif condition == "extra_entry":
+        _write(commit_root / "unexpected", b"unexpected\n", 0o600)
+    elif condition == "mutated_file":
+        _write(snapshot / "nested" / "data.bin", b"mutated\n", 0o600)
+    else:  # pragma: no cover - exhaustive parametrization guard
+        raise AssertionError(condition)
+
+    with pytest.raises(bootstrap.SourceVerificationError, match=message):
+        bootstrap.prepare_source_cache(
+            repo_root=repo, git_head=head, account_home=home
+        )
+
+
+def test_prepare_source_cache_rejects_symlinked_or_public_cache_parent(
+    tmp_path: Path,
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    external = tmp_path / "external-cache"
+    external.mkdir(mode=0o700)
+    (home / ".cache").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(bootstrap.SourceVerificationError, match="non-symlink"):
+        bootstrap.prepare_source_cache(
+            repo_root=repo, git_head=head, account_home=home
+        )
+
+    (home / ".cache").unlink()
+    (home / ".cache").mkdir(mode=0o755)
+    with pytest.raises(bootstrap.SourceVerificationError, match="mode must be 0700"):
+        bootstrap.prepare_source_cache(
+            repo_root=repo, git_head=head, account_home=home
+        )
+
+
+def test_prepare_source_cache_rejects_mutated_archive_against_fresh_git_output(
+    tmp_path: Path,
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    result = bootstrap.prepare_source_cache(
+        repo_root=repo, git_head=head, account_home=home
+    )
+    archive = Path(result["source_archive_path"])
+    archive.write_bytes(archive.read_bytes() + b"mutated")
+    archive.chmod(0o600)
+
+    with pytest.raises(bootstrap.SourceVerificationError, match="fixed Git archive"):
+        bootstrap.prepare_source_cache(
+            repo_root=repo, git_head=head, account_home=home
+        )
 
 
 def test_full_tree_snapshot_manifest_is_exact_and_deterministic(tmp_path: Path) -> None:
@@ -469,6 +671,141 @@ def test_venv_site_packages_must_be_absolute_canonical_venv_layout(
         path.mkdir()
     with pytest.raises(bootstrap.SourceVerificationError, match="absolute|canonical"):
         bootstrap._validate_venv_site_packages(path)
+
+
+def _source_cache_cli_command(
+    repo: Path, head: str, home: Path, pycache: Path
+) -> list[str]:
+    return [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        "-P",
+        "-X",
+        f"pycache_prefix={pycache}",
+        "-",
+        "--prepare-source-cache",
+        "--repo-root",
+        str(repo),
+        "--git-head",
+        head,
+        "--account-home",
+        str(home),
+    ]
+
+
+def _source_cache_cli_input(repo: Path, head: str) -> str:
+    return _git(
+        repo, "show", f"{head}:rocm/verified_source_bootstrap.py"
+    ).decode("utf-8")
+
+
+def test_source_cache_cli_keeps_target_filename_stable_across_run_directories(
+    tmp_path: Path,
+) -> None:
+    target_source = b"""\
+def source_location():
+    return __file__, source_location.__code__.co_filename
+"""
+    repo, head = _make_repo(tmp_path, target_source=target_source)
+    home = _make_account_home(tmp_path)
+    pycache_one = tmp_path / "run-one" / "python-cache-empty"
+    pycache_two = tmp_path / "run-two" / "python-cache-empty"
+    pycache_one.mkdir(parents=True, mode=0o700)
+    pycache_two.mkdir(parents=True, mode=0o700)
+    pycache_one.parent.chmod(0o700)
+    pycache_two.parent.chmod(0o700)
+
+    first = subprocess.run(
+        _source_cache_cli_command(repo, head, home, pycache_one),
+        input=_source_cache_cli_input(repo, head),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    second = subprocess.run(
+        _source_cache_cli_command(repo, head, home, pycache_two),
+        input=_source_cache_cli_input(repo, head),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert first.stderr == second.stderr == ""
+    first_fields = first.stdout.splitlines()
+    second_fields = second.stdout.splitlines()
+    assert len(first_fields) == len(second_fields) == 4
+    assert first_fields[:3] == second_fields[:3]
+    assert first_fields[3] == "created"
+    assert second_fields[3] == "reused"
+
+    target = Path(first_fields[2]) / "rocm" / "amdgpu_safety.py"
+    inspect_code = (
+        "import json,runpy,sys; namespace=runpy.run_path(sys.argv[1]); "
+        "print(json.dumps(namespace['source_location']()))"
+    )
+    locations = []
+    for pycache in (pycache_one, pycache_two):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-B",
+                "-P",
+                "-X",
+                f"pycache_prefix={pycache}",
+                "-c",
+                inspect_code,
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        locations.append(json.loads(result.stdout))
+    assert locations == [[str(target), str(target)], [str(target), str(target)]]
+
+
+def test_source_cache_cli_requires_isolation_and_exact_git_blob_stdin(
+    tmp_path: Path,
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    pycache = tmp_path / "python-cache-empty"
+    pycache.mkdir(mode=0o700)
+    command = _source_cache_cli_command(repo, head, home, pycache)
+    command.remove("-I")
+
+    unisolated = subprocess.run(
+        command,
+        input=_source_cache_cli_input(repo, head),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert unisolated.returncode == 2
+    assert "requires python -I -S -B -P" in unisolated.stderr
+
+    path_command = _source_cache_cli_command(repo, head, home, pycache)
+    path_command[7] = str(repo / "rocm" / "verified_source_bootstrap.py")
+    wrong_source_mode = subprocess.run(
+        path_command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert wrong_source_mode.returncode == 2
+    assert "exact Git bootstrap blob from standard input" in wrong_source_mode.stderr
 
 
 def _integration_fixture(tmp_path: Path) -> dict[str, Path | str]:

@@ -367,15 +367,56 @@ if [[ -n "$prewarm_buckets" ]]; then
     exit 2
   fi
 
-  source_archive="$run_dir/source-head.tar"
-  source_snapshot="$run_dir/source-head"
   source_pycache_prefix="$run_dir/python-cache-empty"
-  /usr/bin/mkdir -m 700 "$source_snapshot" "$source_pycache_prefix"
-  if ! "${source_git[@]}" archive \
-      --format=tar \
-      --output="$source_archive" \
-      "$source_git_head"; then
-    echo "refusing prewarm because the exact HEAD source archive could not be created" >&2
+  /usr/bin/mkdir -m 700 "$source_pycache_prefix"
+  if ! source_cache_record="$(
+    "${source_git[@]}" cat-file blob "$bootstrap_source_blob_oid" |
+      /usr/bin/env -i \
+        HOME="$source_account_home" \
+        LC_ALL=C \
+        PATH=/usr/bin:/bin \
+        /usr/bin/python3.12 -I -S -B -P \
+          -X "pycache_prefix=$source_pycache_prefix" \
+          - \
+          --prepare-source-cache \
+          --repo-root "$repo" \
+          --git-head "$source_git_head" \
+          --account-home "$source_account_home"
+  )"; then
+    echo "refusing prewarm because the private commit-keyed source cache could not be prepared" >&2
+    exit 2
+  fi
+  mapfile -t source_cache_fields <<<"$source_cache_record"
+  if ((${#source_cache_fields[@]} != 4)); then
+    echo "refusing prewarm because source-cache preparation returned malformed output" >&2
+    exit 2
+  fi
+  source_archive="${source_cache_fields[0]}"
+  source_archive_sha256="${source_cache_fields[1]}"
+  source_snapshot="${source_cache_fields[2]}"
+  source_cache_status="${source_cache_fields[3]}"
+  source_cache_root="$source_account_home/.cache/skyrl-source-snapshots-private-v1"
+  source_commit_root="$source_cache_root/$source_git_head"
+  case "$source_cache_status" in
+    created|reused) ;;
+    *)
+      echo "refusing prewarm because source-cache preparation returned an invalid status" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$source_archive" != "$source_commit_root/source-head.tar" \
+    || "$source_snapshot" != "$source_commit_root/source-head" \
+    || ! "$source_archive_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing prewarm because source-cache preparation escaped the exact commit key" >&2
+    exit 2
+  fi
+  if [[ "$(/usr/bin/stat -c '%u:%a:%F' -- "$source_cache_root")" \
+      != "$UID:700:directory" \
+    || "$(/usr/bin/stat -c '%u:%a:%F' -- "$source_commit_root")" \
+      != "$UID:700:directory" \
+    || "$(/usr/bin/stat -c '%u:%a:%F' -- "$source_snapshot")" \
+      != "$UID:700:directory" ]]; then
+    echo "refusing prewarm because the commit-keyed source-cache directories are not private" >&2
     exit 2
   fi
   if [[ "$(/usr/bin/stat -c '%u:%h:%a:%F' -- "$source_archive")" \
@@ -383,17 +424,9 @@ if [[ -n "$prewarm_buckets" ]]; then
     echo "refusing prewarm because the source archive is not a private regular file" >&2
     exit 2
   fi
-  if ! source_archive_sha256="$(source_sha256 "$source_archive")"; then
+  if ! observed_source_archive_sha256="$(source_sha256 "$source_archive")" \
+    || [[ "$observed_source_archive_sha256" != "$source_archive_sha256" ]]; then
     echo "refusing prewarm because the source archive could not be hashed" >&2
-    exit 2
-  fi
-  if ! /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /usr/bin/tar \
-      --extract \
-      --no-same-owner \
-      --no-same-permissions \
-      --file="$source_archive" \
-      --directory="$source_snapshot"; then
-    echo "refusing prewarm because the exact HEAD source archive could not be extracted" >&2
     exit 2
   fi
   if ! snapshot_prewarm_sha256="$(source_sha256 "$source_snapshot/rocm/prewarm_qwen35_buckets.py")" \

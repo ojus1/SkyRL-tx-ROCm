@@ -99,7 +99,11 @@ def _utc_now() -> str:
 
 
 def _stable_regular_file_bytes(
-    path: Path, label: str, *, require_private_writes: bool
+    path: Path,
+    label: str,
+    *,
+    require_private_writes: bool,
+    exact_mode: int | None = None,
 ) -> tuple[Path, bytes]:
     """Read one stable inode through O_NOFOLLOW and recheck its path endpoint."""
     if not path.is_absolute():
@@ -134,10 +138,15 @@ def _stable_regular_file_bytes(
                     require_private_writes
                     and stat.S_IMODE(before.st_mode) & 0o022
                 )
+                or (
+                    exact_mode is not None
+                    and stat.S_IMODE(before.st_mode) != exact_mode
+                )
             ):
                 raise RuntimeError(
                     f"{label} must be a stable regular file owned by the current "
-                    "user, singly linked, and not writable by group or other"
+                    "user, singly linked, not writable by group or other, and "
+                    "have the required exact mode"
                 )
             chunks: list[bytes] = []
             while chunk := os.read(descriptor, 1024 * 1024):
@@ -190,7 +199,7 @@ def _best_effort_self_hash() -> dict[str, Any]:
 
 def _validated_source_file(path: Path, label: str) -> tuple[Path, str]:
     resolved, payload = _stable_regular_file_bytes(
-        path, label, require_private_writes=True
+        path, label, require_private_writes=True, exact_mode=0o600
     )
     return resolved, hashlib.sha256(payload).hexdigest()
 
@@ -267,7 +276,9 @@ def _validated_source_attestation(
     archive_path = Path(observed["SKYRL_QWEN35_SOURCE_ARCHIVE_PATH"])
     expected_archive_path = snapshot_root.parent / "source-head.tar"
     if archive_path != expected_archive_path:
-        raise RuntimeError("source archive path does not match the private run snapshot")
+        raise RuntimeError(
+            "source archive path does not match the private commit snapshot"
+        )
     _archive_path, archive_sha256 = _validated_source_file(
         archive_path, "source archive"
     )
