@@ -3,7 +3,8 @@
 This is the first GDN math rung after the typed-FFI stream/lifetime smoke. It
 prepares WY tensors for exactly one Qwen3.5-4B 512-token superblock; it does not
 execute the recurrent state transition, implement reverse mode, or select a
-model path.
+model path. The separately qualified exact forward transition is documented in
+[GDN_EXECUTE_S512.md](GDN_EXECUTE_S512.md).
 
 The fixed FP32 ABI is:
 

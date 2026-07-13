@@ -88,6 +88,29 @@ isolated `dq`/`dk` relative-L2 errors remain about 1.1%, above the 1% threshold.
 Neither compile success nor bounded autotuning qualifies that attention
 implementation for training.
 
+### Exact S512 GDN execute forward gate
+
+Revision `4c9e7877` qualified exactly one standalone typed-FFI forward
+invocation for the S512 GDN recurrent execute stage. After backend compilation
+and input placement, the one checked candidate took 8.414 ms including its
+output readiness barrier. BF16 output relative-L2/cosine/max-absolute error was
+`2.33682e-5` / `0.999999999727` / `9.53674e-7`; the FP32 final-state result was
+`1.23831e-7` / `0.999999999999972` / `1.16415e-9`.
+
+The guarded process performed exactly one capability release, tuple device
+put, executable invocation, output barrier, and tuple device get. It performed
+no warmup, replay, graph, backward, model, device-reference, or reduction call;
+VJP was not exercised. Peak observed junction temperature, power, and physical
+VRAM were 50 C, 129 W, and 779,153,408 bytes, swap stayed zero, and KFD/VRAM
+returned to the exact idle state with a clean current-boot journal.
+
+This is forward correctness and first-candidate latency evidence, not repeated
+throughput or an end-to-end model speedup. Reverse mode, composed
+prepare/execute, model integration, and other shapes remain pending. Exact
+kernel design, build metadata, compiler evidence, artifact hashes, and scope
+are recorded in
+[GDN_EXECUTE_S512.md](../skyrl/tx/kernels/rocm/ffi/GDN_EXECUTE_S512.md).
+
 ### Post-upgrade exact-one-update hardware gate
 
 Pushed revision `8437dd7739f16ca0c42832cbbca9858f3ced7875` completed the
