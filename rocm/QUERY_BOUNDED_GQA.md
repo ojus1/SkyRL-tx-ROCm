@@ -1007,7 +1007,57 @@ the adjacent 831/833 cases or the sparse-tail 1023 case by inference. It also
 does not promote replay, backward, model integration, SFT, GRPO, or a latency
 distribution. Do not replay this evidence run.
 
-Each remaining case requires a separate command of this form. This is a
+### ROCm 7.2.4 valid1023 result
+
+The independently audited sparse-tail case completed the representative
+T=1024 padding set. Its sole checked candidate dispatch took
+`6.717939999361988 ms`. Aggregate relative L2 was
+`0.002357124273085711`, cosine was `0.9999972220097876`, maximum absolute
+error was `0.00022630393505096436`, and the BF16 output SHA-256 was
+`fada55808cdae5bde39fa880c6167cf759cb1adcb57f9f10510ccf33c5a7ed0b`.
+
+Every row passed. Worst row relative L2 was `0.002421573826163298` and
+minimum row cosine was `0.999997067986625`, both at global query position
+798. The last unaffected row 1022 and sole affected row 1023 had relative L2
+values `0.0023482972258565445` and `0.0023616417038183424`, respectively.
+
+The wrong-all-valid control demonstrates why the row-local gate is required.
+Its informational whole-output relative L2 was only
+`0.001954453236659332`, but the sole affected row and first affected row were
+the same row and had relative L2 `0.03331218934435959`, decisively above the
+0.02 sensitivity threshold. The preceding row 1022 was exactly unchanged.
+
+Both IR dialects retained one sole q768 ROCm Triton call, no outer `while`,
+and exact canonical parsed/raw 768/256 metadata. Compiler memory was
+6,295,552 argument bytes, 2,097,152 output bytes, 16,640 temporary bytes, and
+zero alias bytes. Final accounting recorded exactly one lower, compile, tuple
+placement, checked invocation, and retrieval, with zero warmup, replay,
+lowered-callable invocation, backward call, accelerator reference/reduction,
+model call, or multi-case execution.
+
+The profiler returned zero with no signal. Across 409 measured samples, peak
+physical VRAM was `745213952` bytes, peak junction temperature was `51 C`,
+peak board power was `130 W`, minimum host-available memory was
+`60013723648` bytes, and swap remained zero. All eight child journal
+checkpoints and child preflight/postflight were clean.
+
+The mode-`0600` evidence artifacts and SHA-256 values are:
+
+- `/tmp/query-bounded-gqa-c256-t1024-valid1023.jsonl`:
+  `46fcc247e1cb8c284d6555e60ed37b403dd237f2bffe4a83e4c43ee916ba764f`;
+- `/tmp/query-bounded-gqa-c256-t1024-valid1023.telemetry.jsonl`:
+  `1fbbc7d2ad3744e277d2224fbdab4b3e0ed37158deba8c6e3607f57031b95a1d`;
+- `/tmp/query-bounded-gqa-c256-t1024-valid1023.telemetry.jsonl.summary.json`:
+  `4a0f2fc71ecbbea676d317666f3beec5d899ad26da9230a1324f267ba0f28922`.
+
+Together, `valid769`, `valid832`, and `valid1023` cover the core
+representative padding transitions immediately after the first final-chunk
+query, exactly on a 64-key tile boundary, and at a single-token sparse tail.
+This does not promote the enumerated `valid768`, `valid831`, or `valid833`
+cases individually, nor replay, backward, model integration, SFT, GRPO, or a
+latency distribution. Do not replay this evidence run.
+
+Each unpromoted case requires a separate command of this form. This is a
 pending `valid768` template, not evidence that it ran:
 
 ```bash
@@ -1028,9 +1078,10 @@ pending `valid768` template, not evidence that it ran:
        --output /tmp/query-bounded-gqa-c256-t1024-valid768.jsonl
 ```
 
-No other case is promoted by this result. Every remaining private child
-artifact and profiler telemetry must be independently audited before advancing
-again or proceeding to backward/model integration.
+No unrun case is promoted by these results. Every future private child artifact
+and profiler telemetry must be independently audited before advancing that
+case. The representative T=1024 padding gate is complete; backward and model
+integration remain separate gates.
 
 ## GPU promotion gates
 
