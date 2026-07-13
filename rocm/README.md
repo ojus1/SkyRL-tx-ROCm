@@ -160,12 +160,13 @@ those exact values. Running
 `python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
 CPU-only plan and never imports JAX.
 
-The exact cold T64-plus-Adam direct-tool population and one matched compile-only
-cache-hit process described below are now hardware-qualified. The multi-bucket
-path, launcher-to-API transition, additional/repeated hits, and actual warmup
-remain unqualified. The launcher examples above provide the required telemetry,
-headless-display, exclusive-KFD, fatal-journal, and cleanup gates; any direct
-tool invocation still requires equivalent external supervision. The API's
+The exact cold T64-plus-Adam direct-tool population/hit pair and the supervised
+T512 Pallas population/hit pair described below are now hardware-qualified. The
+multi-bucket path, launcher-to-API transition, additional/repeated hits, and
+actual warmup remain unqualified. The launcher examples above provide the
+required telemetry, headless-display, exclusive-KFD, fatal-journal, and cleanup
+gates; any direct tool invocation still requires equivalent external
+supervision. The API's
 current health endpoint does not prove that the nested engine has finished
 loading, inherited the intended cache policy, or consumed a particular cached
 executable. Therefore prewarm remains default-off until an engine readiness and
@@ -342,6 +343,113 @@ not establish repeatability, steady-state training throughput, optimizer-update
 speed, sampler performance, another bucket, actual warmup safety, or a runtime
 VRAM gain. No additional hit, warmup, or compiled-call invocation is authorized
 by this result.
+
+### ROCm 7.2.4 T512 Pallas population and matched cache-hit result
+
+Two distinct supervised prewarm runs, correlated to commit
+`ab962c799caf09bd85b7454cca46413d6deb88c3` but not directly Git-attested by
+their artifacts, qualified the next training bucket on boot
+`54ccf56c-5f4f-4ef7-ac98-c13e0587b5b9`. Both used growth/eager model
+construction, batch one, rank-8 LoRA, 64-token loss chunks, Pallas attention,
+the exact sole `XLA_FLAGS=--xla_gpu_enable_command_buffer=`, and the optional
+Adam compile under a 7,200-second watchdog. Operationally,
+`SKYRL_QWEN35_PREWARM_ONLY=1` ran completed telemetry supervision plus the
+reap/settle, identity, and final-journal gates and exited before the API. The
+launcher mode and command are not embedded; this pre-API exit is reconstructed
+from the artifact set and byte-matching launcher. No compiled model pass or
+optimizer step was invoked.
+
+This was not a fully cold T512-plus-Adam pair. The fixed trusted namespace
+already contained 187 entries totaling 5,594,715 bytes from the qualified
+T64-plus-Adam work, including the sequence-independent Adam executable. The
+first process therefore truthfully produced one strict T512 miss and one strict
+Adam hit. The T512 request added exactly one 5,969,258-byte executable and no
+change or removal. Its filename is
+`jit_forward_backward_and_accumulate-1caaece3bcfd971ef407426aa8e52a1d135776a45776ad3bef8c1f2f852fb5b6-cache`
+and the still-present file currently has SHA-256
+`ac7a95686357008047971717f68cd5dcb95b10bb08348b0a4ff18867559524c8`.
+The resulting 188-entry namespace totaled 11,563,973 bytes with manifest
+SHA-256 `a6847015bd5aee2a23d5f4da26cd511c773dffc9a950b4949188350aa2a65904`.
+The content hash was measured after the run; the embedded manifest binds sorted
+filename, size, and mtime tuples rather than executable content bytes.
+
+T512 lowered in `6.939800 s` and compiled in `93.328001 s`. Compiler memory
+analysis reported 8,549,574,972 argument bytes, 69,032,112 output bytes,
+2,940,601,600 temporary bytes, and 69,025,800 alias bytes. The existing Adam
+hit lowered in `2.808095 s` and compiled in `1.738305 s`; its public callback
+reported `14.359669 s` saved and `1.640331 s` retrieval. Backend/model setup took
+`32.287817 s`.
+
+The matched second process accepted one strict hit for each target: exactly one
+cache request and hit, zero misses, one finite nonnegative saved-time and
+retrieval-time value, no schema issue, and no executable-cache addition,
+change, or removal. Entry count, byte count, and manifest remained exact. The
+paired target results were:
+
+| Target | First process | Matched hit | Reduction | Speedup |
+|---|---:|---:|---:|---:|
+| T512 forward/backward/accumulate compile | `93.328001 s` | `5.617719 s` | `93.98%` | `16.61x` |
+| Existing Adam-hit compile | `1.738305 s` | `1.609458 s` | `7.41%` | `1.08x` |
+| Combined target compile | `95.066305 s` | `7.227177 s` | `92.40%` | `13.15x` |
+| Both targets including lowering | `104.814200 s` | `16.931410 s` | `83.85%` | `6.19x` |
+| Entire profiled child | `169.407536 s` | `80.572651 s` | `52.44%` | `2.10x` |
+
+Only T512 is a miss-to-hit comparison. Adam is hit-to-hit variation;
+consequently, the combined rows blend that variation with the T512 cache effect
+and are descriptive paired-process reductions, not independent Adam cache-gain
+measurements.
+
+JAX separately reported `84.490213 s` saved with `5.509787 s` retrieval for
+T512, and `14.484431 s` saved with `1.515569 s` retrieval for Adam. These
+process-level callbacks do not name a module or key and use different internal
+accounting from paired wall time. T512 argument, output, temporary, and alias
+memory fields matched across processes; the deserialized handle reported a
+16-byte larger generated-code field. Backend setup was also effectively flat
+at `32.486707 s` in the hit process.
+
+The first/hit profiler maxima were respectively 18,151,886,848 and
+17,901,137,920 bytes VRAM, 6,114,643,968 and 4,372,545,536 bytes command-tree RSS,
+69/64 C junction temperature, 199/192 W board power, and zero swap. Thus the hit
+observed 0.234 GiB lower peak VRAM, 1.622 GiB lower peak RSS, and 98.40% fewer
+command-tree write bytes. These are compile-startup observations, not
+steady-state training-memory gains. Each post-child handoff independently
+returned in about 8.8 seconds to the exact 27,947,008-byte VRAM and
+15,966,208-byte GTT baselines with the same PCI/DRM/KFD identity, KFD and render
+unowned, runtime suspended, and a clean journal.
+
+The private mode-`0600` artifacts under mode-`0700` run directories are:
+
+- population child, handoff, telemetry, and summary:
+  `425624d66934a3389b925066ad790b06066c929f86222778253fd10bec111ddb`,
+  `2ddbed0165ac44668653d9db92b19444787ff5a266146f34dcbcf74c1c794bf8`,
+  `fbec617df8cbc2129dde84ee8efabb5a51d6f770c07177bece1242a97316e468`,
+  and `768eb6d9b7285338eb41250cea1fa99743853ca3e026576b7709a7574cb0735e`
+  under `/tmp/skyrl-qwen35-runs/t512-adam-populate-ab962c79-r1`;
+- matched-hit child, handoff, telemetry, and summary:
+  `7c216e1956b2b58c45c9e5077d45b0b0dea4ff55bbdfd2a7ed1a10259f0d327e`,
+  `7937510fe199b3df039f4cb46d12044c8bad7112909046e1d9968d4a20712d42`,
+  `a40902933b6a7d50e6fe436978cbc054b36a0d854c6c47758c30ed4d6da45d64`,
+  and `d017fcf0525361a9a29097ca3ecc8e7432718e334048f443fb4ed6cf61f8715a`
+  under `/tmp/skyrl-qwen35-runs/t512-adam-hit-ab962c79-r1`.
+
+Both telemetry manifests embed and exactly match profiler SHA-256
+`ed230758101a2a540b3a09e7f84ac92256d2bb41c70dbc399b9466fe0b979684`;
+both handoff baselines embed and exactly match helper SHA-256
+`4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392`.
+The child schema still does not embed the prewarm-tool, launcher, or Git hashes.
+Their correlation to commit `ab962c79` is reconstructed from current runtime
+source bytes matching HEAD, observed pre/post-run Git checks, commit/run
+timestamps, and run-directory names rather than direct runtime attestation.
+The prewarm tool and launcher currently match SHA-256
+`0ce082bbed81ee9013cae036c0619c3e2de5d15b0ed1efce5fcc7958fb303d7c`
+and `118d1ed67a1dd3662d2b43aad86e28ef0bba73d141e07e51ef3a1b0540fcb8f0`;
+the README is the sole tracked modification. Those external checks are not
+embedded proof that the worktree stayed clean during execution.
+
+This qualifies one cold T512 cache population and one matched compile-only hit;
+it is not a repeated-sample timing distribution. It does not prove per-key
+callback attribution, execute T512 training, establish steady-state throughput
+or memory, validate an engine transition, or authorize graph capture/replay.
 
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for
