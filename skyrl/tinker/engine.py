@@ -4,6 +4,9 @@
 # ruff: noqa: E402
 
 import argparse
+import os
+import signal
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -35,6 +38,8 @@ from skyrl.tinker.config import EngineConfig, add_model
 from skyrl.tinker.db_models import (
     CheckpointDB,
     CheckpointStatus,
+    EngineLaunchDB,
+    EngineLaunchStatus,
     EngineStateDB,
     FutureDB,
     ModelDB,
@@ -42,7 +47,23 @@ from skyrl.tinker.db_models import (
     SessionDB,
     enable_sqlite_wal,
 )
+from skyrl.tinker.engine_startup import (
+    ProcessIdentity,
+    process_identity_is_live,
+    read_process_identity,
+    validate_engine_claim_record,
+    validate_engine_launch_id,
+    validate_initializing_engine_launch,
+)
 from skyrl.utils.log import logger
+
+_ENGINE_FAILURE_IN_PROGRESS = threading.Event()
+_ENGINE_WATCHDOG_INTERVAL_SECONDS = 1.0
+_ENGINE_WATCHDOG_DB_FAILURE_GRACE_SECONDS = 4.0
+
+
+class _EngineLaunchRowLost(RuntimeError):
+    """The watchdog's exact launch row left its live states."""
 
 
 def _model_not_found_error(model_id: str) -> types.ErrorResponse:
@@ -287,12 +308,36 @@ class TinkerEngine:
         )
         self.db_engine = create_engine(config.database_url, echo=False)
         enable_sqlite_wal(self.db_engine)
+        self.engine_launch_identity: ProcessIdentity | None = None
+        self.engine_launcher_identity: ProcessIdentity | None = None
+        self.api_launch_identity: ProcessIdentity | None = None
+        self.runtime_handoff_attestation: dict[str, object] = {}
+        self._next_api_identity_check = 0.0
+        self._engine_watchdog_stop = threading.Event()
+        self._engine_watchdog_wake = threading.Event()
+        self._engine_watchdog_probe_request = threading.Event()
+        self._engine_watchdog_probe_ack = threading.Event()
+        self._engine_watchdog_thread: threading.Thread | None = None
+        self._engine_watchdog_db_engine = None
+        use_ray = config.backend_config.get("use_ray", False)
+        start_watchdog_before_backend = config.backend == "jax" and not use_ray
+        if config.startup_launch_id is not None:
+            self._claim_engine_launch()
+            if start_watchdog_before_backend:
+                # The qualified single-process JAX backend does not fork.
+                # Supervise its potentially long model construction directly.
+                self._start_engine_launch_watchdog()
 
         # Initialize the backend (handles model state, computation, and adapter management)
-        use_ray = config.backend_config.get("use_ray", False)
         backend_class, backend_config_class = get_backend_classes(config.backend, use_ray=use_ray)
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
+        if config.startup_launch_id is not None:
+            if self._engine_watchdog_thread is None:
+                # Forking/Ray backends must finish their process construction
+                # while the parent remains single-threaded.
+                self._start_engine_launch_watchdog()
+            self._require_engine_watchdog_acknowledgement("post-backend")
 
         # Backends that support async sample routing notify us when their
         # inference endpoint changes; we persist it to EngineStateDB so the
@@ -305,6 +350,316 @@ class TinkerEngine:
         self._last_cleanup_time: float = time.time()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+    def _claim_engine_launch(self) -> None:
+        """Bind this Python child to the API-created STARTING launch row."""
+        launch_id = validate_engine_launch_id(self.config.startup_launch_id or "")
+        engine_identity = read_process_identity()
+        parent_identity = read_process_identity(os.getppid())
+        deadline = time.monotonic() + min(
+            float(self.config.engine_startup_timeout_sec), 30.0
+        )
+        last_wait_reason = "engine launch row is unavailable"
+        while time.monotonic() < deadline:
+            with Session(self.db_engine) as session:
+                record = session.get(EngineLaunchDB, launch_id)
+                if record is None:
+                    last_wait_reason = "engine launch row is unavailable"
+                elif (
+                    record.engine_launcher_pid is None
+                    or record.engine_launcher_start_ticks is None
+                ):
+                    last_wait_reason = "API has not bound the uv launcher identity"
+                else:
+                    handoff = validate_engine_claim_record(
+                        record,
+                        launch_id=launch_id,
+                        backend=self.config.backend,
+                        engine_identity=engine_identity,
+                        parent_identity=parent_identity,
+                        engine_source_attestation=self.runtime_source_attestation,
+                        engine_lock_attestation=self.runtime_launch_lock_attestation,
+                    )
+                    statement = (
+                        update(EngineLaunchDB)
+                        .where(
+                            EngineLaunchDB.launch_id == launch_id,
+                            EngineLaunchDB.status == EngineLaunchStatus.STARTING,
+                            EngineLaunchDB.backend == self.config.backend,
+                            EngineLaunchDB.boot_id == engine_identity.boot_id,
+                            EngineLaunchDB.api_pid == record.api_pid,
+                            EngineLaunchDB.api_start_ticks
+                            == record.api_start_ticks,
+                            EngineLaunchDB.engine_launcher_pid
+                            == record.engine_launcher_pid,
+                            EngineLaunchDB.engine_launcher_start_ticks
+                            == record.engine_launcher_start_ticks,
+                            EngineLaunchDB.engine_pid.is_(None),
+                            EngineLaunchDB.engine_start_ticks.is_(None),
+                        )
+                        .values(
+                            status=EngineLaunchStatus.INITIALIZING,
+                            engine_pid=engine_identity.pid,
+                            engine_start_ticks=engine_identity.start_ticks,
+                            engine_source_attestation=self.runtime_source_attestation,
+                            engine_launch_lock_attestation=(
+                                self.runtime_launch_lock_attestation
+                            ),
+                            runtime_handoff_attestation=handoff,
+                            heartbeat_at=datetime.now(timezone.utc),
+                            heartbeat_monotonic_ns=time.monotonic_ns(),
+                            heartbeat_sequence=1,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    result = session.exec(statement)
+                    if result.rowcount != 1:
+                        raise RuntimeError(
+                            "engine launch claim lost its conditional update race"
+                        )
+                    proxy_state = session.get(EngineStateDB, 1)
+                    if proxy_state is not None:
+                        proxy_state.inference_proxy_url = None
+                        proxy_state.updated_at = datetime.now(timezone.utc)
+                        session.add(proxy_state)
+                    session.commit()
+                    self.engine_launch_identity = engine_identity
+                    self.engine_launcher_identity = ProcessIdentity(
+                        pid=record.engine_launcher_pid,
+                        start_ticks=record.engine_launcher_start_ticks,
+                        boot_id=record.boot_id,
+                        state="?",
+                    )
+                    self.api_launch_identity = ProcessIdentity(
+                        pid=record.api_pid,
+                        start_ticks=record.api_start_ticks,
+                        boot_id=record.boot_id,
+                        state="?",
+                    )
+                    self.runtime_handoff_attestation = handoff
+                    self._next_api_identity_check = time.monotonic() + 1.0
+                    logger.info(
+                        "Claimed engine launch %s with engine PID %d",
+                        launch_id,
+                        engine_identity.pid,
+                    )
+                    return
+            time.sleep(0.05)
+        raise RuntimeError(
+            "timed out waiting to claim API-created engine launch row: "
+            + last_wait_reason
+        )
+
+    def _start_engine_launch_watchdog(self) -> None:
+        """Heartbeat readiness and terminate if the supervising tree vanishes."""
+        if (
+            self.config.startup_launch_id is None
+            or self.engine_launch_identity is None
+            or self.engine_launcher_identity is None
+            or self.api_launch_identity is None
+        ):
+            raise RuntimeError("cannot start engine watchdog before launch claim")
+        if self._engine_watchdog_thread is not None:
+            raise RuntimeError("engine launch watchdog was already started")
+        self._engine_watchdog_db_engine = create_engine(
+            self.config.database_url, echo=False
+        )
+        enable_sqlite_wal(
+            self._engine_watchdog_db_engine, busy_timeout_ms=1_000
+        )
+        watchdog = threading.Thread(
+            target=self._engine_launch_watchdog,
+            name="skyrl-engine-launch-watchdog",
+            daemon=True,
+        )
+        self._engine_watchdog_thread = watchdog
+        watchdog.start()
+        self._require_engine_watchdog_acknowledgement("startup")
+
+    def _require_engine_watchdog_acknowledgement(self, phase: str) -> None:
+        """Require a new identity-bound heartbeat after an explicit probe."""
+        watchdog = self._engine_watchdog_thread
+        if watchdog is None or not watchdog.is_alive():
+            raise RuntimeError(f"engine launch watchdog is absent during {phase}")
+        self._engine_watchdog_probe_ack.clear()
+        self._engine_watchdog_probe_request.set()
+        self._engine_watchdog_wake.set()
+        if not self._engine_watchdog_probe_ack.wait(timeout=5.0):
+            raise RuntimeError(
+                f"engine launch watchdog did not acknowledge the {phase} probe"
+            )
+
+    def _engine_launch_watchdog(self) -> None:
+        """Run independently of long backend construction and GPU operations."""
+        assert self.config.startup_launch_id is not None
+        assert self.engine_launch_identity is not None
+        assert self.engine_launcher_identity is not None
+        assert self.api_launch_identity is not None
+        launch_id = self.config.startup_launch_id
+        identities = (
+            self.api_launch_identity,
+            self.engine_launcher_identity,
+            self.engine_launch_identity,
+        )
+        last_successful_heartbeat = time.monotonic()
+        while not self._engine_watchdog_stop.is_set() and (
+            not _ENGINE_FAILURE_IN_PROGRESS.is_set()
+        ):
+            database_operation_started = False
+            try:
+                if not all(process_identity_is_live(identity) for identity in identities):
+                    raise RuntimeError("supervising process identity disappeared")
+                if os.getpgid(self.engine_launcher_identity.pid) != (
+                    self.engine_launcher_identity.pid
+                ) or os.getpgid(self.engine_launch_identity.pid) != (
+                    self.engine_launcher_identity.pid
+                ):
+                    raise RuntimeError("engine process escaped its launch group")
+                now = datetime.now(timezone.utc)
+                if self._engine_watchdog_db_engine is None:
+                    raise RuntimeError("engine watchdog database is unavailable")
+                database_operation_started = True
+                with Session(self._engine_watchdog_db_engine) as session:
+                    statement = (
+                        update(EngineLaunchDB)
+                        .where(
+                            EngineLaunchDB.launch_id == launch_id,
+                            EngineLaunchDB.boot_id
+                            == self.engine_launch_identity.boot_id,
+                            EngineLaunchDB.api_pid == self.api_launch_identity.pid,
+                            EngineLaunchDB.api_start_ticks
+                            == self.api_launch_identity.start_ticks,
+                            EngineLaunchDB.engine_launcher_pid
+                            == self.engine_launcher_identity.pid,
+                            EngineLaunchDB.engine_launcher_start_ticks
+                            == self.engine_launcher_identity.start_ticks,
+                            EngineLaunchDB.engine_pid
+                            == self.engine_launch_identity.pid,
+                            EngineLaunchDB.engine_start_ticks
+                            == self.engine_launch_identity.start_ticks,
+                            EngineLaunchDB.status.in_(
+                                (
+                                    EngineLaunchStatus.INITIALIZING,
+                                    EngineLaunchStatus.READY,
+                                )
+                            ),
+                        )
+                        .values(
+                            heartbeat_at=now,
+                            heartbeat_monotonic_ns=time.monotonic_ns(),
+                            heartbeat_sequence=(
+                                EngineLaunchDB.heartbeat_sequence + 1
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                    result = session.exec(statement)
+                    if result.rowcount != 1:
+                        raise _EngineLaunchRowLost(
+                            "engine launch watchdog lost its identity-bound row"
+                        )
+                    session.commit()
+                last_successful_heartbeat = time.monotonic()
+                if self._engine_watchdog_probe_request.is_set():
+                    self._engine_watchdog_probe_request.clear()
+                    self._engine_watchdog_probe_ack.set()
+            except Exception as error:
+                database_failure_age = (
+                    time.monotonic() - last_successful_heartbeat
+                )
+                if (
+                    database_operation_started
+                    and not isinstance(error, _EngineLaunchRowLost)
+                    and database_failure_age
+                    <= _ENGINE_WATCHDOG_DB_FAILURE_GRACE_SECONDS
+                    and not _ENGINE_FAILURE_IN_PROGRESS.is_set()
+                ):
+                    logger.warning(
+                        "Engine watchdog DB heartbeat retry after transient "
+                        "failure: %s",
+                        error,
+                    )
+                    self._engine_watchdog_wake.wait(0.25)
+                    self._engine_watchdog_wake.clear()
+                    continue
+                logger.error("Engine launch watchdog failed closed: %s", error)
+                if not _ENGINE_FAILURE_IN_PROGRESS.is_set():
+                    try:
+                        os.killpg(os.getpgrp(), signal.SIGKILL)
+                    except Exception:
+                        os.kill(os.getpid(), signal.SIGKILL)
+                return
+            self._engine_watchdog_wake.wait(_ENGINE_WATCHDOG_INTERVAL_SECONDS)
+            self._engine_watchdog_wake.clear()
+
+    def _publish_engine_ready(self) -> None:
+        """Publish READY only after the backend constructor has returned."""
+        if self.config.startup_launch_id is None:
+            return
+        if self.engine_launch_identity is None or not self.runtime_handoff_attestation:
+            raise RuntimeError("engine launch was not claimed before READY publication")
+        if self.api_launch_identity is None or self.engine_launcher_identity is None:
+            raise RuntimeError("engine launch process identities are incomplete")
+        now = datetime.now(timezone.utc)
+        with Session(self.db_engine) as session:
+            record = session.get(EngineLaunchDB, self.config.startup_launch_id)
+            validate_initializing_engine_launch(
+                record,
+                launch_id=self.config.startup_launch_id,
+                backend=self.config.backend,
+                api_identity=self.api_launch_identity,
+                launcher_identity=self.engine_launcher_identity,
+                engine_identity=self.engine_launch_identity,
+                engine_source_attestation=self.runtime_source_attestation,
+                engine_lock_attestation=self.runtime_launch_lock_attestation,
+            )
+            statement = (
+                update(EngineLaunchDB)
+                .where(
+                    EngineLaunchDB.launch_id == self.config.startup_launch_id,
+                    EngineLaunchDB.status == EngineLaunchStatus.INITIALIZING,
+                    EngineLaunchDB.backend == self.config.backend,
+                    EngineLaunchDB.boot_id == self.engine_launch_identity.boot_id,
+                    EngineLaunchDB.api_pid == self.api_launch_identity.pid,
+                    EngineLaunchDB.api_start_ticks
+                    == self.api_launch_identity.start_ticks,
+                    EngineLaunchDB.engine_launcher_pid
+                    == self.engine_launcher_identity.pid,
+                    EngineLaunchDB.engine_launcher_start_ticks
+                    == self.engine_launcher_identity.start_ticks,
+                    EngineLaunchDB.engine_pid == self.engine_launch_identity.pid,
+                    EngineLaunchDB.engine_start_ticks
+                    == self.engine_launch_identity.start_ticks,
+                )
+                .values(
+                    status=EngineLaunchStatus.READY,
+                    cache_evidence_status="not_required",
+                    cache_evidence={},
+                    ready_at=now,
+                    updated_at=now,
+                )
+            )
+            result = session.exec(statement)
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    "engine READY publication lost its conditional update race"
+                )
+            session.commit()
+        logger.info(
+            "Published readiness for engine launch %s",
+            self.config.startup_launch_id,
+        )
+
+    def _require_api_launch_identity(self) -> None:
+        """Stop an orphan engine promptly if its API identity disappears."""
+        if self.api_launch_identity is None:
+            return
+        now = time.monotonic()
+        if now < self._next_api_identity_check:
+            return
+        if not process_identity_is_live(self.api_launch_identity):
+            raise RuntimeError("API process identity disappeared; stopping orphan engine")
+        self._next_api_identity_check = now + 1.0
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -790,6 +1145,7 @@ class TinkerEngine:
     def process_pending_requests(self):
         """Main loop to process pending requests."""
         while True:
+            self._require_api_launch_identity()
             # Query for pending requests and extract data within session context
             with Session(self.db_engine) as session:
                 # Use look-ahead scheduling to find batchable forward_backward and forward model passes
@@ -821,8 +1177,53 @@ class TinkerEngine:
 
     def run(self):
         """Entry point to start the engine."""
+        self._publish_engine_ready()
         logger.info("Starting background engine...")
         self.process_pending_requests()
+
+
+def _publish_engine_failure(config: EngineConfig, error: BaseException) -> None:
+    """Best-effort identity-bound FAILED publication for supervised engines."""
+    if config.startup_launch_id is None:
+        return
+    failure_engine = None
+    try:
+        launch_id = validate_engine_launch_id(config.startup_launch_id)
+        engine_identity = read_process_identity()
+        failure_engine = create_engine(config.database_url, echo=False)
+        enable_sqlite_wal(failure_engine, busy_timeout_ms=100)
+        with Session(failure_engine) as session:
+            statement = (
+                update(EngineLaunchDB)
+                .where(
+                    EngineLaunchDB.launch_id == launch_id,
+                    EngineLaunchDB.boot_id == engine_identity.boot_id,
+                    EngineLaunchDB.engine_pid == engine_identity.pid,
+                    EngineLaunchDB.engine_start_ticks == engine_identity.start_ticks,
+                    EngineLaunchDB.status.in_(
+                        (
+                            EngineLaunchStatus.INITIALIZING,
+                            EngineLaunchStatus.READY,
+                        )
+                    ),
+                )
+                .values(
+                    status=EngineLaunchStatus.FAILED,
+                    error_message=(
+                        f"{type(error).__name__}: {error}"
+                    )[:2048],
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            result = session.exec(statement)
+            session.commit()
+            if result.rowcount == 1:
+                logger.info("Published FAILED for engine launch %s", launch_id)
+    except Exception:
+        logger.exception("Could not publish supervised engine failure")
+    finally:
+        if failure_engine is not None:
+            failure_engine.dispose()
 
 
 def main():
@@ -838,7 +1239,18 @@ def main():
     config = EngineConfig.model_validate(vars(args))
 
     # Initialize and run the engine
-    TinkerEngine(config).run()
+    _ENGINE_FAILURE_IN_PROGRESS.clear()
+    engine: TinkerEngine | None = None
+    try:
+        engine = TinkerEngine(config)
+        engine.run()
+    except BaseException as error:
+        _ENGINE_FAILURE_IN_PROGRESS.set()
+        if engine is not None:
+            engine._engine_watchdog_stop.set()
+            engine._engine_watchdog_wake.set()
+        _publish_engine_failure(config, error)
+        raise
 
 
 if __name__ == "__main__":

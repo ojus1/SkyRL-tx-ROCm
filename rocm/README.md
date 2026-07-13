@@ -232,11 +232,21 @@ repeated hits, and actual warmup remain hardware-unqualified. The launcher
 examples above provide the
 required telemetry, headless-display, exclusive-KFD, fatal-journal, and cleanup
 gates. The historical T64 direct-tool artifacts used equivalent external
-supervision; current operational ROCm prewarm is launcher-only. The API's
-current health endpoint does not prove that the nested engine has finished
-loading or consumed a particular cached executable. Therefore prewarm remains
-default-off until an engine readiness and in-engine cache-evidence contract is
-added and separately qualified. Each
+supervision; current operational ROCm prewarm is launcher-only. The API now
+waits for an exact launch-ID/PID/start-tick/boot/source/lock-bound engine row,
+published only after backend construction, before it serves requests. Its
+health endpoint revalidates that row, a one-second engine watchdog heartbeat,
+the isolated API-spawned process group, and all three live process identities.
+Shutdown signals the complete group immediately and does not report STOPPED
+until the wrapper is reaped and the group is absent. This readiness protocol is
+bounded to 3600 seconds in both Qwen launcher branches. It is CPU-qualified but
+has not yet been exercised with the real ROCm backend, and it
+still does not prove consumption of a particular cached executable. Therefore
+prewarm remains default-off until the in-engine cache-evidence contract is
+implemented and separately qualified. The containment result is specifically
+for the pinned non-Ray, single-process JAX path: a POSIX process group is not a
+cgroup, so Ray/FSDP/Megatron workers, daemonized descendants, or any child that
+calls `setsid()` require separate containment and qualification. Each
 train-bucket and optimizer compile has separate timing, compiled-memory,
 postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
 process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`
@@ -602,8 +612,11 @@ HEAD, deterministic archive, full snapshot layout/content, accelerator policy,
 memory mode, stack-versioned JAX cache, working directory, and module origins
 before backend construction. Disposable CPU tests prove API/engine origin
 selection, archive/full-tree binding, environment behavior, no snapshot
-mutation, and rejection of shadow modules. This new transition has not yet run
-on the GPU, so engine cache consumption and engine readiness remain unproven.
+mutation, rejection of shadow modules, exact engine readiness transitions,
+stale/PID-reused/stopped process rejection, heartbeat freshness, child-exit and
+timeout behavior, and terminate-to-kill whole-group cleanup. This new
+transition has not yet run on the GPU, so real-backend readiness and engine
+cache consumption remain unproven.
 Ordinary warmup, graph capture/replay, and any compiled-call invocation remain
 unauthorized. The older
 T1024 `93.144 s` then `47.655 s` runs were two misses with different source

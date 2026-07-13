@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, AsyncGenerator, ClassVar, Literal
@@ -43,7 +44,7 @@ from pydantic import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import SQLModel, func, select
+from sqlmodel import SQLModel, func, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from skyrl.tinker import types
@@ -51,6 +52,8 @@ from skyrl.tinker.config import EngineConfig, add_model, config_to_argv
 from skyrl.tinker.db_models import (
     CheckpointDB,
     CheckpointStatus,
+    EngineLaunchDB,
+    EngineLaunchStatus,
     FutureDB,
     ModelDB,
     RequestStatus,
@@ -58,6 +61,12 @@ from skyrl.tinker.db_models import (
     SessionDB,
     enable_sqlite_wal,
     get_async_database_url,
+)
+from skyrl.tinker.engine_startup import (
+    ProcessIdentity,
+    new_engine_launch_id,
+    read_process_identity,
+    validate_ready_engine_launch,
 )
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
@@ -122,7 +131,10 @@ _UV_RUN_OPTIONS_WITH_VALUES = {
 }
 
 # Timeout for graceful shutdown when engine crashes
-SHUTDOWN_TIMEOUT_SECONDS = 10
+SHUTDOWN_TIMEOUT_SECONDS = 20
+STARTUP_DB_POLL_TIMEOUT_SECONDS = 2.0
+TERMINAL_STATE_WRITE_TIMEOUT_SECONDS = 2.0
+READINESS_DB_FAILURE_GRACE_SECONDS = 5.0
 
 
 def _get_parent_uv_run_args(
@@ -231,10 +243,371 @@ def _build_uv_run_cmd_engine(
     return cmd
 
 
+async def _insert_engine_launch(
+    db_engine: Any,
+    *,
+    launch_id: str,
+    engine_config: EngineConfig,
+    api_identity: ProcessIdentity,
+    source_attestation: dict[str, Any],
+    lock_attestation: dict[str, Any],
+) -> None:
+    """Insert the API-owned STARTING row without overwriting a collision."""
+    record = EngineLaunchDB(
+        launch_id=launch_id,
+        backend=engine_config.backend,
+        status=EngineLaunchStatus.STARTING,
+        boot_id=api_identity.boot_id,
+        api_pid=api_identity.pid,
+        api_start_ticks=api_identity.start_ticks,
+        api_source_attestation=dict(source_attestation),
+        api_launch_lock_attestation=dict(lock_attestation),
+    )
+    async with AsyncSession(db_engine) as session:
+        session.add(record)
+        try:
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise RuntimeError("engine launch ID collision") from error
+
+
+async def _bind_engine_launcher(
+    db_engine: Any,
+    *,
+    launch_id: str,
+    api_identity: ProcessIdentity,
+    launcher_identity: ProcessIdentity,
+) -> None:
+    """Conditionally bind the uv wrapper identity to the STARTING launch."""
+    if launcher_identity.boot_id != api_identity.boot_id:
+        raise RuntimeError("API and engine launcher identities span different boots")
+    async with AsyncSession(db_engine) as session:
+        statement = (
+            update(EngineLaunchDB)
+            .where(
+                EngineLaunchDB.launch_id == launch_id,
+                EngineLaunchDB.status == EngineLaunchStatus.STARTING,
+                EngineLaunchDB.api_pid == api_identity.pid,
+                EngineLaunchDB.api_start_ticks == api_identity.start_ticks,
+                EngineLaunchDB.engine_launcher_pid.is_(None),
+                EngineLaunchDB.engine_launcher_start_ticks.is_(None),
+            )
+            .values(
+                engine_launcher_pid=launcher_identity.pid,
+                engine_launcher_start_ticks=launcher_identity.start_ticks,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        result = await session.exec(statement)
+        if result.rowcount != 1:
+            raise RuntimeError(
+                "engine launcher identity lost its conditional binding race"
+            )
+        await session.commit()
+
+
+async def _mark_engine_launch(
+    db_engine: Any,
+    *,
+    launch_id: str,
+    api_identity: ProcessIdentity,
+    status: EngineLaunchStatus,
+    expected_statuses: tuple[EngineLaunchStatus, ...],
+    error_message: str | None = None,
+) -> bool:
+    """Apply one terminal launch transition without reviving stale rows."""
+    now = datetime.now(timezone.utc)
+    values: dict[str, Any] = {
+        "status": status,
+        "updated_at": now,
+        "error_message": error_message[:2048] if error_message else None,
+    }
+    async with AsyncSession(db_engine) as session:
+        statement = (
+            update(EngineLaunchDB)
+            .where(
+                EngineLaunchDB.launch_id == launch_id,
+                EngineLaunchDB.boot_id == api_identity.boot_id,
+                EngineLaunchDB.api_pid == api_identity.pid,
+                EngineLaunchDB.api_start_ticks == api_identity.start_ticks,
+                EngineLaunchDB.status.in_(expected_statuses),
+            )
+            .values(**values)
+        )
+        result = await session.exec(statement)
+        await session.commit()
+        return result.rowcount == 1
+
+
+async def _wait_for_engine_ready(
+    db_engine: Any,
+    *,
+    launch_id: str,
+    backend: str,
+    api_identity: ProcessIdentity,
+    launcher_identity: ProcessIdentity,
+    expected_api_source_attestation: dict[str, Any],
+    expected_api_lock_attestation: dict[str, Any],
+    background_engine: asyncio.subprocess.Process,
+    engine_exit_task: asyncio.Task[int],
+    timeout_sec: float,
+) -> dict[str, ProcessIdentity]:
+    """Wait for this exact launch's READY row while racing child exit."""
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        if engine_exit_task.done() or background_engine.returncode is not None:
+            exit_code = await asyncio.shield(engine_exit_task)
+            raise RuntimeError(
+                f"background engine exited before readiness with code {exit_code}"
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"background engine did not become ready within {timeout_sec:g} seconds"
+            )
+
+        async def read_launch_record() -> EngineLaunchDB | None:
+            async with AsyncSession(db_engine) as session:
+                return await session.get(EngineLaunchDB, launch_id)
+
+        try:
+            record = await asyncio.wait_for(
+                read_launch_record(),
+                timeout=min(STARTUP_DB_POLL_TIMEOUT_SECONDS, remaining),
+            )
+        except asyncio.TimeoutError:
+            if engine_exit_task.done() or background_engine.returncode is not None:
+                exit_code = await asyncio.shield(engine_exit_task)
+                raise RuntimeError(
+                    "background engine exited while its readiness row was blocked "
+                    f"with code {exit_code}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "background engine readiness deadline expired during DB read"
+                ) from None
+            continue
+
+        if record is None:
+            raise RuntimeError("current engine launch row disappeared")
+        else:
+            status = str(getattr(record.status, "value", record.status))
+            if status == EngineLaunchStatus.READY.value:
+                identities = validate_ready_engine_launch(
+                    record,
+                    launch_id=launch_id,
+                    backend=backend,
+                    api_identity=api_identity,
+                    launcher_identity=launcher_identity,
+                    expected_api_source_attestation=(
+                        expected_api_source_attestation
+                    ),
+                    expected_api_lock_attestation=expected_api_lock_attestation,
+                )
+                if (
+                    engine_exit_task.done()
+                    or background_engine.returncode is not None
+                ):
+                    exit_code = await asyncio.shield(engine_exit_task)
+                    raise RuntimeError(
+                        "background engine exited during readiness validation "
+                        f"with code {exit_code}"
+                    )
+                return identities
+            if status in {
+                EngineLaunchStatus.FAILED.value,
+                EngineLaunchStatus.STOPPED.value,
+            }:
+                detail = record.error_message or "no failure detail was published"
+                raise RuntimeError(
+                    f"background engine entered {status} before readiness: {detail}"
+                )
+            if status not in {
+                EngineLaunchStatus.STARTING.value,
+                EngineLaunchStatus.INITIALIZING.value,
+            }:
+                raise RuntimeError(f"background engine published invalid state {status!r}")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"background engine did not become ready within {timeout_sec:g} seconds"
+            )
+        poll_task = asyncio.create_task(asyncio.sleep(min(0.05, remaining)))
+        done, _ = await asyncio.wait(
+            {engine_exit_task, poll_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if engine_exit_task in done:
+            if not poll_task.done():
+                poll_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await poll_task
+            exit_code = await asyncio.shield(engine_exit_task)
+            raise RuntimeError(
+                f"background engine exited before readiness with code {exit_code}"
+            )
+        await poll_task
+
+
+def _engine_process_group_exists(process_group_id: int) -> bool:
+    """Probe the dedicated child group without treating EPERM as absence."""
+    if type(process_group_id) is not int or process_group_id <= 0:
+        raise RuntimeError("engine process-group ID is invalid")
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError as error:
+        raise RuntimeError("cannot inspect the engine process group") from error
+    return True
+
+
+def _signal_engine_process_group(process_group_id: int, signal_number: int) -> bool:
+    """Signal the isolated engine tree; return false only if it is already gone."""
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        return False
+    except PermissionError as error:
+        raise RuntimeError("cannot signal the engine process group") from error
+    return True
+
+
+def _identity_owns_engine_process_group(
+    identity: ProcessIdentity | None,
+    process_group_id: int,
+) -> bool:
+    """Bind group signalling to a non-reused recorded process identity."""
+    if identity is None:
+        return False
+    try:
+        current = read_process_identity(identity.pid)
+        current_process_group = os.getpgid(identity.pid)
+    except (OSError, RuntimeError):
+        return False
+    return (
+        current.start_ticks == identity.start_ticks
+        and current.boot_id == identity.boot_id
+        and current.state not in {"X", "Z", "x"}
+        and current_process_group == process_group_id
+    )
+
+
+@dataclass(frozen=True)
+class _EngineStopResult:
+    exit_code: int
+    signals_sent: tuple[int, ...]
+    exited_before_signal: bool
+
+
+def _expected_engine_shutdown_result(result: _EngineStopResult) -> bool:
+    """Require causal evidence that API-delivered shutdown ended the wrapper."""
+    if result.exited_before_signal or not result.signals_sent:
+        return False
+    if signal.SIGTERM in result.signals_sent and result.exit_code in {
+        0,
+        -signal.SIGTERM,
+        128 + signal.SIGTERM,
+    }:
+        return True
+    if signal.SIGKILL in result.signals_sent:
+        return result.exit_code in {-signal.SIGKILL, 128 + signal.SIGKILL}
+    return False
+
+
+async def _stop_background_engine(
+    background_engine: asyncio.subprocess.Process,
+    engine_exit_task: asyncio.Task[int],
+    process_group_id: int | None,
+    *,
+    graceful_timeout_sec: float = 5.0,
+    forced_timeout_sec: float = 5.0,
+    poll_interval_sec: float = 0.05,
+) -> _EngineStopResult:
+    """Terminate the isolated engine tree, reap its wrapper, and prove exit."""
+    exited_before_signal = (
+        engine_exit_task.done() or background_engine.returncode is not None
+    )
+    signals_sent: list[int] = []
+    if process_group_id is None:
+        try:
+            background_engine.terminate()
+            signals_sent.append(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            exit_code = await asyncio.wait_for(
+                asyncio.shield(engine_exit_task), timeout=graceful_timeout_sec
+            )
+            return _EngineStopResult(
+                exit_code=exit_code,
+                signals_sent=tuple(signals_sent),
+                exited_before_signal=exited_before_signal,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Background engine (PID %d) did not terminate gracefully, killing",
+                background_engine.pid,
+            )
+            try:
+                background_engine.kill()
+                signals_sent.append(signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        exit_code = await asyncio.wait_for(
+            asyncio.shield(engine_exit_task), timeout=forced_timeout_sec
+        )
+        return _EngineStopResult(
+            exit_code=exit_code,
+            signals_sent=tuple(signals_sent),
+            exited_before_signal=exited_before_signal,
+        )
+
+    if _signal_engine_process_group(process_group_id, signal.SIGTERM):
+        signals_sent.append(signal.SIGTERM)
+    graceful_deadline = time.monotonic() + graceful_timeout_sec
+    while time.monotonic() < graceful_deadline:
+        if engine_exit_task.done() and not _engine_process_group_exists(
+            process_group_id
+        ):
+            return _EngineStopResult(
+                exit_code=await asyncio.shield(engine_exit_task),
+                signals_sent=tuple(signals_sent),
+                exited_before_signal=exited_before_signal,
+            )
+        await asyncio.sleep(poll_interval_sec)
+
+    if _engine_process_group_exists(process_group_id):
+        logger.warning(
+            "Engine process group %d did not terminate gracefully, killing",
+            process_group_id,
+        )
+        if _signal_engine_process_group(process_group_id, signal.SIGKILL):
+            signals_sent.append(signal.SIGKILL)
+    try:
+        exit_code = await asyncio.wait_for(
+            asyncio.shield(engine_exit_task), timeout=forced_timeout_sec
+        )
+    except asyncio.TimeoutError as error:
+        raise RuntimeError("engine launcher could not be reaped after SIGKILL") from error
+    forced_deadline = time.monotonic() + forced_timeout_sec
+    while _engine_process_group_exists(process_group_id):
+        if time.monotonic() >= forced_deadline:
+            raise RuntimeError("engine process group survived SIGKILL")
+        await asyncio.sleep(poll_interval_sec)
+    return _EngineStopResult(
+        exit_code=exit_code,
+        signals_sent=tuple(signals_sent),
+        exited_before_signal=exited_before_signal,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
-
     runtime_source_attestation = revalidate_runtime_source(
         initial=_RUNTIME_SOURCE_ATTESTATION,
         role="api",
@@ -251,117 +624,462 @@ async def lifespan(app: FastAPI):
         "API runtime launch-lock attestation: %s",
         runtime_launch_lock_attestation,
     )
-
-    db_url = get_async_database_url(app.state.engine_config.database_url)
-    app.state.db_engine = create_async_engine(db_url, echo=False)
-    enable_sqlite_wal(app.state.db_engine.sync_engine)
-
-    async with app.state.db_engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
-
-    # Setup external inference client if configured.
-    #
-    # Three cases:
-    #   1. external_inference_url set: forward sample requests to a fully
-    #      external vLLM (existing behavior).
-    #   2. backend in (megatron, fsdp) and colocate_all=False: install
-    #      SkyRLTrainInferenceForwardingClient so sample requests go directly
-    #      to the SkyRL-Train-managed vLLM, bypassing the engine's serial loop.
-    #   3. otherwise (JAX, colocated SkyRL-Train, etc.): route everything
-    #      through the engine subprocess.
-    #
-    # The colocated path stays on the engine because vLLM is asleep during
-    # training and only the engine's synchronous sample path knows how to
-    # wake it (save_weights_for_sampler → broadcast → sample).
-    backend_name = app.state.engine_config.backend
-    backend_cfg = app.state.engine_config.backend_config or {}
-    # SkyRL-Train default is colocate_all=True; only opt into forwarding
-    # when the operator explicitly sets it to False.
-    is_colocated = bool(backend_cfg.get("trainer.placement.colocate_all", True))
-    if app.state.engine_config.external_inference_url:
-        app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
-        logger.info(f"External engine configured: {app.state.engine_config.external_inference_url}")
-    elif backend_name in ("megatron", "fsdp") and not is_colocated:
-        app.state.external_inference_client = SkyRLTrainInferenceForwardingClient(
-            app.state.engine_config, app.state.db_engine
+    engine_config: EngineConfig = app.state.engine_config
+    if engine_config.startup_launch_id is not None:
+        raise RuntimeError(
+            "startup_launch_id is internal; API configuration must leave it unset"
         )
+
+    db_url = get_async_database_url(engine_config.database_url)
+    db_engine = create_async_engine(db_url, echo=False)
+    enable_sqlite_wal(db_engine.sync_engine)
+    app.state.db_engine = db_engine
+    app.state.external_inference_client = None
+    app.state.background_engine = None
+    app.state.engine_exit_task = None
+    app.state.engine_launch_id = None
+    app.state.engine_launch_identities = None
+    app.state.engine_process_group_id = None
+
+    api_identity: ProcessIdentity | None = None
+    launcher_identity: ProcessIdentity | None = None
+    launch_id: str | None = None
+    launch_created = False
+    startup_ready = False
+    shutting_down = False
+    unexpected_engine_exit = False
+    lifecycle_failed = False
+    background_engine: asyncio.subprocess.Process | None = None
+    engine_exit_task: asyncio.Task[int] | None = None
+    engine_process_group_id: int | None = None
+    monitor_task: asyncio.Task[None] | None = None
+    force_exit_timer: threading.Timer | None = None
+    startup_error = "API startup did not complete"
+
+    try:
+        async with db_engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+
+        # Setup external inference client if configured. The colocated path
+        # stays on the engine because only its synchronous sample path knows
+        # how to wake an inference worker that sleeps during training.
+        backend_name = engine_config.backend
+        backend_cfg = engine_config.backend_config or {}
+        is_colocated = bool(
+            backend_cfg.get("trainer.placement.colocate_all", True)
+        )
+        if engine_config.external_inference_url:
+            app.state.external_inference_client = ExternalInferenceClient(
+                engine_config, db_engine
+            )
+            logger.info(
+                "External engine configured: %s",
+                engine_config.external_inference_url,
+            )
+        elif backend_name in ("megatron", "fsdp") and not is_colocated:
+            app.state.external_inference_client = (
+                SkyRLTrainInferenceForwardingClient(engine_config, db_engine)
+            )
+            logger.info(
+                "SkyRL-Train inference forwarding client enabled for "
+                "non-colocated backend=%s",
+                backend_name,
+            )
+        else:
+            logger.info("Using internal engine for inference")
+
+        api_identity = read_process_identity()
+        launch_id = new_engine_launch_id()
+        await _insert_engine_launch(
+            db_engine,
+            launch_id=launch_id,
+            engine_config=engine_config,
+            api_identity=api_identity,
+            source_attestation=runtime_source_attestation,
+            lock_attestation=runtime_launch_lock_attestation,
+        )
+        launch_created = True
+        child_config = engine_config.model_copy(
+            update={"startup_launch_id": launch_id}
+        )
+        engine_startup_deadline = time.monotonic() + float(
+            engine_config.engine_startup_timeout_sec
+        )
+
+        parent_cmd = psutil.Process(os.getppid()).cmdline()
+        cmd = _build_uv_run_cmd_engine(
+            parent_cmd,
+            child_config,
+            runtime_source_attestation=runtime_source_attestation,
+        )
+        subprocess_options: dict[str, Any] = {}
+        subprocess_options["start_new_session"] = True
+        if runtime_launch_lock_attestation["status"] == "passed":
+            subprocess_options["pass_fds"] = (
+                runtime_launch_lock_attestation["descriptor"],
+            )
+        background_engine = await asyncio.create_subprocess_exec(
+            *cmd, **subprocess_options
+        )
+        app.state.background_engine = background_engine
+        engine_exit_task = asyncio.create_task(background_engine.wait())
+        app.state.engine_exit_task = engine_exit_task
+        engine_process_group_id = background_engine.pid
+        app.state.engine_process_group_id = engine_process_group_id
+        if os.getpgid(background_engine.pid) != background_engine.pid:
+            raise RuntimeError("engine launcher did not enter a dedicated process group")
         logger.info(
-            "SkyRL-Train inference forwarding client enabled for non-colocated backend=%s",
+            "Started background engine launcher with PID %d for launch %s "
+            "(backend=%s)",
+            background_engine.pid,
+            launch_id,
             backend_name,
         )
-    else:
-        app.state.external_inference_client = None
-        logger.info("Using internal engine for inference")
 
-    # Build subprocess command with engine config parameters.
-    parent_cmd = psutil.Process(os.getppid()).cmdline()
-    cmd = _build_uv_run_cmd_engine(
-        parent_cmd,
-        app.state.engine_config,
-        runtime_source_attestation=runtime_source_attestation,
-    )
-
-    subprocess_options: dict[str, Any] = {}
-    if runtime_launch_lock_attestation["status"] == "passed":
-        subprocess_options["pass_fds"] = (
-            runtime_launch_lock_attestation["descriptor"],
+        launcher_identity = read_process_identity(background_engine.pid)
+        bind_timeout = engine_startup_deadline - time.monotonic()
+        if bind_timeout <= 0:
+            raise TimeoutError("engine startup deadline expired before launcher bind")
+        await asyncio.wait_for(
+            _bind_engine_launcher(
+                db_engine,
+                launch_id=launch_id,
+                api_identity=api_identity,
+                launcher_identity=launcher_identity,
+            ),
+            timeout=bind_timeout,
         )
-    background_engine = await asyncio.create_subprocess_exec(
-        *cmd, **subprocess_options
-    )
-    app.state.background_engine = background_engine
-    logger.info(f"Started background engine with PID {background_engine.pid}: {' '.join(cmd)}")
+        readiness_timeout = engine_startup_deadline - time.monotonic()
+        if readiness_timeout <= 0:
+            raise TimeoutError("engine startup deadline expired before readiness wait")
+        identities = await _wait_for_engine_ready(
+            db_engine,
+            launch_id=launch_id,
+            backend=backend_name,
+            api_identity=api_identity,
+            launcher_identity=launcher_identity,
+            expected_api_source_attestation=runtime_source_attestation,
+            expected_api_lock_attestation=runtime_launch_lock_attestation,
+            background_engine=background_engine,
+            engine_exit_task=engine_exit_task,
+            timeout_sec=readiness_timeout,
+        )
+        app.state.engine_launch_id = launch_id
+        app.state.engine_launch_identities = identities
 
-    shutting_down = False
+        async def monitor_engine() -> None:
+            """Fail this launch on child exit or stale operational readiness."""
+            nonlocal force_exit_timer, startup_error, unexpected_engine_exit
+            failure_reason: str | None = None
+            database_failure_started: float | None = None
+            while not shutting_down:
+                poll_task = asyncio.create_task(asyncio.sleep(1.0))
+                try:
+                    done, _ = await asyncio.wait(
+                        {engine_exit_task, poll_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except BaseException:
+                    poll_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await poll_task
+                    raise
+                if engine_exit_task in done:
+                    if not poll_task.done():
+                        poll_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await poll_task
+                    exit_code = await asyncio.shield(engine_exit_task)
+                    failure_reason = (
+                        f"background engine exited with code {exit_code}"
+                    )
+                    break
+                await poll_task
+                async def read_monitor_record() -> EngineLaunchDB | None:
+                    async with AsyncSession(db_engine) as session:
+                        return await session.get(EngineLaunchDB, launch_id)
 
-    async def monitor_engine():
-        """Monitor engine process and exit API server if it crashes."""
-        exit_code = await background_engine.wait()
-        if not shutting_down:
-            logger.error(f"Background engine crashed with exit code {exit_code}, exiting API server")
+                try:
+                    record = await asyncio.wait_for(
+                        read_monitor_record(),
+                        timeout=STARTUP_DB_POLL_TIMEOUT_SECONDS,
+                    )
+                except Exception as error:
+                    now = time.monotonic()
+                    if database_failure_started is None:
+                        database_failure_started = now
+                    if (
+                        now - database_failure_started
+                        <= READINESS_DB_FAILURE_GRACE_SECONDS
+                    ):
+                        logger.warning(
+                            "Engine readiness DB monitor retry after transient "
+                            "failure: %s",
+                            error,
+                        )
+                        continue
+                    failure_reason = (
+                        "engine readiness DB monitor exceeded its retry window: "
+                        f"{error}"
+                    )
+                    break
+                database_failure_started = None
+                try:
+                    current_identities = validate_ready_engine_launch(
+                        record,
+                        launch_id=launch_id,
+                        backend=backend_name,
+                        api_identity=api_identity,
+                        launcher_identity=launcher_identity,
+                        expected_api_source_attestation=(
+                            runtime_source_attestation
+                        ),
+                        expected_api_lock_attestation=(
+                            runtime_launch_lock_attestation
+                        ),
+                    )
+                    if current_identities != identities:
+                        raise RuntimeError(
+                            "engine launch identities changed after readiness"
+                        )
+                except Exception as error:
+                    failure_reason = f"engine readiness monitor failed: {error}"
+                    break
+            if shutting_down or failure_reason is None:
+                return
+            unexpected_engine_exit = True
+            startup_error = failure_reason
+            logger.error("%s; exiting API server", failure_reason)
+            if engine_process_group_id is not None and (
+                _identity_owns_engine_process_group(
+                    launcher_identity, engine_process_group_id
+                )
+                or _identity_owns_engine_process_group(
+                    identities["engine"], engine_process_group_id
+                )
+            ):
+                try:
+                    _signal_engine_process_group(
+                        engine_process_group_id, signal.SIGTERM
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to signal unhealthy engine process group"
+                    )
+            try:
+                await asyncio.wait_for(
+                    _mark_engine_launch(
+                        db_engine,
+                        launch_id=launch_id,
+                        api_identity=api_identity,
+                        status=EngineLaunchStatus.FAILED,
+                        expected_statuses=(EngineLaunchStatus.READY,),
+                        error_message=failure_reason,
+                    ),
+                    timeout=TERMINAL_STATE_WRITE_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("Failed to persist unexpected engine exit")
 
-            # Start a background timer that force-exits after timeout.
-            # Using a thread instead of asyncio task because SIGTERM handling
-            # may wait for pending asyncio tasks to complete before exiting.
-            def force_exit():
+            # Uvicorn can wait for active tasks after SIGTERM. A daemon timer
+            # retains the existing hard upper bound for that graceful path.
+            def force_exit() -> None:
                 logger.warning("Graceful shutdown timed out, forcing exit")
                 os._exit(1)
 
             timer = threading.Timer(SHUTDOWN_TIMEOUT_SECONDS, force_exit)
             timer.daemon = True
             timer.start()
-
-            # Request graceful shutdown. Uvicorn will stop accepting new
-            # connections and wait for active requests to complete.
-            # If shutdown doesn't complete in time, force_exit() will terminate.
+            force_exit_timer = timer
             os.kill(os.getpid(), signal.SIGTERM)
 
-    monitor_task = asyncio.create_task(monitor_engine())
+        monitor_task = asyncio.create_task(monitor_engine())
+        startup_ready = True
+        logger.info(
+            "Accepted READY engine launch %s (launcher PID %d, engine PID %d)",
+            launch_id,
+            launcher_identity.pid,
+            identities["engine"].pid,
+        )
+        yield
+    except BaseException as error:
+        lifecycle_failed = True
+        startup_error = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        if (
+            startup_ready
+            and engine_exit_task is not None
+            and background_engine is not None
+            and (
+                engine_exit_task.done()
+                or background_engine.returncode is not None
+            )
+        ):
+            unexpected_engine_exit = True
+            exit_code = (
+                engine_exit_task.result()
+                if engine_exit_task.done()
+                else background_engine.returncode
+            )
+            startup_error = f"background engine exited with code {exit_code}"
+        shutting_down = True
+        if monitor_task is not None:
+            monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor_task
 
-    yield
+        accepted_identities = app.state.engine_launch_identities
+        accepted_engine_identity = (
+            None
+            if accepted_identities is None
+            else accepted_identities.get("engine")
+        )
+        app.state.engine_launch_identities = None
+        engine_stop_task: asyncio.Task[_EngineStopResult] | None = None
+        group_ownership_error = False
+        if background_engine is not None and engine_exit_task is not None:
+            owned_process_group_id = None
+            if engine_process_group_id is not None and (
+                _identity_owns_engine_process_group(
+                    launcher_identity, engine_process_group_id
+                )
+                or _identity_owns_engine_process_group(
+                    accepted_engine_identity, engine_process_group_id
+                )
+            ):
+                owned_process_group_id = engine_process_group_id
+            elif engine_process_group_id is not None:
+                try:
+                    group_ownership_error = _engine_process_group_exists(
+                        engine_process_group_id
+                    )
+                except Exception:
+                    group_ownership_error = True
+                    logger.exception("Could not validate engine process-group ownership")
+            engine_stop_task = asyncio.create_task(
+                _stop_background_engine(
+                    background_engine,
+                    engine_exit_task,
+                    owned_process_group_id,
+                )
+            )
+            # Let the stop task deliver TERM before any potentially blocked DB
+            # or client cleanup operation begins.
+            await asyncio.sleep(0)
 
-    shutting_down = True
-    monitor_task.cancel()
+        normal_shutdown = (
+            startup_ready
+            and not unexpected_engine_exit
+            and not lifecycle_failed
+        )
+        if (
+            not normal_shutdown
+            and launch_created
+            and launch_id is not None
+            and api_identity is not None
+        ):
+            try:
+                marked = await asyncio.wait_for(
+                    _mark_engine_launch(
+                        db_engine,
+                        launch_id=launch_id,
+                        api_identity=api_identity,
+                        status=EngineLaunchStatus.FAILED,
+                        expected_statuses=(
+                            EngineLaunchStatus.STARTING,
+                            EngineLaunchStatus.INITIALIZING,
+                            EngineLaunchStatus.READY,
+                        ),
+                        error_message=startup_error,
+                    ),
+                    timeout=TERMINAL_STATE_WRITE_TIMEOUT_SECONDS,
+                )
+                if not marked:
+                    logger.warning(
+                        "Engine launch %s was already terminal during cleanup",
+                        launch_id,
+                    )
+            except Exception:
+                logger.exception("Failed to persist terminal engine launch state")
 
-    # Close the forwarding client's persistent httpx connection pool if we
-    # installed one. Cheap no-op when external_inference_client doesn't own
-    # an httpx client (ExternalInferenceClient creates one per call).
-    inference_client = getattr(app.state, "external_inference_client", None)
-    aclose = getattr(inference_client, "aclose", None)
-    if aclose is not None:
-        with suppress(Exception):
-            await aclose()
+        inference_client = getattr(
+            app.state, "external_inference_client", None
+        )
+        aclose = getattr(inference_client, "aclose", None)
+        if aclose is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    aclose(), timeout=TERMINAL_STATE_WRITE_TIMEOUT_SECONDS
+                )
 
-    logger.info(f"Stopping background engine (PID {app.state.background_engine.pid})")
-    with suppress(ProcessLookupError):
-        background_engine.terminate()
+        stop_error: str | None = (
+            "engine process-group ownership could not be verified"
+            if group_ownership_error
+            else None
+        )
+        shutdown_result: _EngineStopResult | None = None
+        if engine_stop_task is not None and background_engine is not None:
+            logger.info(
+                "Stopping background engine launcher (PID %d)",
+                background_engine.pid,
+            )
+            try:
+                shutdown_result = await asyncio.shield(engine_stop_task)
+                logger.info(
+                    "Background engine launcher stopped with code %d",
+                    shutdown_result.exit_code,
+                )
+            except Exception:
+                stop_error = "background engine could not be stopped and reaped"
+                logger.exception("Failed to stop or reap background engine launcher")
+        if (
+            normal_shutdown
+            and stop_error is None
+            and shutdown_result is not None
+            and not _expected_engine_shutdown_result(shutdown_result)
+        ):
+            stop_error = (
+                "background engine exited unexpectedly during shutdown with code "
+                f"{shutdown_result.exit_code}"
+            )
+        if (
+            normal_shutdown
+            and launch_created
+            and launch_id is not None
+            and api_identity is not None
+        ):
+            try:
+                marked = await asyncio.wait_for(
+                    _mark_engine_launch(
+                        db_engine,
+                        launch_id=launch_id,
+                        api_identity=api_identity,
+                        status=(
+                            EngineLaunchStatus.STOPPED
+                            if stop_error is None
+                            else EngineLaunchStatus.FAILED
+                        ),
+                        expected_statuses=(EngineLaunchStatus.READY,),
+                        error_message=stop_error,
+                    ),
+                    timeout=TERMINAL_STATE_WRITE_TIMEOUT_SECONDS,
+                )
+                if not marked:
+                    logger.warning(
+                        "Engine launch %s was already terminal after shutdown",
+                        launch_id,
+                    )
+            except Exception:
+                logger.exception("Failed to persist final engine launch state")
         try:
-            await asyncio.wait_for(background_engine.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            logger.warning(f"Background engine (PID {background_engine.pid}) did not terminate gracefully, killing")
-            background_engine.kill()
-            await background_engine.wait()
-    logger.info("Background engine stopped")
+            await asyncio.wait_for(
+                db_engine.dispose(), timeout=TERMINAL_STATE_WRITE_TIMEOUT_SECONDS
+            )
+        except Exception:
+            logger.exception("Failed to dispose API database engine cleanly")
+        if force_exit_timer is not None:
+            force_exit_timer.cancel()
 
 
 app = FastAPI(title="Tinker API Mock", version="0.0.1", lifespan=lifespan)
@@ -891,8 +1609,52 @@ async def client_config():
 
 
 @app.get("/api/v1/healthz", response_model=HealthResponse)
-async def healthz():
-    """Checks if the API server is ready."""
+async def healthz(request: Request):
+    """Return healthy only for the exact accepted and still-live launch."""
+    try:
+        launch_id = request.app.state.engine_launch_id
+        accepted_identities = request.app.state.engine_launch_identities
+        background_engine = request.app.state.background_engine
+        engine_exit_task = request.app.state.engine_exit_task
+        if (
+            launch_id is None
+            or accepted_identities is None
+            or background_engine is None
+            or engine_exit_task is None
+            or engine_exit_task.done()
+            or background_engine.returncode is not None
+        ):
+            raise RuntimeError("no live engine launch has been accepted")
+        async def read_health_record() -> EngineLaunchDB | None:
+            async with AsyncSession(request.app.state.db_engine) as session:
+                return await session.get(EngineLaunchDB, launch_id)
+
+        record = await asyncio.wait_for(
+            read_health_record(), timeout=STARTUP_DB_POLL_TIMEOUT_SECONDS
+        )
+        current_identities = validate_ready_engine_launch(
+            record,
+            launch_id=launch_id,
+            backend=request.app.state.engine_config.backend,
+            api_identity=accepted_identities["api"],
+            launcher_identity=accepted_identities["engine_launcher"],
+            expected_api_source_attestation=(
+                request.app.state.runtime_source_attestation
+            ),
+            expected_api_lock_attestation=(
+                request.app.state.runtime_launch_lock_attestation
+            ),
+        )
+        if current_identities != accepted_identities:
+            raise RuntimeError("ready engine identities changed after startup")
+        if engine_exit_task.done() or background_engine.returncode is not None:
+            raise RuntimeError("engine exited during health validation")
+    except Exception as error:
+        logger.warning("Engine health validation failed: %s", error)
+        raise HTTPException(
+            status_code=503,
+            detail="engine unavailable",
+        ) from error
     return HealthResponse(status="ok")
 
 
@@ -1564,6 +2326,8 @@ if __name__ == "__main__":
 
     # Create EngineConfig from parsed arguments (only EngineConfig fields)
     engine_config = EngineConfig.model_validate({k: v for k, v in vars(args).items() if k in EngineConfig.model_fields})
+    if engine_config.startup_launch_id is not None:
+        parser.error("--startup-launch-id is internal and cannot be supplied to the API")
 
     # Store config in app.state so lifespan can access it
     app.state.engine_config = engine_config

@@ -118,8 +118,12 @@ and CPU-qualified with sanitized environment, exact `uv` arguments, and full
 Git/archive/snapshot revalidation. The exact uv payload and one fixed per-UID
 lock namespace are pinned, and CPU probes confirm the locked descriptor reaches
 the nested engine. This transition has not yet consumed the cache in a hardware
-run. Engine readiness, actual cache consumption, ordinary warmup, and
-steady-state throughput remain unverified.
+run. An exact per-launch readiness table, dedicated child process group,
+engine-owned watchdog heartbeat, bounded startup wait, and fail-closed health
+endpoint are now implemented and CPU-qualified for the pinned non-Ray JAX
+path. Real ROCm backend readiness,
+actual cache consumption, ordinary warmup, and steady-state throughput remain
+unverified.
 
 ### Exact S512 GDN execute forward gate
 

@@ -333,7 +333,9 @@ def run_tinker_ppo(
             _kill_server()
             raise RuntimeError(f"Tinker server exited early with code {server.returncode}")
         try:
-            with urllib.request.urlopen(f"{base_url}/docs", timeout=5) as resp:
+            with urllib.request.urlopen(
+                f"{base_url}/api/v1/healthz", timeout=5
+            ) as resp:
                 if resp.status < 500:
                     ready = True
                     break

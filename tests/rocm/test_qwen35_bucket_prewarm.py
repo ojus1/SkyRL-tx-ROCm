@@ -1879,6 +1879,7 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     stable_api_exec_index = source.index(stable_api_exec, stable_api_gate)
     stable_uv_exec = source.index('    "$uv_executable" run \\', stable_api_exec_index)
     stable_api_module = source.index("-m skyrl.tinker.api", stable_uv_exec)
+    engine_startup_timeout = "--engine-startup-timeout-sec 3600"
     assert source.rindex(final_journal_gate) < prewarm_status_gate
     assert prewarm_status_gate < prewarm_only_gate < source.index(api_exec)
     assert prewarm_only_gate < stable_api_gate < stable_api_exec_index
@@ -1919,6 +1920,16 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     assert stable_api_module < source.index(api_exec)
     assert source.count(api_exec) == 1
     assert f"\nfi\n{api_exec}" in source
+    assert source.count(engine_startup_timeout) == 2
+    stable_startup_timeout = source.index(
+        engine_startup_timeout, stable_api_module
+    )
+    fallback_api_module = source.index(api_exec)
+    fallback_startup_timeout = source.index(
+        engine_startup_timeout, fallback_api_module
+    )
+    assert stable_api_module < stable_startup_timeout < fallback_api_module
+    assert fallback_api_module < fallback_startup_timeout
     between_gate_and_api = source[
         source.rindex(final_journal_gate) + len(final_journal_gate) : source.index(
             api_exec

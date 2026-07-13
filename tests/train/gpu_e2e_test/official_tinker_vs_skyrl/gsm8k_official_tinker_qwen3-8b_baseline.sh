@@ -32,7 +32,7 @@ SERVER_PID=$!
 trap 'kill -TERM -- -$SERVER_PID 2>/dev/null || true; sleep 5; kill -KILL -- -$SERVER_PID 2>/dev/null || true' EXIT
 
 deadline=$(( $(date +%s) + 1800 ))
-until curl -sSf http://localhost:8000/docs >/dev/null 2>&1; do
+until curl -sSf http://localhost:8000/api/v1/healthz >/dev/null 2>&1; do
   if (( $(date +%s) > deadline )); then
     echo "Tinker server did not become ready within 30 minutes" >&2
     tail -n 200 "$LOG_DIR/server.log" >&2 || true

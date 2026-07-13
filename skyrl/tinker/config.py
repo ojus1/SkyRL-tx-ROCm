@@ -68,6 +68,20 @@ class EngineConfig(BaseModel):
         default=300,
         description="Seconds without heartbeat before session is considered stale. Set to -1 to disable cleanup.",
     )
+    startup_launch_id: str | None = Field(
+        default=None,
+        description=(
+            "Internal API-generated engine launch identifier. Direct API users "
+            "must leave this unset."
+        ),
+        json_schema_extra={"argparse_type": str},
+    )
+    engine_startup_timeout_sec: int = Field(
+        default=600,
+        ge=1,
+        le=7200,
+        description="Maximum seconds for the background engine to publish readiness.",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):
@@ -130,7 +144,7 @@ def config_to_argv(cfg: BaseModel) -> list[str]:
     """This should 'unparse' a config parsed by an ArgumentParser constructed by add_model."""
     argv = []
     for field_name, value in cfg.model_dump().items():
-        field = cfg.model_fields[field_name]
+        field = type(cfg).model_fields[field_name]
         arg_name = field_name.replace("_", "-")
 
         if field.annotation is bool:

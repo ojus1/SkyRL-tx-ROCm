@@ -789,7 +789,24 @@ def test_api_source_preserves_validated_launch_lock_for_nested_engine():
 
     assert 'runtime_launch_lock_attestation["descriptor"]' in source
     assert 'subprocess_options["pass_fds"]' in source
+    assert 'subprocess_options["start_new_session"] = True' in source
     assert "asyncio.create_subprocess_exec(" in source
+
+
+def test_build_cmd_engine_passes_internal_launch_id_once():
+    launch_id = "0123456789abcdef0123456789abcdef"
+    config = EngineConfig(
+        backend="jax",
+        base_model="Qwen/Qwen3-0.6B",
+        startup_launch_id=launch_id,
+    )
+    command = _build_uv_run_cmd_engine(
+        ["uv", "run", "-m", "skyrl.tinker.api"], config
+    )
+
+    assert command.count("--startup-launch-id") == 1
+    index = command.index("--startup-launch-id")
+    assert command[index + 1] == launch_id
 
 
 @pytest.mark.parametrize(

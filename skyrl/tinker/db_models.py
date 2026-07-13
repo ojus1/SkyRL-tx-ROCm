@@ -3,14 +3,14 @@
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import DateTime, event
+from sqlalchemy import BigInteger, DateTime, event
 from sqlalchemy.engine import url as sqlalchemy_url
 from sqlmodel import JSON, Field, SQLModel
 
 from skyrl.tinker import types
 
 
-def enable_sqlite_wal(engine) -> None:
+def enable_sqlite_wal(engine, *, busy_timeout_ms: int = 30_000) -> None:
     """Enable WAL mode and busy timeout for SQLite engines.
 
     WAL mode allows concurrent readers with a single writer.
@@ -21,12 +21,14 @@ def enable_sqlite_wal(engine) -> None:
     """
     if engine.dialect.name != "sqlite":
         return
+    if type(busy_timeout_ms) is not int or busy_timeout_ms < 0:
+        raise ValueError("SQLite busy timeout must be a nonnegative integer")
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
+        cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
 
 
@@ -72,6 +74,16 @@ class CheckpointStatus(str, Enum):
     PENDING = "pending"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class EngineLaunchStatus(str, Enum):
+    """Lifecycle state for one API-bound engine subprocess."""
+
+    STARTING = "starting"
+    INITIALIZING = "initializing"
+    READY = "ready"
+    FAILED = "failed"
+    STOPPED = "stopped"
 
 
 # SQLModel table definitions
@@ -153,3 +165,40 @@ class EngineStateDB(SQLModel, table=True):
     inference_proxy_url: str | None = None
 
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_type=DateTime(timezone=True))
+
+
+class EngineLaunchDB(SQLModel, table=True):
+    """Per-launch readiness handoff; additive and safe for legacy databases."""
+
+    __tablename__ = "engine_launches"
+
+    launch_id: str = Field(primary_key=True)
+    backend: str
+    status: EngineLaunchStatus = Field(default=EngineLaunchStatus.STARTING, index=True)
+    boot_id: str
+    api_pid: int
+    api_start_ticks: int = Field(sa_type=BigInteger)
+    engine_launcher_pid: int | None = None
+    engine_launcher_start_ticks: int | None = Field(default=None, sa_type=BigInteger)
+    engine_pid: int | None = None
+    engine_start_ticks: int | None = Field(default=None, sa_type=BigInteger)
+    api_source_attestation: dict[str, object] = Field(default_factory=dict, sa_type=JSON)
+    api_launch_lock_attestation: dict[str, object] = Field(default_factory=dict, sa_type=JSON)
+    engine_source_attestation: dict[str, object] = Field(default_factory=dict, sa_type=JSON)
+    engine_launch_lock_attestation: dict[str, object] = Field(default_factory=dict, sa_type=JSON)
+    runtime_handoff_attestation: dict[str, object] = Field(default_factory=dict, sa_type=JSON)
+    cache_evidence_status: str = Field(default="not_required", index=True)
+    cache_evidence: dict[str, object] = Field(default_factory=dict, sa_type=JSON)
+    error_message: str | None = None
+    heartbeat_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    heartbeat_monotonic_ns: int | None = Field(default=None, sa_type=BigInteger)
+    heartbeat_sequence: int = Field(default=0, sa_type=BigInteger)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_type=DateTime(timezone=True),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_type=DateTime(timezone=True),
+    )
+    ready_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))

@@ -1017,6 +1017,7 @@ if [[ -n "$prewarm_buckets" ]]; then
     --host 127.0.0.1 \
     --port "$port" \
     --checkpoints-base "$run_dir/checkpoints" \
+    --engine-startup-timeout-sec 3600 \
     --database-url "sqlite:///$run_dir/tinker.db"
 fi
 exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api \
@@ -1026,4 +1027,5 @@ exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api \
   --host 127.0.0.1 \
   --port "$port" \
   --checkpoints-base "$run_dir/checkpoints" \
+  --engine-startup-timeout-sec 3600 \
   --database-url "sqlite:///$run_dir/tinker.db"
