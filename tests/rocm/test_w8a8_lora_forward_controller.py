@@ -536,6 +536,37 @@ def _write_private(path: Path, payload: str) -> None:
     path.chmod(0o600)
 
 
+def _valid_independent_ir_pair() -> tuple[str, str]:
+    marker = "skyrl_qwen35_w8a8_lora_forward"
+    stable = (
+        "module {\n"
+        "  func.func public @main(%arg0: tensor<3x64xbf16>, "
+        "%arg1: tensor<64x17xi8>, %arg2: tensor<1x17xbf16>, "
+        "%arg3: tensor<64x8xbf16>, %arg4: tensor<8x17xbf16>, "
+        "%arg5: tensor<f32>) -> (tensor<3x17xbf16> "
+        '{jax.result_info = "result"}) {\n'
+        "    %0 = stablehlo.custom_call @__gpu$xla.gpu.triton() "
+        f'{{mhlo.backend_config = {{ir = "payload\\00{marker}\\00", '
+        f'name = "{marker}"}}}} : () -> tensor<16x17xbf16>\n'
+        "    %1 = stablehlo.slice %0 : tensor<16x17xbf16>\n"
+        "    return %1 : tensor<3x17xbf16>\n"
+        "  }\n"
+        "}\n"
+    )
+    optimized = (
+        "ENTRY %main.6 (%x: bf16[3,64], %codes: s8[64,17], "
+        "%scales: bf16[1,17], %a: bf16[64,8], %b: bf16[8,17], "
+        "%scale: f32[]) -> bf16[3,17] {\n"
+        "  %0 = bf16[16,17] custom-call(), "
+        'custom_call_target="__gpu$xla.gpu.triton", '
+        f'metadata={{op_name="jit(candidate)/{marker}/pallas_call"}}, '
+        f'backend_config={{ir="payload\\00{marker}\\00", name="{marker}"}}\n'
+        "  ROOT %1 = bf16[3,17] fusion(%0)\n"
+        "}\n"
+    )
+    return stable, optimized
+
+
 def test_independent_ir_gate_rejects_signature_tokens_supplied_only_in_comments() -> (
     None
 ):
@@ -544,7 +575,7 @@ def test_independent_ir_gate_rejects_signature_tokens_supplied_only_in_comments(
         "  // tensor<3x64xbf16> tensor<64x17xi8> tensor<1x17xbf16> "
         "tensor<64x8xbf16> tensor<8x17xbf16> tensor<f32> tensor<3x17xbf16>\n"
         "  %0 = stablehlo.custom_call @__gpu$xla.gpu.triton() "
-        '{backend_config="skyrl_qwen35_w8a8_lora_forward"} : '
+        '{mhlo.backend_config={name="skyrl_qwen35_w8a8_lora_forward"}} : '
         "() -> tensor<1xf32>\n"
         "  return %0 : tensor<1xf32>\n"
         "}\n"
@@ -554,7 +585,8 @@ def test_independent_ir_gate_rejects_signature_tokens_supplied_only_in_comments(
         "  // bf16[3,64] s8[64,17] bf16[1,17] bf16[64,8] bf16[8,17] "
         "f32[] bf16[3,17]\n"
         '  ROOT %0 = f32[1] custom-call(), custom_call_target="__gpu$xla.gpu.triton", '
-        'op_name="skyrl_qwen35_w8a8_lora_forward"\n'
+        'metadata={op_name="jit(candidate)/skyrl_qwen35_w8a8_lora_forward/pallas_call"}, '
+        'backend_config={name="skyrl_qwen35_w8a8_lora_forward"}\n'
         "}\n"
     )
 
@@ -565,32 +597,111 @@ def test_independent_ir_gate_rejects_signature_tokens_supplied_only_in_comments(
     assert result["checks"]["optimized_hlo_exact_entry_signature"] is False
 
 
+def test_independent_ir_gate_accepts_realistic_duplicate_metadata() -> None:
+    stable, optimized = _valid_independent_ir_pair()
+
+    result = _CONTROLLER._independent_ir_gate(stable, optimized)
+
+    assert result["passed"] is True
+
+
+def test_independent_ir_gate_rejects_backend_name_and_target_decoys() -> None:
+    marker = "skyrl_qwen35_w8a8_lora_forward"
+    stable, optimized = _valid_independent_ir_pair()
+    exact_name = f'name="{marker}"'
+    exact_target = 'custom_call_target="__gpu$xla.gpu.triton"'
+    optimized_cases = [
+        optimized.replace(exact_name, 'name="wrong"'),
+        optimized.replace(exact_name, f'debug={{name="{marker}"}}'),
+        optimized.replace(exact_name, f"{exact_name}, {exact_name}"),
+        optimized.replace(exact_name, f"/* {exact_name} */"),
+        optimized.replace(exact_name, f'fake-name="{marker}"'),
+        optimized.replace(
+            exact_target,
+            'custom_call_target="wrong", '
+            'target_decoy={custom_call_target="__gpu$xla.gpu.triton"}',
+        ),
+        optimized.replace(exact_target, f"{exact_target}, {exact_target}"),
+    ]
+
+    for candidate in optimized_cases:
+        assert _CONTROLLER._independent_ir_gate(stable, candidate)["passed"] is False
+
+
+def test_independent_ir_gate_rejects_backend_map_scope_decoys() -> None:
+    marker = "skyrl_qwen35_w8a8_lora_forward"
+    stable, optimized = _valid_independent_ir_pair()
+    stable_map = (
+        f'mhlo.backend_config = {{ir = "payload\\00{marker}\\00", name = "{marker}"}}'
+    )
+    optimized_map = f'backend_config={{ir="payload\\00{marker}\\00", name="{marker}"}}'
+    nested_stable = stable.replace(stable_map, f"metadata = {{{stable_map}}}")
+    nested_optimized = optimized.replace(
+        optimized_map, f"metadata_decoy={{{optimized_map}}}"
+    )
+
+    assert _CONTROLLER._independent_ir_gate(nested_stable, optimized)["passed"] is False
+    assert _CONTROLLER._independent_ir_gate(stable, nested_optimized)["passed"] is False
+
+
+def test_independent_ir_gate_rejects_dead_call_and_control_dependency() -> None:
+    stable, optimized = _valid_independent_ir_pair()
+    dead_stable = stable.replace(
+        "    %1 = stablehlo.slice %0 : tensor<16x17xbf16>\n",
+        "    %1 = stablehlo.constant dense<0> : tensor<3x17xbf16>\n",
+    )
+    dead_optimized = optimized.replace(
+        "  ROOT %1 = bf16[3,17] fusion(%0)\n",
+        "  ROOT %1 = bf16[3,17] constant(0), control-predecessors={%0}\n",
+    )
+
+    assert _CONTROLLER._independent_ir_gate(dead_stable, optimized)["passed"] is False
+    assert _CONTROLLER._independent_ir_gate(stable, dead_optimized)["passed"] is False
+
+
+def test_independent_ir_gate_rejects_call_owned_only_by_dead_helper() -> None:
+    stable, optimized = _valid_independent_ir_pair()
+    stable_call = next(
+        line for line in stable.splitlines() if "stablehlo.custom_call" in line
+    )
+    stable_without_live_call = stable.replace(
+        stable_call,
+        "    %0 = stablehlo.constant dense<0> : tensor<16x17xbf16>",
+    )
+    dead_stable = (
+        stable_without_live_call.removesuffix("}\n")
+        + "  func.func private @dead() -> tensor<16x17xbf16> {\n"
+        + stable_call
+        + "\n    return %0 : tensor<16x17xbf16>\n  }\n}\n"
+    )
+    optimized_call = next(
+        line for line in optimized.splitlines() if "custom-call" in line
+    )
+    optimized_without_live_call = optimized.replace(
+        optimized_call, "  %0 = bf16[16,17] constant(0)"
+    )
+    dead_optimized = (
+        "%dead {\n"
+        + optimized_call
+        + "\n  ROOT %dead_root = bf16[16,17] copy(%0)\n}\n\n"
+        + optimized_without_live_call
+    )
+
+    stable_result = _CONTROLLER._independent_ir_gate(dead_stable, optimized)
+    optimized_result = _CONTROLLER._independent_ir_gate(stable, dead_optimized)
+
+    assert stable_result["passed"] is False
+    assert stable_result["checks"]["stablehlo_call_owned_by_public_main"] is False
+    assert optimized_result["passed"] is False
+    assert optimized_result["checks"]["optimized_hlo_call_owned_by_entry"] is False
+
+
 def test_evidence_audit_reparses_raw_ir_and_requires_two_measured_samples(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path
     run_dir.chmod(0o700)
-    stable_text = (
-        "module {\n"
-        "  func.func public @main(%arg0: tensor<3x64xbf16>, "
-        "%arg1: tensor<64x17xi8>, %arg2: tensor<1x17xbf16>, "
-        "%arg3: tensor<64x8xbf16>, %arg4: tensor<8x17xbf16>, "
-        "%arg5: tensor<f32>) -> tensor<3x17xbf16> {\n"
-        "    %0 = stablehlo.custom_call @__gpu$xla.gpu.triton() "
-        '{backend_config = "skyrl_qwen35_w8a8_lora_forward"} : '
-        "() -> tensor<3x17xbf16>\n"
-        "    return %0 : tensor<3x17xbf16>\n"
-        "  }\n"
-        "}\n"
-    )
-    optimized_text = (
-        "ENTRY %main (%x: bf16[3,64], %codes: s8[64,17], "
-        "%scales: bf16[1,17], %a: bf16[64,8], %b: bf16[8,17], "
-        "%scale: f32[]) -> bf16[3,17] {\n"
-        '  ROOT %0 = bf16[3,17] custom-call(), custom_call_target="__gpu$xla.gpu.triton", '
-        'op_name="skyrl_qwen35_w8a8_lora_forward"\n'
-        "}\n"
-    )
+    stable_text, optimized_text = _valid_independent_ir_pair()
     stable_sha = hashlib.sha256(stable_text.encode()).hexdigest()
     optimized_sha = hashlib.sha256(optimized_text.encode()).hexdigest()
     telemetry_records = [

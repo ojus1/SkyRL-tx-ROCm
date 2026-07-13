@@ -376,26 +376,32 @@ def test_host_case_detects_every_missing_lora_rank_and_output_column() -> None:
 
 
 def _stablehlo(target: str = "__gpu$xla.gpu.triton", *, backward=False) -> str:
-    marker = _PROBE._EXPECTED_KERNEL_NAME
+    name = _PROBE._EXPECTED_KERNEL_NAME
+    marker = name
     if backward:
         marker += " w8a16_lora_input_vjp"
     return (
         "module {\n"
-        f"  %0 = stablehlo.custom_call @{target}() "
-        f'{{backend_config = "{marker}"}} : () -> tensor<1xf32>\n'
-        "  return\n"
+        "  func.func public @main() -> tensor<1xf32> {\n"
+        f"    %0 = stablehlo.custom_call @{target}() "
+        f'{{mhlo.backend_config = {{ir = "payload\\00{marker}\\00", '
+        f'name = "{name}"}}}} : () -> tensor<1xf32>\n'
+        "    return %0 : tensor<1xf32>\n"
+        "  }\n"
         "}\n"
     )
 
 
 def _optimized_hlo(target: str = "__gpu$xla.gpu.triton", *, backward=False) -> str:
-    marker = _PROBE._EXPECTED_KERNEL_NAME
+    name = _PROBE._EXPECTED_KERNEL_NAME
+    marker = name
     if backward:
         marker += " w8a16_lora_input_vjp"
     return (
-        "ENTRY main {\n"
+        "ENTRY %main () -> f32[1] {\n"
         f'  ROOT %0 = f32[1] custom-call(), custom_call_target="{target}", '
-        f'op_name="{marker}"\n'
+        f'metadata={{op_name="jit(candidate)/{marker}/pallas_call"}}, '
+        f'backend_config={{ir="payload\\00{marker}\\00", name="{name}"}}\n'
         "}\n"
     )
 
@@ -407,6 +413,9 @@ def test_structural_gate_accepts_only_the_named_forward_triton_call() -> None:
     proof = _PROBE._structural_gate(stable, optimized)
 
     assert proof["passed"] is True
+    assert stable["expected_kernel_marker_count"] == 1
+    assert optimized["expected_kernel_marker_count"] == 2
+    assert optimized["custom_call_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -432,20 +441,21 @@ def test_structural_gate_rejects_wrong_target_backward_or_extra_call(
     "text",
     [
         _stablehlo().replace(
-            "  return\n",
-            "  %1 = stablehlo.custom_call @hipGraphLaunch() : () -> tensor<1xf32>\n"
-            "  return\n",
+            "    return %0 : tensor<1xf32>\n",
+            "    %1 = stablehlo.custom_call @hipGraphLaunch() : () -> tensor<1xf32>\n"
+            "    return %0 : tensor<1xf32>\n",
         ),
         _stablehlo().replace(
             _PROBE._EXPECTED_KERNEL_NAME,
             _PROBE._EXPECTED_KERNEL_NAME + "_lookalike",
         ),
         _stablehlo().replace(
-            "  return\n", "  %1 = stablehlo.while () : () -> ()\n  return\n"
+            "    return %0 : tensor<1xf32>\n",
+            "    %1 = stablehlo.while () : () -> ()\n    return %0 : tensor<1xf32>\n",
         ),
         _stablehlo().replace(
-            _PROBE._EXPECTED_KERNEL_NAME,
-            _PROBE._EXPECTED_KERNEL_NAME + " hipGraphLaunch",
+            f"payload\\00{_PROBE._EXPECTED_KERNEL_NAME}\\00",
+            f"payload\\00{_PROBE._EXPECTED_KERNEL_NAME} hipGraphLaunch\\00",
         ),
     ],
 )
@@ -464,6 +474,166 @@ def test_optimized_parser_counts_whitespace_before_call_parenthesis() -> None:
     assert summary["raw_custom_call_opcode_count"] == 1
     assert summary["custom_call_count"] == 1
     assert summary["custom_call_parser_consistent"] is True
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        'kernel="wrong"',
+        'name="wrong"',
+        f'debug={{name="{_PROBE._EXPECTED_KERNEL_NAME}"}}',
+        f'name="{_PROBE._EXPECTED_KERNEL_NAME}", name="{_PROBE._EXPECTED_KERNEL_NAME}"',
+        f'/* name="{_PROBE._EXPECTED_KERNEL_NAME}" */',
+        f'fake-name="{_PROBE._EXPECTED_KERNEL_NAME}"',
+    ],
+)
+def test_optimized_gate_rejects_backend_name_decoys(replacement: str) -> None:
+    exact = f'name="{_PROBE._EXPECTED_KERNEL_NAME}"'
+    text = _optimized_hlo().replace(exact, replacement)
+
+    summary = _PROBE._ir_summary(text, "optimized_hlo")
+
+    assert (
+        _PROBE._structural_gate(_PROBE._ir_summary(_stablehlo(), "stablehlo"), summary)[
+            "passed"
+        ]
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        'kernel = "wrong"',
+        'name = "wrong"',
+        f'debug = {{name = "{_PROBE._EXPECTED_KERNEL_NAME}"}}',
+        f'name = "{_PROBE._EXPECTED_KERNEL_NAME}", '
+        f'name = "{_PROBE._EXPECTED_KERNEL_NAME}"',
+        f'/* name = "{_PROBE._EXPECTED_KERNEL_NAME}" */',
+        f'fake-name = "{_PROBE._EXPECTED_KERNEL_NAME}"',
+    ],
+)
+def test_stable_gate_rejects_backend_name_decoys(replacement: str) -> None:
+    exact = f'name = "{_PROBE._EXPECTED_KERNEL_NAME}"'
+    text = _stablehlo().replace(exact, replacement)
+
+    assert (
+        _PROBE._stablehlo_gate(_PROBE._ir_summary(text, "stablehlo"))["passed"] is False
+    )
+
+
+def test_optimized_gate_rejects_nested_or_duplicate_target_decoys() -> None:
+    exact = 'custom_call_target="__gpu$xla.gpu.triton"'
+    cases = [
+        'custom_call_target="wrong", '
+        'metadata={custom_call_target="__gpu$xla.gpu.triton"}',
+        f"{exact}, {exact}",
+    ]
+
+    stable = _PROBE._ir_summary(_stablehlo(), "stablehlo")
+    for replacement in cases:
+        optimized = _PROBE._ir_summary(
+            _optimized_hlo().replace(exact, replacement), "optimized_hlo"
+        )
+        assert _PROBE._structural_gate(stable, optimized)["passed"] is False
+
+
+def test_probe_gates_reject_backend_map_scope_decoys() -> None:
+    marker = _PROBE._EXPECTED_KERNEL_NAME
+    stable = _stablehlo()
+    optimized = _optimized_hlo()
+    stable_map = (
+        f'mhlo.backend_config = {{ir = "payload\\00{marker}\\00", name = "{marker}"}}'
+    )
+    optimized_map = f'backend_config={{ir="payload\\00{marker}\\00", name="{marker}"}}'
+    nested_stable = stable.replace(stable_map, f"metadata = {{{stable_map}}}")
+    nested_optimized = optimized.replace(
+        optimized_map, f"metadata_decoy={{{optimized_map}}}"
+    )
+
+    assert (
+        _PROBE._stablehlo_gate(_PROBE._ir_summary(nested_stable, "stablehlo"))["passed"]
+        is False
+    )
+    assert (
+        _PROBE._structural_gate(
+            _PROBE._ir_summary(stable, "stablehlo"),
+            _PROBE._ir_summary(nested_optimized, "optimized_hlo"),
+        )["passed"]
+        is False
+    )
+
+
+def test_probe_gates_reject_dead_call_and_control_dependency() -> None:
+    stable = _stablehlo()
+    optimized = _optimized_hlo()
+    dead_stable = stable.replace(
+        "    return %0 : tensor<1xf32>\n",
+        "    %1 = stablehlo.constant dense<0.0> : tensor<1xf32>\n"
+        "    return %1 : tensor<1xf32>\n",
+    )
+    dead_optimized = optimized.replace(
+        "  ROOT %0 = f32[1] custom-call()",
+        "  %0 = f32[1] custom-call()",
+    )
+    dead_optimized = (
+        dead_optimized.removesuffix("}\n")
+        + "  ROOT %1 = f32[1] constant(0), control-predecessors={%0}\n}\n"
+    )
+
+    assert (
+        _PROBE._stablehlo_gate(_PROBE._ir_summary(dead_stable, "stablehlo"))["passed"]
+        is False
+    )
+    assert (
+        _PROBE._structural_gate(
+            _PROBE._ir_summary(stable, "stablehlo"),
+            _PROBE._ir_summary(dead_optimized, "optimized_hlo"),
+        )["passed"]
+        is False
+    )
+
+
+def test_probe_gates_reject_call_owned_only_by_dead_helper() -> None:
+    stable = _stablehlo()
+    optimized = _optimized_hlo()
+    stable_call = next(
+        line for line in stable.splitlines() if "stablehlo.custom_call" in line
+    )
+    stable_without_live_call = stable.replace(
+        stable_call, "    %0 = stablehlo.constant dense<0.0> : tensor<1xf32>"
+    )
+    dead_stable = (
+        stable_without_live_call.removesuffix("}\n")
+        + "  func.func private @dead() -> tensor<1xf32> {\n"
+        + stable_call
+        + "\n    return %0 : tensor<1xf32>\n  }\n}\n"
+    )
+    optimized_call = next(
+        line for line in optimized.splitlines() if "custom-call" in line
+    )
+    optimized_without_live_call = optimized.replace(
+        optimized_call, "  ROOT %0 = f32[1] constant(0)"
+    )
+    dead_optimized = (
+        "%dead {\n"
+        + optimized_call.replace("  ROOT ", "  ")
+        + "\n  ROOT %dead_root = f32[1] copy(%0)\n}\n\n"
+        + optimized_without_live_call
+    )
+
+    stable_summary = _PROBE._ir_summary(dead_stable, "stablehlo")
+    optimized_summary = _PROBE._ir_summary(dead_optimized, "optimized_hlo")
+
+    assert stable_summary["sole_custom_call_owned_by_entry"] is False
+    assert _PROBE._stablehlo_gate(stable_summary)["passed"] is False
+    assert optimized_summary["sole_custom_call_owned_by_entry"] is False
+    assert (
+        _PROBE._structural_gate(
+            _PROBE._ir_summary(stable, "stablehlo"), optimized_summary
+        )["passed"]
+        is False
+    )
 
 
 @pytest.mark.parametrize(

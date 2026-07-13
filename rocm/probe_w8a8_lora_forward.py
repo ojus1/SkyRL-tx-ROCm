@@ -1003,8 +1003,63 @@ def _construct_host_case() -> tuple[tuple[Any, ...], list[dict[str, Any]], Any]:
     return arguments, manifests, expected
 
 
+def _mask_ir_strings_and_comments(text: str) -> str:
+    masked = list(text)
+    state = "plain"
+    escaped = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if state == "quoted":
+            if character == "\n":
+                raise RuntimeError("compiler IR contains a multiline quoted string")
+            masked[index] = " "
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                masked[index] = '"'
+                state = "plain"
+        elif state == "line_comment":
+            if character == "\n":
+                state = "plain"
+            else:
+                masked[index] = " "
+        elif state == "block_comment":
+            if character != "\n":
+                masked[index] = " "
+            if character == "/" and following == "*":
+                raise RuntimeError("compiler IR contains a nested block comment")
+            if character == "*" and following == "/":
+                masked[index + 1] = " "
+                state = "plain"
+                index += 1
+        elif character == '"':
+            state = "quoted"
+            masked[index] = '"'
+        elif character == "/" and following == "/":
+            state = "line_comment"
+            masked[index] = masked[index + 1] = " "
+            index += 1
+        elif character == "/" and following == "*":
+            state = "block_comment"
+            masked[index] = masked[index + 1] = " "
+            index += 1
+        elif character == "*" and following == "/":
+            raise RuntimeError("compiler IR contains an orphan block-comment close")
+        index += 1
+    if state == "quoted":
+        raise RuntimeError("compiler IR contains an unterminated quoted string")
+    if state == "block_comment":
+        raise RuntimeError("compiler IR contains an unterminated block comment")
+    return "".join(masked)
+
+
 def _custom_call_blocks(text: str, dialect: str) -> list[str]:
-    lines = text.splitlines()
+    raw_lines = text.splitlines()
+    masked_lines = _mask_ir_strings_and_comments(text).splitlines()
     if dialect == "stablehlo":
         start = re.compile(r"^(?P<indent>\s*)%[^=]+?=\s*stablehlo\.custom_call\b")
         boundary = re.compile(
@@ -1019,16 +1074,16 @@ def _custom_call_blocks(text: str, dialect: str) -> list[str]:
         raise ValueError(f"unsupported IR dialect: {dialect}")
     blocks: list[str] = []
     index = 0
-    while index < len(lines):
-        match = start.search(lines[index])
+    while index < len(masked_lines):
+        match = start.search(masked_lines[index])
         if match is None:
             index += 1
             continue
         base_indent = len(match.group("indent").expandtabs())
-        block = [lines[index]]
+        block = [raw_lines[index]]
         index += 1
-        while index < len(lines):
-            candidate = lines[index]
+        while index < len(masked_lines):
+            candidate = masked_lines[index]
             candidate_indent = len(candidate) - len(candidate.lstrip(" \t"))
             if (
                 candidate.strip()
@@ -1036,38 +1091,276 @@ def _custom_call_blocks(text: str, dialect: str) -> list[str]:
                 and boundary.match(candidate)
             ):
                 break
-            block.append(candidate)
+            block.append(raw_lines[index])
             index += 1
         blocks.append("\n".join(block))
     return blocks
 
 
-def _call_targets(block: str, dialect: str) -> set[str]:
-    targets = set(
-        re.findall(r"(?:call_target_name|custom_call_target)\s*=\s*\"([^\"]+)\"", block)
+def _top_level_string_attribute_values(text: str, attribute: str) -> list[str]:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", attribute) is None:
+        raise ValueError(f"invalid IR attribute name: {attribute}")
+    structural = _mask_ir_strings_and_comments(text)
+    assignment = re.compile(
+        rf"(?<![A-Za-z0-9_.$-]){re.escape(attribute)}"
+        rf"(?![A-Za-z0-9_.$-])\s*=\s*\""
     )
-    if dialect == "stablehlo":
-        for match in re.finditer(
-            r"\bstablehlo\.custom_call\s+@(?:\"([^\"]+)\"|([A-Za-z0-9_.$-]+))",
-            block,
+    values: list[str] = []
+    depths = {"{": 0, "[": 0, "(": 0}
+    closing = {"}": "{", "]": "[", ")": "("}
+    index = 0
+    while index < len(structural):
+        if not any(depths.values()):
+            match = assignment.match(structural, index)
+            if match is not None:
+                opening_quote = structural.find('"', match.start(), match.end())
+                closing_quote = structural.find('"', opening_quote + 1)
+                if opening_quote < 0 or closing_quote < 0:
+                    raise RuntimeError("compiler IR string attribute is malformed")
+                value = text[opening_quote + 1 : closing_quote]
+                if re.fullmatch(r"[A-Za-z0-9_.$-]+", value) is None:
+                    raise RuntimeError("compiler IR string attribute is not canonical")
+                values.append(value)
+                index = closing_quote + 1
+                continue
+        character = structural[index]
+        if character in depths:
+            depths[character] += 1
+        elif character in closing:
+            opening = closing[character]
+            depths[opening] -= 1
+            if depths[opening] < 0:
+                raise RuntimeError("compiler IR delimiters are unbalanced")
+        index += 1
+    if any(depths.values()):
+        raise RuntimeError("compiler IR delimiters are unbalanced")
+    return values
+
+
+def _map_attribute_contents(
+    text: str, attribute: str, *, required_brace_depth: int
+) -> list[str]:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", attribute) is None:
+        raise ValueError(f"invalid IR map attribute name: {attribute}")
+    structural = _mask_ir_strings_and_comments(text)
+    assignment = re.compile(
+        rf"(?<![A-Za-z0-9_.$-]){re.escape(attribute)}"
+        rf"(?![A-Za-z0-9_.$-])\s*=\s*\{{"
+    )
+    contents: list[str] = []
+    depths = {"{": 0, "[": 0, "(": 0}
+    closing = {"}": "{", "]": "[", ")": "("}
+    index = 0
+    while index < len(structural):
+        if (
+            depths["{"] == required_brace_depth
+            and depths["["] == 0
+            and depths["("] == 0
         ):
-            targets.add(match.group(1) or match.group(2))
-    return targets
+            match = assignment.match(structural, index)
+            if match is not None:
+                opening = structural.rfind("{", match.start(), match.end())
+                depth = 1
+                cursor = opening + 1
+                while cursor < len(structural) and depth:
+                    if structural[cursor] == "{":
+                        depth += 1
+                    elif structural[cursor] == "}":
+                        depth -= 1
+                    cursor += 1
+                if depth:
+                    raise RuntimeError("compiler IR map attribute is unterminated")
+                contents.append(text[opening + 1 : cursor - 1])
+                index = cursor
+                continue
+        character = structural[index]
+        if character in depths:
+            depths[character] += 1
+        elif character in closing:
+            opening = closing[character]
+            depths[opening] -= 1
+            if depths[opening] < 0:
+                raise RuntimeError("compiler IR delimiters are unbalanced")
+        index += 1
+    if any(depths.values()):
+        raise RuntimeError("compiler IR delimiters are unbalanced")
+    return contents
+
+
+def _call_targets(block: str, dialect: str) -> list[str]:
+    if dialect == "optimized_hlo":
+        return _top_level_string_attribute_values(block, "custom_call_target")
+    if dialect != "stablehlo":
+        raise ValueError(f"unsupported IR dialect: {dialect}")
+    structural = _mask_ir_strings_and_comments(block)
+    return re.findall(r"\bstablehlo\.custom_call\s+@([A-Za-z0-9_.$-]+)", structural)
+
+
+def _kernel_name_binding(block: str, dialect: str) -> dict[str, Any]:
+    attribute = "mhlo.backend_config" if dialect == "stablehlo" else "backend_config"
+    maps = _map_attribute_contents(
+        block,
+        attribute,
+        required_brace_depth=1 if dialect == "stablehlo" else 0,
+    )
+    names = (
+        _top_level_string_attribute_values(maps[0], "name") if len(maps) == 1 else []
+    )
+    return {"backend_config_map_count": len(maps), "names": names}
+
+
+def _entry_regions(text: str, dialect: str) -> list[dict[str, tuple[int, int]]]:
+    prefix = re.compile(
+        r"\bfunc\.func\s+public\s+@main\s*\("
+        if dialect == "stablehlo"
+        else r"\bENTRY\s+%?main(?:\.[A-Za-z0-9_.-]+)?\s*\("
+    )
+    regions: list[dict[str, tuple[int, int]]] = []
+    for match in prefix.finditer(text):
+        parenthesis_depth = 1
+        square_depth = 0
+        cursor = match.end()
+        body_opening = -1
+        while cursor < len(text):
+            character = text[cursor]
+            if character == "(":
+                parenthesis_depth += 1
+            elif character == ")":
+                parenthesis_depth -= 1
+                if parenthesis_depth < 0:
+                    raise RuntimeError("compiler IR entry header is malformed")
+            elif character == "[":
+                square_depth += 1
+            elif character == "]":
+                square_depth -= 1
+                if square_depth < 0:
+                    raise RuntimeError("compiler IR entry header is malformed")
+            elif character == "{" and parenthesis_depth == 0 and square_depth == 0:
+                body_opening = cursor
+                break
+            cursor += 1
+        if body_opening < 0:
+            raise RuntimeError("compiler IR entry body has no opening brace")
+        depth = 1
+        cursor = body_opening + 1
+        while cursor < len(text) and depth:
+            if text[cursor] == "{":
+                depth += 1
+            elif text[cursor] == "}":
+                depth -= 1
+            cursor += 1
+        if depth:
+            raise RuntimeError("compiler IR entry body is unterminated")
+        regions.append(
+            {
+                "header": (match.start(), body_opening),
+                "body": (body_opening + 1, cursor - 1),
+            }
+        )
+    return regions
+
+
+def _entry_result_flow(
+    text: str, entry: dict[str, tuple[int, int]] | None, dialect: str
+) -> dict[str, Any]:
+    if entry is None:
+        return {"call_results": [], "output_sinks": [], "passed": False}
+    body = text[slice(*entry["body"])]
+    definition = re.compile(
+        r"^\s*(?P<root>ROOT\s+)?(?P<lhs>%[A-Za-z0-9_.-]+)\s*=\s*(?P<rhs>.*)$"
+    )
+    reference = re.compile(r"%[A-Za-z0-9_.-]+")
+    call_pattern = re.compile(
+        r"\bstablehlo\.custom_call\b"
+        if dialect == "stablehlo"
+        else r"\bcustom-call\s*\("
+    )
+    graph: dict[str, list[str]] = {}
+    call_results: list[str] = []
+    output_sinks: list[str] = []
+
+    def data_references(rhs: str) -> list[str]:
+        if dialect == "stablehlo":
+            return reference.findall(rhs.split(" : ", maxsplit=1)[0])
+        opening = rhs.find("(")
+        if opening < 0:
+            return []
+        depth = 1
+        cursor = opening + 1
+        while cursor < len(rhs) and depth:
+            if rhs[cursor] == "(":
+                depth += 1
+            elif rhs[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            raise RuntimeError("optimized HLO opcode operands are malformed")
+        return reference.findall(rhs[opening + 1 : cursor - 1])
+
+    for line in body.splitlines():
+        match = definition.match(line)
+        if match is not None:
+            lhs = match.group("lhs")
+            rhs = match.group("rhs")
+            graph[lhs] = data_references(rhs)
+            if call_pattern.search(rhs) is not None:
+                call_results.append(lhs)
+            if dialect == "optimized_hlo" and match.group("root") is not None:
+                output_sinks.append(lhs)
+        elif dialect == "stablehlo" and re.match(r"^\s*(?:stablehlo\.)?return\b", line):
+            output_sinks.extend(reference.findall(line.split(" : ", maxsplit=1)[0]))
+
+    def reaches_call(node: str, call_result: str, seen: set[str]) -> bool:
+        if node == call_result:
+            return True
+        if node in seen:
+            return False
+        return any(
+            reaches_call(dependency, call_result, seen | {node})
+            for dependency in graph.get(node, [])
+        )
+
+    passed = (
+        len(call_results) == 1
+        and len(output_sinks) == 1
+        and reaches_call(output_sinks[0], call_results[0], set())
+    )
+    return {
+        "call_results": call_results,
+        "output_sinks": output_sinks,
+        "passed": passed,
+    }
 
 
 def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
+    structural_text = _mask_ir_strings_and_comments(text)
     blocks = _custom_call_blocks(text, dialect)
     pallas = [
-        block for block in blocks if _call_targets(block, dialect) & _PALLAS_TARGETS
+        block
+        for block in blocks
+        if any(target in _PALLAS_TARGETS for target in _call_targets(block, dialect))
     ]
     raw_opcode_count = len(
         re.findall(
             r"\bstablehlo\.custom_call\b"
             if dialect == "stablehlo"
             else r"\bcustom-call\s*\(",
-            text,
+            structural_text,
         )
     )
+    call_positions = [
+        match.start()
+        for match in re.finditer(
+            r"\bstablehlo\.custom_call\b"
+            if dialect == "stablehlo"
+            else r"\bcustom-call\s*\(",
+            structural_text,
+        )
+    ]
+    entries = _entry_regions(structural_text, dialect)
+    entry = entries[0] if len(entries) == 1 else None
+    entry_body = entry["body"] if entry is not None else None
+    result_flow = _entry_result_flow(structural_text, entry, dialect)
     marker_pattern = re.compile(
         rf"(?<![A-Za-z0-9_.$-]){re.escape(_EXPECTED_KERNEL_NAME)}"
         r"(?![A-Za-z0-9_.$-])"
@@ -1081,6 +1374,7 @@ def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
         name: bool(re.search(pattern, text))
         for name, pattern in forbidden_patterns.items()
     }
+    kernel_name_bindings = [_kernel_name_binding(block, dialect) for block in pallas]
     return {
         "dialect": dialect,
         "sha256": hashlib.sha256(text.encode()).hexdigest(),
@@ -1089,20 +1383,28 @@ def _ir_summary(text: str, dialect: str) -> dict[str, Any]:
         "custom_call_count": len(blocks),
         "raw_custom_call_opcode_count": raw_opcode_count,
         "custom_call_parser_consistent": raw_opcode_count == len(blocks),
+        "entry_count": len(entries),
+        "sole_custom_call_owned_by_entry": entry_body is not None
+        and len(call_positions) == 1
+        and entry_body[0] <= call_positions[0] < entry_body[1],
+        "entry_result_flow": result_flow,
         "pallas_custom_call_count": len(pallas),
         "expected_kernel_marker_count": sum(
             len(marker_pattern.findall(block)) for block in pallas
         ),
-        "pallas_targets": [sorted(_call_targets(block, dialect)) for block in pallas],
+        "kernel_name_bindings": kernel_name_bindings,
+        "pallas_targets": [_call_targets(block, dialect) for block in pallas],
         "backward_marker_present": "w8a16_lora_input_vjp" in text,
         "while_count": len(
             re.findall(
                 r"\bstablehlo\.while\b" if dialect == "stablehlo" else r"\bwhile\s*\(",
-                text,
+                structural_text,
             )
         ),
         "fusion_opcode_count": (
-            0 if dialect == "stablehlo" else len(re.findall(r"\bfusion\s*\(", text))
+            0
+            if dialect == "stablehlo"
+            else len(re.findall(r"\bfusion\s*\(", structural_text))
         ),
         "forbidden_markers": forbidden,
     }
@@ -1114,9 +1416,18 @@ def _stablehlo_gate(summary: dict[str, Any]) -> dict[str, Any]:
         "parser_matches_raw_opcode_count": summary.get("custom_call_parser_consistent")
         is True,
         "exactly_one_custom_call_total": summary.get("custom_call_count") == 1,
+        "unique_public_entry": summary.get("entry_count") == 1,
+        "sole_custom_call_owned_by_entry": summary.get(
+            "sole_custom_call_owned_by_entry"
+        )
+        is True,
+        "entry_result_depends_on_custom_call": summary.get("entry_result_flow", {}).get(
+            "passed"
+        )
+        is True,
         "exactly_one_pallas_call": summary.get("pallas_custom_call_count") == 1,
-        "exactly_one_exact_forward_marker": summary.get("expected_kernel_marker_count")
-        == 1,
+        "exactly_one_exact_forward_kernel_name": summary.get("kernel_name_bindings")
+        == [{"backend_config_map_count": 1, "names": [_EXPECTED_KERNEL_NAME]}],
         "exact_triton_target": summary.get("pallas_targets")
         == [["__gpu$xla.gpu.triton"]],
         "no_backward_marker": summary.get("backward_marker_present") is False,
@@ -1137,12 +1448,19 @@ def _structural_gate(*summaries: dict[str, Any]) -> dict[str, Any]:
         dialect = str(summary["dialect"])
         checks[f"{dialect}_one_pallas_call"] = summary["pallas_custom_call_count"] == 1
         checks[f"{dialect}_one_custom_call_total"] = summary["custom_call_count"] == 1
+        checks[f"{dialect}_unique_public_entry"] = summary["entry_count"] == 1
+        checks[f"{dialect}_call_owned_by_entry"] = (
+            summary["sole_custom_call_owned_by_entry"] is True
+        )
+        checks[f"{dialect}_entry_result_depends_on_call"] = (
+            summary["entry_result_flow"]["passed"] is True
+        )
         checks[f"{dialect}_parser_matches_raw_opcodes"] = (
             summary["custom_call_parser_consistent"] is True
         )
-        checks[f"{dialect}_one_forward_marker"] = (
-            summary["expected_kernel_marker_count"] == 1
-        )
+        checks[f"{dialect}_one_forward_kernel_name"] = summary[
+            "kernel_name_bindings"
+        ] == [{"backend_config_map_count": 1, "names": [_EXPECTED_KERNEL_NAME]}]
         checks[f"{dialect}_no_backward_marker"] = (
             summary["backward_marker_present"] is False
         )

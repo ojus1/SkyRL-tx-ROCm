@@ -184,9 +184,8 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
 Controller completion still does not establish runtime correctness or native
 INT8 ISA. It establishes only an unpromoted compile diagnostic whose private
 probe, telemetry, compiler, handoff, and final-journal artifacts must be
-reviewed together. Optimized HLO proving one
-Triton custom call is not an
-INT8 ISA proof, and surrounding optimized-HLO fusions may still launch separate
+reviewed together. Optimized HLO proving one Triton custom call is not an INT8
+ISA proof, and surrounding optimized-HLO fusions may still launch separate
 kernels. The probe therefore persists raw StableHLO and optimized HLO and marks
 the result `passed_compile_diagnostic_unpromoted`. Promotion requires
 correlating an actual retained Pallas code object with the forward symbol,
@@ -196,6 +195,15 @@ available, the result remains only a Pallas Triton custom-call compile proof.
 Version/origin checks and selected binary hashes do not constitute a complete
 hash closure over every JAX, NumPy, ML-dtypes, ROCm, and system runtime file;
 the untouched installed stack remains a recorded trust assumption.
+
+The structural gate treats raw forward-name occurrences as diagnostics only:
+XLA may repeat that name in op metadata and the embedded Triton configuration
+for one custom call. Both the probe and controller instead mask quoted payloads
+and comments, require the exact scoped `mhlo.backend_config`/`backend_config`
+`name`, preserve duplicate target/name attributes as failures, bind the sole
+call to the unique public entry, and require its SSA result to reach the entry
+return/ROOT through data operands. Metadata, nested-map, comment, payload,
+dead-helper, dead-result, and control-predecessor decoys all fail closed.
 
 Only after the tiny compile diagnostic is reviewed and a separate source
 revision safely enables the one-shot forward will the ladder change one risk
