@@ -12,6 +12,17 @@ for injection_name in BASH_ENV ENV LD_AUDIT LD_LIBRARY_PATH LD_PRELOAD; do
     exit 2
   fi
 done
+for internal_claim_name in \
+  SKYRL_QWEN35_RUNTIME_T64_CACHE_ATTEST \
+  SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_PATH \
+  SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_SHA256 \
+  SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_PATH \
+  SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_SHA256; do
+  if [[ -v "$internal_claim_name" ]]; then
+    echo "refusing inherited launcher-owned cache-attestation claim: $internal_claim_name" >&2
+    exit 2
+  fi
+done
 while IFS= read -r exported_name; do
   if [[ "$exported_name" == BASH_FUNC_*%% ]]; then
     echo "refusing inherited exported Bash function: $exported_name" >&2
@@ -50,7 +61,9 @@ prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
 prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"
 prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"
 prewarm_timeout_seconds="${SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS:-3600}"
-backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64}'
+engine_t64_cache_attest="${SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST-0}"
+runtime_cache_attestation_environment=()
+backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"abstract_model_load":false}'
 
 case "$prewarm_optimizer" in
   0|1) ;;
@@ -66,6 +79,13 @@ case "$prewarm_only" in
     exit 2
     ;;
 esac
+case "$engine_t64_cache_attest" in
+  0|1) ;;
+  *)
+    echo "SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST must be exactly 0 or 1." >&2
+    exit 2
+    ;;
+esac
 if [[ "$prewarm_optimizer" == "1" && -z "$prewarm_buckets" ]]; then
   echo "SKYRL_QWEN35_PREWARM_OPTIMIZER=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
   exit 2
@@ -73,6 +93,20 @@ fi
 if [[ "$prewarm_only" == "1" && -z "$prewarm_buckets" ]]; then
   echo "SKYRL_QWEN35_PREWARM_ONLY=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
   exit 2
+fi
+if [[ "${engine_t64_cache_attest:-0}" == "1" ]]; then
+  if [[ "$prewarm_only" != "0" ]]; then
+    echo "SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1 requires SKYRL_QWEN35_PREWARM_ONLY=0." >&2
+    exit 2
+  fi
+  compact_prewarm_buckets="${prewarm_buckets//[[:space:]]/}"
+  case ",$compact_prewarm_buckets," in
+    *,64,*) ;;
+    *)
+      echo "SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1 requires exact bucket 64 in SKYRL_QWEN35_PREWARM_BUCKETS." >&2
+      exit 2
+      ;;
+  esac
 fi
 if [[ ! "$prewarm_timeout_seconds" =~ ^[0-9]{3,5}$ ]] \
   || ((10#$prewarm_timeout_seconds < 600 || 10#$prewarm_timeout_seconds > 14400)); then
@@ -957,6 +991,44 @@ if ((prewarm_status != 0)); then
   exit "$prewarm_status"
 fi
 
+if [[ "${engine_t64_cache_attest:-0}" == "1" ]]; then
+  prewarm_audit_artifact="$run_dir/prewarm.jsonl"
+  if [[ "$prewarm_handoff_artifact" != "$run_dir/prewarm-handoff.jsonl" ]] \
+    || [[ "$(/usr/bin/stat -c '%u:%a:%F' -- "$run_dir")" \
+      != "$EUID:700:directory" ]]; then
+    echo "refusing runtime cache attestation because its artifact parent is not the exact private run directory" >&2
+    exit 2
+  fi
+  for artifact in "$prewarm_audit_artifact" "$prewarm_handoff_artifact"; do
+    if [[ -L "$artifact" ]] \
+      || [[ "$(/usr/bin/stat -c '%u:%a:%F:%h' -- "$artifact")" \
+        != "$EUID:600:regular file:1" ]]; then
+      echo "refusing runtime cache attestation because an artifact is not an owned, singly linked mode-0600 regular file" >&2
+      exit 2
+    fi
+  done
+  if ! prewarm_audit_sha256_line="$(/usr/bin/sha256sum -- "$prewarm_audit_artifact")" \
+    || ! prewarm_handoff_sha256_line="$(/usr/bin/sha256sum -- "$prewarm_handoff_artifact")"; then
+    echo "refusing runtime cache attestation because its artifacts could not be hashed" >&2
+    exit 2
+  fi
+  prewarm_audit_sha256="${prewarm_audit_sha256_line%% *}"
+  prewarm_handoff_sha256="${prewarm_handoff_sha256_line%% *}"
+  if [[ ! "$prewarm_audit_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ ! "$prewarm_handoff_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing runtime cache attestation because an artifact digest is malformed" >&2
+    exit 2
+  fi
+  runtime_cache_attestation_environment=(
+    SKYRL_QWEN35_RUNTIME_T64_CACHE_ATTEST=required-v1
+    SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_PATH="$prewarm_audit_artifact"
+    SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_SHA256="$prewarm_audit_sha256"
+    SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_PATH="$prewarm_handoff_artifact"
+    SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_SHA256="$prewarm_handoff_sha256"
+  )
+fi
+unset SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST
+
 unset SKYRL_QWEN35_GIT_HEAD
 unset SKYRL_QWEN35_GIT_TREE
 unset SKYRL_QWEN35_GIT_WORKTREE_CLEAN
@@ -1002,6 +1074,7 @@ if [[ -n "$prewarm_buckets" ]]; then
     SKYRL_QWEN35_RUNTIME_SOURCE_ROOT="$source_snapshot" \
     SKYRL_QWEN35_RUNTIME_UV_EXECUTABLE="$uv_executable" \
     SKYRL_QWEN35_LAUNCH_LOCK_FD="$SKYRL_QWEN35_LAUNCH_LOCK_FD" \
+    "${runtime_cache_attestation_environment[@]}" \
     "${verified_runtime_environment[@]}" \
     "$uv_executable" run \
     --active \

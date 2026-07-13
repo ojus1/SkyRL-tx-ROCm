@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
@@ -466,7 +467,8 @@ def test_cache_and_graph_environment_must_match_launcher_exactly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "private-cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     _exact_environment(monkeypatch, cache)
     monkeypatch.setattr(prewarm, "prepare_cache", lambda maximum: cache)
 
@@ -597,7 +599,8 @@ def test_cache_is_revalidated_after_compilation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "private-cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     observed_maxima: list[int] = []
 
     def validate(maximum: int) -> Path:
@@ -642,11 +645,28 @@ class _FakeMonitoring:
             listener(event, duration_secs, **metadata)
 
 
+def _write_cache_pair(cache: Path, cache_name: str, payload: bytes) -> Path:
+    assert cache_name.endswith("-cache")
+    executable = cache / cache_name
+    executable.write_bytes(payload)
+    executable.with_name(cache_name.removesuffix("-cache") + "-atime").write_bytes(
+        time.time_ns().to_bytes(8, "little")
+    )
+    return executable
+
+
+def _rewrite_cache_atime(executable: Path) -> None:
+    executable.with_name(executable.name.removesuffix("-cache") + "-atime").write_bytes(
+        time.time_ns().to_bytes(8, "little")
+    )
+
+
 def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     monitoring = _FakeMonitoring()
     jax = SimpleNamespace(monitoring=monitoring)
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
@@ -655,7 +675,7 @@ def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
     def compile_bucket() -> tuple[object, float, float]:
         monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
         monitoring.emit("/jax/compilation_cache/cache_misses")
-        (cache / "jit_model-deadbeef-cache").write_bytes(b"compiled")
+        _write_cache_pair(cache, "jit_model-deadbeef-cache", b"compiled")
         return object(), 0.1, 0.2
 
     def postflight() -> dict[str, object]:
@@ -673,9 +693,7 @@ def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
     )
 
     assert postflights == ["clean"]
-    assert evidence["classification"] == (
-        "strict_public_monitoring_miss_with_single_cache_add"
-    )
+    assert evidence["classification"] == "strict_aot_seed_miss_v1"
     assert evidence["public_monitoring_events"] == {
         "compile_requests_use_cache": 1,
         "cache_hits": 0,
@@ -684,7 +702,7 @@ def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
     assert evidence["top_level_executable_cache"]["added_entries"] == [
         "jit_model-deadbeef-cache"
     ]
-    assert "do not prove which key" in evidence["evidence_limit"]
+    assert evidence["evidence_limit"] == prewarm.cache_attestation.MISS_EVIDENCE_LIMIT
     assert [
         json.loads(line)["record_type"] for line in output.getvalue().splitlines()
     ] == ["bucket_postflight", "bucket_cache_evidence"]
@@ -693,8 +711,8 @@ def test_per_bucket_cache_evidence_uses_public_events_and_directory_delta(
 @pytest.mark.parametrize(
     ("mutation", "classification"),
     [
-        ("two_added", "ambiguous_miss_with_multiple_added_cache_entries"),
-        ("changed_only", "ambiguous_miss_with_changed_cache_entry"),
+        ("two_added", "miss_without_exact_paired_cache_add"),
+        ("changed_only", "miss_without_exact_paired_cache_add"),
     ],
 )
 def test_strict_miss_rejects_multiple_adds_or_changed_only(
@@ -704,10 +722,11 @@ def test_strict_miss_rejects_multiple_adds_or_changed_only(
     classification: str,
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     existing = cache / "jit_existing-cache"
     if mutation == "changed_only":
-        existing.write_bytes(b"before")
+        existing = _write_cache_pair(cache, existing.name, b"before")
     monitoring = _FakeMonitoring()
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
 
@@ -715,8 +734,8 @@ def test_strict_miss_rejects_multiple_adds_or_changed_only(
         monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
         monitoring.emit("/jax/compilation_cache/cache_misses")
         if mutation == "two_added":
-            (cache / "jit_first-cache").write_bytes(b"first")
-            (cache / "jit_second-cache").write_bytes(b"second")
+            _write_cache_pair(cache, "jit_first-cache", b"first")
+            _write_cache_pair(cache, "jit_second-cache", b"second")
         else:
             existing.write_bytes(b"changed-and-longer")
         return object(), 0.1, 0.2
@@ -743,8 +762,9 @@ def test_strict_public_cache_hit_is_promotable_without_directory_change(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
-    (cache / "jit_model-hit-cache").write_bytes(b"cached")
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
+    executable = _write_cache_pair(cache, "jit_model-hit-cache", b"cached")
     monitoring = _FakeMonitoring()
     jax = SimpleNamespace(monitoring=monitoring)
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
@@ -756,6 +776,7 @@ def test_strict_public_cache_hit_is_promotable_without_directory_change(
         monitoring.emit_duration(
             "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
         )
+        _rewrite_cache_atime(executable)
         return object(), 0.1, 0.01
 
     result = prewarm._run_bucket_compile_attempt(
@@ -771,7 +792,7 @@ def test_strict_public_cache_hit_is_promotable_without_directory_change(
     )
 
     evidence = result[-1]
-    assert evidence["classification"] == "strict_public_monitoring_hit"
+    assert evidence["classification"] == "strict_aot_seed_hit_v1"
     assert evidence["public_monitoring_duration_events"] == {
         "compile_time_saved_sec": [2.5],
         "cache_retrieval_time_sec": [0.01],
@@ -783,9 +804,9 @@ def test_public_hit_with_top_level_cache_mutation_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
-    existing = cache / "jit_model-hit-cache"
-    existing.write_bytes(b"cached")
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
+    existing = _write_cache_pair(cache, "jit_model-hit-cache", b"cached")
     monitoring = _FakeMonitoring()
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
 
@@ -796,14 +817,15 @@ def test_public_hit_with_top_level_cache_mutation_fails_closed(
         monitoring.emit_duration(
             "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
         )
+        _rewrite_cache_atime(existing)
         if mutation == "added":
-            (cache / "jit_unexpected-added-cache").write_bytes(b"unexpected")
+            _write_cache_pair(cache, "jit_unexpected-added-cache", b"unexpected")
         else:
             existing.write_bytes(b"unexpected-change")
         return object(), 0.1, 0.01
 
     output = StringIO()
-    with pytest.raises(RuntimeError, match="ambiguous_hit_with_top_level"):
+    with pytest.raises(RuntimeError, match="ambiguous_hit_with_executable"):
         prewarm._run_bucket_compile_attempt(
             bucket=64,
             cache_path=cache,
@@ -817,14 +839,16 @@ def test_public_hit_with_top_level_cache_mutation_fails_closed(
         )
 
     evidence = json.loads(output.getvalue().splitlines()[-1])["evidence"]
-    assert evidence["classification"] == ("ambiguous_hit_with_top_level_cache_mutation")
+    assert evidence["classification"] == (
+        "ambiguous_hit_with_executable_cache_mutation"
+    )
 
 
 @pytest.mark.parametrize(
     ("duration", "metadata", "classification"),
     [
         (float("nan"), {}, "malformed_public_monitoring_evidence"),
-        (-0.1, {}, "malformed_public_monitoring_evidence"),
+        (-0.1, {}, "hit_without_exact_logical_atime_evidence"),
         (
             1.0,
             {"module": "untrusted-attribution"},
@@ -840,7 +864,9 @@ def test_malformed_public_duration_evidence_fails_closed(
     classification: str,
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
+    executable = _write_cache_pair(cache, "jit_model-hit-cache", b"cached")
     monitoring = _FakeMonitoring()
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
 
@@ -855,6 +881,7 @@ def test_malformed_public_duration_evidence_fails_closed(
         monitoring.emit_duration(
             "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
         )
+        _rewrite_cache_atime(executable)
         return object(), 0.1, 0.01
 
     output = StringIO()
@@ -873,7 +900,10 @@ def test_malformed_public_duration_evidence_fails_closed(
 
     evidence = json.loads(output.getvalue().splitlines()[-1])["evidence"]
     assert evidence["classification"] == classification
-    assert evidence["public_monitoring_schema_issues"]
+    if classification == "malformed_public_monitoring_evidence":
+        assert evidence["public_monitoring_schema_issues"]
+    else:
+        assert evidence["public_monitoring_schema_issues"] == []
     assert monitoring.listeners == []
     assert monitoring.duration_listeners == []
 
@@ -882,7 +912,9 @@ def test_duplicate_hit_duration_is_ambiguous_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
+    executable = _write_cache_pair(cache, "jit_model-hit-cache", b"cached")
     monitoring = _FakeMonitoring()
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
 
@@ -894,6 +926,7 @@ def test_duplicate_hit_duration_is_ambiguous_and_fails_closed(
         monitoring.emit_duration(
             "/jax/compilation_cache/cache_retrieval_time_sec", 0.01
         )
+        _rewrite_cache_atime(executable)
         return object(), 0.1, 0.01
 
     output = StringIO()
@@ -921,7 +954,7 @@ def test_duplicate_hit_duration_is_ambiguous_and_fails_closed(
                 "/jax/compilation_cache/cache_misses",
             ),
             False,
-            "miss_event_without_top_level_cache_change",
+            "miss_without_exact_paired_cache_add",
         ),
         (
             (
@@ -930,7 +963,7 @@ def test_duplicate_hit_duration_is_ambiguous_and_fails_closed(
                 "/jax/compilation_cache/cache_misses",
             ),
             True,
-            "non_strict_miss_events_with_cache_change",
+            "mixed_or_incomplete_public_monitoring_events",
         ),
         (
             ("/jax/compilation_cache/compile_requests_use_cache",),
@@ -947,7 +980,8 @@ def test_non_strict_cache_evidence_hard_fails_promotion(
     classification: str,
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     monitoring = _FakeMonitoring()
     jax = SimpleNamespace(monitoring=monitoring)
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
@@ -956,7 +990,7 @@ def test_non_strict_cache_evidence_hard_fails_promotion(
         for event in events:
             monitoring.emit(event)
         if add_entry:
-            (cache / "jit_model-unproven-cache").write_bytes(b"candidate")
+            _write_cache_pair(cache, "jit_model-unproven-cache", b"candidate")
         return object(), 0.1, 0.2
 
     output = StringIO()
@@ -987,7 +1021,8 @@ def test_compile_exception_still_runs_cache_and_journal_postflight_without_pass(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     monitoring = _FakeMonitoring()
     jax = SimpleNamespace(monitoring=monitoring)
     order: list[str] = []
@@ -1055,7 +1090,8 @@ def _patch_rocm_execution_for_postflight(
 ) -> tuple[SimpleNamespace, list[str]]:
     order: list[str] = []
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     model = tmp_path / "model"
     model.mkdir()
     lock_dir = tmp_path / "lock"
@@ -1295,7 +1331,8 @@ def test_tool_wide_postflight_covers_all_gpu_capable_failure_stages(
     model = tmp_path / "model"
     model.mkdir()
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     args = SimpleNamespace(
         execute_rocm=True,
         compile_optimizer=False,
@@ -1554,14 +1591,15 @@ def test_optimizer_compile_attempt_has_separate_cache_and_postflight_records(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     monitoring = _FakeMonitoring()
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
 
     def compile_optimizer() -> tuple[object, float, float]:
         monitoring.emit("/jax/compilation_cache/compile_requests_use_cache")
         monitoring.emit("/jax/compilation_cache/cache_misses")
-        (cache / "jit_optimizer-deadbeef-cache").write_bytes(b"compiled")
+        _write_cache_pair(cache, "jit_optimizer-deadbeef-cache", b"compiled")
         return _FakeCompiled(), 0.2, 0.4
 
     output = StringIO()
@@ -1592,7 +1630,8 @@ def test_optimizer_compile_failure_cleans_monitoring_and_runs_postflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache = tmp_path / "cache"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
     monitoring = _FakeMonitoring()
     monkeypatch.setattr(prewarm, "prepare_cache", lambda _maximum: cache)
     order: list[str] = []

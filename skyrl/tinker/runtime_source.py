@@ -23,6 +23,18 @@ _REPO_ROOT_ENV = "SKYRL_QWEN35_RUNTIME_REPO_ROOT"
 _UV_EXECUTABLE_ENV = "SKYRL_QWEN35_RUNTIME_UV_EXECUTABLE"
 _MEMORY_MODE_ENV = "SKYRL_QWEN35_RUNTIME_MEMORY_MODE"
 _LAUNCH_LOCK_FD_ENV = "SKYRL_QWEN35_LAUNCH_LOCK_FD"
+_T64_CACHE_ATTEST_ENV = "SKYRL_QWEN35_RUNTIME_T64_CACHE_ATTEST"
+_PREWARM_AUDIT_PATH_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_PATH"
+_PREWARM_AUDIT_SHA256_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_SHA256"
+_PREWARM_HANDOFF_PATH_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_PATH"
+_PREWARM_HANDOFF_SHA256_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_SHA256"
+_CACHE_ATTESTATION_ENVIRONMENT = (
+    _T64_CACHE_ATTEST_ENV,
+    _PREWARM_AUDIT_PATH_ENV,
+    _PREWARM_AUDIT_SHA256_ENV,
+    _PREWARM_HANDOFF_PATH_ENV,
+    _PREWARM_HANDOFF_SHA256_ENV,
+)
 _SOURCE_CACHE_NAMESPACE = "skyrl-source-snapshots-private-v1"
 _UV_SIZE_BYTES = 59_853_688
 _UV_SHA256 = "646adf5cf12ba17d1a41fa77c8dd6496f73651dcfeeed6b5f4ec019b36bc7153"
@@ -376,6 +388,63 @@ def _validate_full_source_cache(
     return {**result, "expected_jax_cache": str(expected_jax_cache)}
 
 
+def _validate_startup_cache_claim(
+    *,
+    claims: Mapping[str, str],
+    source_root: Path,
+    git_head: str,
+    git_tree: str,
+    jax_cache: Path,
+    attention_backend: str,
+    memory_mode: str,
+) -> dict[str, object]:
+    """Validate both private prewarm artifacts without importing JAX."""
+    try:
+        from rocm import qwen35_cache_attestation as cache_attestation
+    except Exception as error:
+        raise RuntimeSourceError(
+            f"cannot import startup cache-attestation validator: {error}"
+        ) from error
+    helper_origin = _canonical_private_file(
+        Path(cache_attestation.__file__), "startup cache-attestation validator"
+    )
+    if helper_origin != source_root / "rocm/qwen35_cache_attestation.py":
+        raise RuntimeSourceError(
+            "startup cache-attestation validator did not resolve from the source snapshot"
+        )
+    expected_attention = "pallas" if attention_backend == "1" else "xla"
+    try:
+        result = cache_attestation.build_startup_cache_claim(
+            prewarm_path=Path(claims[_PREWARM_AUDIT_PATH_ENV]),
+            prewarm_sha256=claims[_PREWARM_AUDIT_SHA256_ENV],
+            handoff_path=Path(claims[_PREWARM_HANDOFF_PATH_ENV]),
+            handoff_sha256=claims[_PREWARM_HANDOFF_SHA256_ENV],
+            expected_git_head=git_head,
+            expected_git_tree=git_tree,
+            expected_cache_path=str(jax_cache),
+            expected_attention_backend=expected_attention,
+        )
+    except Exception as error:
+        raise RuntimeSourceError(
+            f"startup T64 cache-attestation artifacts are invalid: {error}"
+        ) from error
+    if result.get("status") != "required-v1":
+        raise RuntimeSourceError(
+            "startup T64 cache-attestation validator returned an invalid status"
+        )
+    seed = result.get("seed")
+    expected_construction = (
+        "abstract-load" if memory_mode == "preallocate85" else "eager"
+    )
+    if not isinstance(seed, dict) or seed.get("construction") != (
+        expected_construction
+    ):
+        raise RuntimeSourceError(
+            "startup T64 cache-attestation construction does not match memory mode"
+        )
+    return result
+
+
 def validate_runtime_source(
     *,
     role: str,
@@ -398,7 +467,26 @@ def validate_runtime_source(
         _MEMORY_MODE_ENV,
     )
     claims = {name: observed.get(name) for name in claim_names}
+    cache_claims = {name: observed.get(name) for name in _CACHE_ATTESTATION_ENVIRONMENT}
+    cache_claim_present = any(value is not None for value in cache_claims.values())
+    if cache_claim_present:
+        missing_cache_claims = [
+            name for name, value in cache_claims.items() if not value
+        ]
+        if missing_cache_claims:
+            raise RuntimeSourceError(
+                "runtime T64 cache-attestation claims are incomplete: "
+                f"{missing_cache_claims!r}"
+            )
+        if cache_claims[_T64_CACHE_ATTEST_ENV] != "required-v1":
+            raise RuntimeSourceError(
+                "runtime T64 cache-attestation mode must be required-v1"
+            )
     if all(value is None for value in claims.values()):
+        if cache_claim_present:
+            raise RuntimeSourceError(
+                "runtime T64 cache attestation requires full hardened source claims"
+            )
         return {"status": "not_required", "role": role}
     if any(not value for value in claims.values()):
         raise RuntimeSourceError("runtime source claims are incomplete")
@@ -580,6 +668,19 @@ def validate_runtime_source(
         raise RuntimeSourceError(
             "SKYRL_ROCM_PALLAS_ATTENTION must be exactly 0 or 1 at runtime"
         )
+    startup_cache_attestation: dict[str, object]
+    if cache_claim_present:
+        startup_cache_attestation = _validate_startup_cache_claim(
+            claims={name: str(value) for name, value in cache_claims.items()},
+            source_root=root,
+            git_head=head,
+            git_tree=str(full_source["git_tree"]),
+            jax_cache=jax_cache,
+            attention_backend=attention_backend,
+            memory_mode=memory_mode,
+        )
+    else:
+        startup_cache_attestation = {"status": "not_required"}
 
     return {
         "status": "passed",
@@ -607,6 +708,7 @@ def validate_runtime_source(
             "JAX_COMPILATION_CACHE_EXPECT_PGLE"
         ],
         "pallas_attention": attention_backend,
+        "startup_cache_attestation": startup_cache_attestation,
         "dont_write_bytecode": True,
     }
 

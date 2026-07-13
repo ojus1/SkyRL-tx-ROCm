@@ -60,6 +60,29 @@ from skyrl.utils.log import logger
 _ENGINE_FAILURE_IN_PROGRESS = threading.Event()
 _ENGINE_WATCHDOG_INTERVAL_SECONDS = 1.0
 _ENGINE_WATCHDOG_DB_FAILURE_GRACE_SECONDS = 4.0
+RUNTIME_HIT_KIND = "strict_aot_t64_persistent_cache_hit_v1"
+
+
+def run_engine_t64_cache_attestation(
+    backend: object, claim: dict[str, object]
+) -> dict[str, object]:
+    """Load the repo-only ROCm helper only for an explicit hardened claim."""
+    from rocm.qwen35_cache_attestation import (
+        run_engine_t64_cache_attestation as run_attestation,
+    )
+
+    return run_attestation(backend, claim)
+
+
+def validate_runtime_cache_evidence(
+    claim: dict[str, object], evidence: dict[str, object]
+) -> dict[str, object]:
+    """Keep generic/wheel engine imports independent of repo-only ROCm tools."""
+    from rocm.qwen35_cache_attestation import (
+        validate_runtime_cache_evidence as validate_evidence,
+    )
+
+    return validate_evidence(claim, evidence)
 
 
 class _EngineLaunchRowLost(RuntimeError):
@@ -312,6 +335,8 @@ class TinkerEngine:
         self.engine_launcher_identity: ProcessIdentity | None = None
         self.api_launch_identity: ProcessIdentity | None = None
         self.runtime_handoff_attestation: dict[str, object] = {}
+        self.cache_evidence_status = "not_required"
+        self.cache_evidence: dict[str, object] = {}
         self._next_api_identity_check = 0.0
         self._engine_watchdog_stop = threading.Event()
         self._engine_watchdog_wake = threading.Event()
@@ -338,6 +363,9 @@ class TinkerEngine:
                 # while the parent remains single-threaded.
                 self._start_engine_launch_watchdog()
             self._require_engine_watchdog_acknowledgement("post-backend")
+        self._attest_startup_cache_if_required(use_ray=use_ray)
+        if self.cache_evidence_status == RUNTIME_HIT_KIND:
+            self._require_engine_watchdog_acknowledgement("post-cache-attestation")
 
         # Backends that support async sample routing notify us when their
         # inference endpoint changes; we persist it to EngineStateDB so the
@@ -350,6 +378,51 @@ class TinkerEngine:
         self._last_cleanup_time: float = time.time()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+    def _attest_startup_cache_if_required(self, *, use_ray: bool) -> None:
+        """Prove the prewarmed T64 executable in the exact real backend."""
+        claim = self.runtime_source_attestation.get("startup_cache_attestation")
+        if claim is None:
+            if self.runtime_source_attestation.get("status") == "not_required":
+                return
+            raise RuntimeError("hardened runtime startup cache claim is absent")
+        if not isinstance(claim, dict):
+            raise RuntimeError("runtime startup cache claim has an invalid type")
+        requirement = claim.get("status")
+        if requirement == "not_required":
+            if claim != {"status": "not_required"}:
+                raise RuntimeError("runtime cache opt-out claim has unexpected fields")
+            return
+        if requirement != "required-v1":
+            raise RuntimeError("runtime startup cache requirement is invalid")
+        if self.config.startup_launch_id is None:
+            raise RuntimeError(
+                "required startup cache attestation needs a supervised engine launch"
+            )
+        if self.config.backend != "jax" or use_ray:
+            raise RuntimeError(
+                "required startup cache attestation supports only non-Ray JAX"
+            )
+        resolved_config = getattr(self.backend, "config", None)
+        for field in (
+            "tensor_parallel_size",
+            "expert_parallel_size",
+            "fully_sharded_data_parallel_size",
+        ):
+            if getattr(resolved_config, field, None) != 1:
+                raise RuntimeError(
+                    "required startup cache attestation needs one local JAX device"
+                )
+        if getattr(resolved_config, "coordinator_address", None) is not None or (
+            getattr(resolved_config, "num_processes", None) is not None
+        ):
+            raise RuntimeError(
+                "required startup cache attestation rejects distributed JAX"
+            )
+        evidence = run_engine_t64_cache_attestation(self.backend, claim)
+        self.cache_evidence_status = RUNTIME_HIT_KIND
+        self.cache_evidence = evidence
+        logger.info("Passed exact T64 persistent-cache startup attestation")
 
     def _claim_engine_launch(self) -> None:
         """Bind this Python child to the API-created STARTING launch row."""
@@ -600,6 +673,29 @@ class TinkerEngine:
             raise RuntimeError("engine launch was not claimed before READY publication")
         if self.api_launch_identity is None or self.engine_launcher_identity is None:
             raise RuntimeError("engine launch process identities are incomplete")
+        startup_cache_claim = self.runtime_source_attestation.get(
+            "startup_cache_attestation"
+        )
+        if (
+            startup_cache_claim is None
+            and self.runtime_source_attestation.get("status") == "not_required"
+        ):
+            startup_cache_claim = {"status": "not_required"}
+        if not isinstance(startup_cache_claim, dict):
+            raise RuntimeError("engine startup cache publication claim is absent")
+        if startup_cache_claim.get("status") == "not_required":
+            if (
+                startup_cache_claim != {"status": "not_required"}
+                or self.cache_evidence_status != "not_required"
+                or self.cache_evidence != {}
+            ):
+                raise RuntimeError("engine cache opt-out publication is inconsistent")
+        elif startup_cache_claim.get("status") == "required-v1":
+            if self.cache_evidence_status != RUNTIME_HIT_KIND:
+                raise RuntimeError("engine required cache evidence was not passed")
+            validate_runtime_cache_evidence(startup_cache_claim, self.cache_evidence)
+        else:
+            raise RuntimeError("engine startup cache publication claim is invalid")
         now = datetime.now(timezone.utc)
         with Session(self.db_engine) as session:
             record = session.get(EngineLaunchDB, self.config.startup_launch_id)
@@ -633,8 +729,8 @@ class TinkerEngine:
                 )
                 .values(
                     status=EngineLaunchStatus.READY,
-                    cache_evidence_status="not_required",
-                    cache_evidence={},
+                    cache_evidence_status=self.cache_evidence_status,
+                    cache_evidence=self.cache_evidence,
                     ready_at=now,
                     updated_at=now,
                 )

@@ -117,6 +117,12 @@ SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
 SKYRL_QWEN35_PREWARM_ONLY=1 \
 SKYRL_ROCM_PALLAS_ATTENTION=1 \
   ./rocm/start_qwen35.sh qualify-t512-adam
+
+# Require one exact in-engine T64 AOT cache hit before READY.
+SKYRL_QWEN35_PREWARM_BUCKETS=64 \
+SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1 \
+SKYRL_ROCM_PALLAS_ATTENTION=1 \
+  ./rocm/start_qwen35.sh attest-t64-engine-hit
 ```
 
 Buckets at 512 or above additionally require the explicitly enabled Pallas
@@ -137,8 +143,9 @@ occurs.
 `1`, and requires a nonempty bucket list. It does not weaken or skip any
 prewarm, handoff, or final-journal gate; after all of them pass, it disarms the
 launcher traps and exits zero before the API command. This is the qualification
-route while source-aligned engine startup and cache consumption remain
-hardware-unqualified.
+route when no server transition is wanted. The source-aligned API/engine
+readiness and exact T64 cache-attestation paths are CPU-qualified, but their
+real ROCm backend transition remains hardware-unqualified.
 
 Every operational launcher prewarm also requires a clean Git worktree before
 the first hardware or JAX access. Fixed, sanitized Git commands bind the exact
@@ -217,7 +224,8 @@ timeout, `INT`, or `TERM`, the launcher reaps the profiler, requires three
 consecutive one-second samples with the exact PCI/DRM/KFD identity unowned and
 VRAM/GTT no higher than baseline, and then performs the final boot-journal gate
 before it can start the API. Neither path enables command buffers, HIP Graphs,
-PGLE, executable export, an actual warmup/replay, or an in-engine prewarm. The
+PGLE, executable export, or an actual warmup/replay. The separately opted-in
+engine attestation described below performs one compile-only cache lookup. The
 launcher exports both `JAX_ENABLE_PGLE=false` and
 `JAX_COMPILATION_CACHE_EXPECT_PGLE=false`, and the operational child requires
 those exact values. Running
@@ -225,41 +233,56 @@ those exact values. Running
 CPU-only plan and never imports JAX.
 
 The exact cold T64-plus-Adam direct-tool pair, supervised T512 Pallas pair, and
-commit-keyed T1024 Pallas pair described below are now hardware-qualified. The
-launcher-to-API/nested-engine source-path alignment is implemented and
-CPU-qualified, but engine cache consumption, the multi-bucket path, additional
-repeated hits, and actual warmup remain hardware-unqualified. The launcher
-examples above provide the
-required telemetry, headless-display, exclusive-KFD, fatal-journal, and cleanup
-gates. The historical T64 direct-tool artifacts used equivalent external
-supervision; current operational ROCm prewarm is launcher-only. The API now
-waits for an exact launch-ID/PID/start-tick/boot/source/lock-bound engine row,
-published only after backend construction, before it serves requests. Its
-health endpoint revalidates that row, a one-second engine watchdog heartbeat,
-the isolated API-spawned process group, and all three live process identities.
-Shutdown signals the complete group immediately and does not report STOPPED
-until the wrapper is reaped and the group is absent. This readiness protocol is
-bounded to 3600 seconds in both Qwen launcher branches. It is CPU-qualified but
-has not yet been exercised with the real ROCm backend, and it
-still does not prove consumption of a particular cached executable. Therefore
-prewarm remains default-off until the in-engine cache-evidence contract is
-implemented and separately qualified. The containment result is specifically
-for the pinned non-Ray, single-process JAX path: a POSIX process group is not a
-cgroup, so Ray/FSDP/Megatron workers, daemonized descendants, or any child that
-calls `setsid()` require separate containment and qualification. Each
-train-bucket and optimizer compile has separate timing, compiled-memory,
-postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
-process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`
-and `cache_retrieval_time_sec` events on hits, and top-level cache-directory
-deltas. Those public callbacks contain no module or cache key, so this is useful
-process-level evidence but not per-key proof of a cache write or hit. Startup
-accepts only one monitored hit with exactly one finite nonnegative value for
-each duration and no top-level executable-cache mutation, or one monitored miss
-paired with exactly one newly added top-level executable-cache entry, no changed
-or removed entry, and no duration. Unexpected metadata, malformed/duplicate
-durations, cache additions or changes during a hit, changed-only or multiple-add
-miss deltas, cache removals, and otherwise ambiguous, missing, or mixed evidence
-fail closed.
+commit-keyed T1024 Pallas pair described below are hardware-qualified. The
+launcher-to-API/nested-engine source alignment, readiness protocol, and exact
+T64 in-engine cache-evidence contract are implemented and CPU-qualified. The
+multi-bucket engine path, repeated engine hits, normal first-call warmup, and
+the real ROCm engine transition remain hardware-unqualified. The launcher
+examples above provide the required telemetry, headless-display, exclusive-KFD,
+fatal-journal, and cleanup gates. Historical T64 direct-tool artifacts used
+equivalent external supervision; current operational ROCm prewarm is
+launcher-only.
+
+`SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1` is default-off and accepts only literal
+`0` or `1`. Enabling it requires an operational prewarm list containing exact
+bucket 64, `SKYRL_QWEN35_PREWARM_ONLY=0`, a clean hardened source snapshot, and
+successful prewarm, idle-handoff, and final-journal gates. It is restricted to
+the pinned supervised non-Ray, single-process, single-device JAX engine with the
+exact model path, resolved backend configuration, attention backend, memory
+mode, cache namespace, and graph-free XLA flags used by the seed process. The
+launcher rejects inherited internal claim variables, creates them only after
+all gates pass, and carries them through the sanitized `env -i` API launch. The
+API and nested engine independently bind the claim to the same Git HEAD/tree,
+boot, source snapshot, lock, artifacts, and live process identities.
+
+After exact backend construction and before READY, the engine synchronizes
+constructor arrays and performs one T64 `lower().compile()` while capturing JAX
+0.10.2's public cache events. It never calls or exports the compiled object.
+JAX's bounded local LRU rewrites the exact eight-byte little-endian
+`<key>-atime` file on `get(key)`. The verifier brackets that write with wall
+time and requires exactly one request, one hit, no miss, the exact duration
+event order, an increasing target atime, a byte-identical paired executable,
+stable executable and auxiliary manifests, and no other cache mutation. READY
+and every API health check revalidate this evidence. A fresh seed-process miss
+may add or update the per-fusion autotune subtree; that mutation is explicitly
+permitted and only its before/after manifest hashes are bound. An engine hit
+permits no auxiliary mutation.
+
+This proves exact-key AOT persistent-cache lookup/deserialization, signature
+compatibility, and executable-byte continuity. It does not seed normal
+`PjitFunction` first-call dispatch, invoke a training executable, establish
+request latency or throughput, prove numerical execution, or prove HSA runtime
+stability. Prewarm and engine attestation therefore remain default-off until the
+real ROCm path is separately qualified. The API waits for an exact
+launch-ID/PID/start-tick/boot/source/lock-bound engine row published only after
+backend construction and any required cache proof. Health revalidates that row,
+a one-second watchdog heartbeat, the isolated API-spawned process group, and all
+three live process identities. Shutdown signals the complete group immediately
+and does not report STOPPED until the wrapper is reaped and the group is absent.
+Both Qwen launcher branches bound readiness to 3600 seconds. This containment
+result covers only the pinned topology: a POSIX process group is not a cgroup,
+so Ray/FSDP/Megatron workers, daemonized descendants, or any child that calls
+`setsid()` require separate containment and qualification.
 
 ### ROCm 7.2.4 cold T64 plus Adam cache-population result
 
@@ -614,9 +637,9 @@ before backend construction. Disposable CPU tests prove API/engine origin
 selection, archive/full-tree binding, environment behavior, no snapshot
 mutation, rejection of shadow modules, exact engine readiness transitions,
 stale/PID-reused/stopped process rejection, heartbeat freshness, child-exit and
-timeout behavior, and terminate-to-kill whole-group cleanup. This new
-transition has not yet run on the GPU, so real-backend readiness and engine
-cache consumption remain unproven.
+timeout behavior, terminate-to-kill whole-group cleanup, and the exact T64 AOT
+cache-evidence contract. This transition has not yet run on the GPU, so
+real-backend readiness, hit timing, and execution behavior remain unproven.
 Ordinary warmup, graph capture/replay, and any compiled-call invocation remain
 unauthorized. The older
 T1024 `93.144 s` then `47.655 s` runs were two misses with different source

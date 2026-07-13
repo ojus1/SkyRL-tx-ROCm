@@ -91,6 +91,7 @@ def _source_attestation(role: str = "api") -> dict[str, Any]:
         "jax_enable_pgle": "false",
         "jax_compilation_cache_expect_pgle": "false",
         "pallas_attention": "1",
+        "startup_cache_attestation": {"status": "not_required"},
         "dont_write_bytecode": True,
     }
 
@@ -102,6 +103,17 @@ def _launch_lock_attestation() -> dict[str, Any]:
         "path": "/run/user/1000/skyrl-qwen35-rocm-1000",
         "inheritable": True,
         "exclusive_lock_observed": True,
+    }
+
+
+def _required_cache_claim() -> dict[str, Any]:
+    return {
+        "status": "required-v1",
+        "schema_name": "skyrl.qwen35.persistent-cache-attestation",
+        "schema_version": 1,
+        "seed": {"bucket": 64},
+        "prewarm_audit": {"sha256": "e" * 64},
+        "prewarm_handoff": {"sha256": "f" * 64},
     }
 
 
@@ -281,6 +293,7 @@ def test_runtime_attestation_handoff_accepts_exact_shared_invariants() -> None:
         "git_tree": "b" * 40,
         "source_root": "/private/source",
         "jax_compilation_cache": "/private/jax-cache",
+        "startup_cache_attestation": {"status": "not_required"},
         "launch_lock": launch_lock,
     }
 
@@ -316,6 +329,39 @@ def test_runtime_attestation_handoff_rejects_unknown_shared_field_drift() -> Non
     with pytest.raises(RuntimeError, match="runtime source attestation mismatch"):
         validate_runtime_attestation_handoff(
             _source_attestation(),
+            engine_source,
+            _launch_lock_attestation(),
+            _launch_lock_attestation(),
+        )
+
+
+def test_runtime_attestation_handoff_binds_required_cache_claim() -> None:
+    api_source = _source_attestation()
+    engine_source = _source_attestation("engine")
+    claim = _required_cache_claim()
+    api_source["startup_cache_attestation"] = claim
+    engine_source["startup_cache_attestation"] = dict(claim)
+
+    handoff = validate_runtime_attestation_handoff(
+        api_source,
+        engine_source,
+        _launch_lock_attestation(),
+        _launch_lock_attestation(),
+    )
+
+    assert handoff["startup_cache_attestation"] == claim
+
+
+def test_runtime_attestation_handoff_rejects_cache_claim_drift() -> None:
+    api_source = _source_attestation()
+    engine_source = _source_attestation("engine")
+    api_source["startup_cache_attestation"] = _required_cache_claim()
+    engine_source["startup_cache_attestation"] = _required_cache_claim()
+    engine_source["startup_cache_attestation"]["prewarm_audit"] = {"sha256": "0" * 64}
+
+    with pytest.raises(RuntimeError, match="runtime source attestation mismatch"):
+        validate_runtime_attestation_handoff(
+            api_source,
             engine_source,
             _launch_lock_attestation(),
             _launch_lock_attestation(),
@@ -473,6 +519,82 @@ def test_validate_ready_launch_accepts_exact_live_launch() -> None:
         "engine": _identity(303, 3_003, state="?"),
     }
     assert observed == list(identities.values())
+
+
+def test_validate_ready_launch_accepts_only_claim_bound_required_cache_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rocm import qwen35_cache_attestation
+
+    api_source = _source_attestation()
+    engine_source = _source_attestation("engine")
+    claim = _required_cache_claim()
+    api_source["startup_cache_attestation"] = claim
+    engine_source["startup_cache_attestation"] = dict(claim)
+    launch_lock = _launch_lock_attestation()
+    handoff = validate_runtime_attestation_handoff(
+        api_source, engine_source, launch_lock, launch_lock
+    )
+    evidence = {"proof": "exact"}
+    observed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    def validate(claim_arg: Any, evidence_arg: Any) -> dict[str, Any]:
+        observed.append((dict(claim_arg), dict(evidence_arg)))
+        return dict(evidence_arg)
+
+    monkeypatch.setattr(
+        qwen35_cache_attestation, "validate_runtime_cache_evidence", validate
+    )
+    record = _ready_record(
+        api_source_attestation=api_source,
+        engine_source_attestation=engine_source,
+        runtime_handoff_attestation=handoff,
+        cache_evidence_status=qwen35_cache_attestation.RUNTIME_HIT_KIND,
+        cache_evidence=evidence,
+    )
+
+    validate_ready_engine_launch(
+        record,
+        launch_id=_LAUNCH_ID,
+        backend="jax",
+        api_identity=_identity(101, 1_001),
+        launcher_identity=_identity(202, 2_002),
+        expected_api_source_attestation=api_source,
+        expected_api_lock_attestation=launch_lock,
+        identity_is_live=lambda _identity: True,
+        process_group_reader=lambda _pid: 202,
+    )
+
+    assert observed == [(claim, evidence)]
+
+
+def test_validate_ready_launch_rejects_missing_required_cache_evidence() -> None:
+    api_source = _source_attestation()
+    engine_source = _source_attestation("engine")
+    claim = _required_cache_claim()
+    api_source["startup_cache_attestation"] = claim
+    engine_source["startup_cache_attestation"] = dict(claim)
+    launch_lock = _launch_lock_attestation()
+    handoff = validate_runtime_attestation_handoff(
+        api_source, engine_source, launch_lock, launch_lock
+    )
+
+    with pytest.raises(RuntimeError, match="required cache evidence is absent"):
+        validate_ready_engine_launch(
+            _ready_record(
+                api_source_attestation=api_source,
+                engine_source_attestation=engine_source,
+                runtime_handoff_attestation=handoff,
+            ),
+            launch_id=_LAUNCH_ID,
+            backend="jax",
+            api_identity=_identity(101, 1_001),
+            launcher_identity=_identity(202, 2_002),
+            expected_api_source_attestation=api_source,
+            expected_api_lock_attestation=launch_lock,
+            identity_is_live=lambda _identity: True,
+            process_group_reader=lambda _pid: 202,
+        )
 
 
 def test_validate_initializing_launch_revalidates_claim_before_ready() -> None:

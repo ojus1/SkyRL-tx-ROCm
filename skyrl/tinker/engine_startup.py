@@ -343,8 +343,41 @@ def validate_ready_engine_launch(
     )
     if dict(record.runtime_handoff_attestation) != recomputed_handoff:
         raise RuntimeError("ready engine runtime handoff attestation is inconsistent")
-    if record.cache_evidence_status != "not_required" or record.cache_evidence != {}:
-        raise RuntimeError("ready engine cache evidence is incomplete or rejected")
+    startup_cache_claim = expected_api_source_attestation.get(
+        "startup_cache_attestation"
+    )
+    if (
+        startup_cache_claim is None
+        and expected_api_source_attestation.get("status") == "not_required"
+    ):
+        startup_cache_claim = {"status": "not_required"}
+    if not isinstance(startup_cache_claim, Mapping):
+        raise RuntimeError("ready engine startup cache requirement is absent")
+    cache_requirement = startup_cache_claim.get("status")
+    if cache_requirement == "not_required":
+        if dict(startup_cache_claim) != {"status": "not_required"} or (
+            record.cache_evidence_status != "not_required"
+            or record.cache_evidence != {}
+        ):
+            raise RuntimeError("ready engine cache evidence is incomplete or rejected")
+    elif cache_requirement == "required-v1":
+        from rocm.qwen35_cache_attestation import (
+            RUNTIME_HIT_KIND,
+            validate_runtime_cache_evidence,
+        )
+
+        if record.cache_evidence_status != RUNTIME_HIT_KIND or not isinstance(
+            record.cache_evidence, Mapping
+        ):
+            raise RuntimeError("ready engine required cache evidence is absent")
+        try:
+            validate_runtime_cache_evidence(startup_cache_claim, record.cache_evidence)
+        except Exception as error:
+            raise RuntimeError(
+                f"ready engine required cache evidence is invalid: {error}"
+            ) from error
+    else:
+        raise RuntimeError("ready engine startup cache requirement is invalid")
     return identities
 
 
@@ -476,6 +509,33 @@ def validate_runtime_attestation_handoff(
             raise RuntimeError("API/engine runtime module origins are invalid")
         if api_shared.get("launch_lock") != api_lock_dict:
             raise RuntimeError("runtime source and launch-lock attestations disagree")
+        startup_cache_attestation = api_shared.get("startup_cache_attestation")
+        if not isinstance(startup_cache_attestation, Mapping):
+            raise RuntimeError("runtime startup cache attestation is absent")
+        cache_requirement = startup_cache_attestation.get("status")
+        if cache_requirement == "not_required":
+            if dict(startup_cache_attestation) != {"status": "not_required"}:
+                raise RuntimeError(
+                    "runtime opt-out cache attestation has unexpected fields"
+                )
+        elif cache_requirement == "required-v1":
+            if (
+                startup_cache_attestation.get("schema_name")
+                != "skyrl.qwen35.persistent-cache-attestation"
+                or startup_cache_attestation.get("schema_version") != 1
+                or not isinstance(startup_cache_attestation.get("seed"), Mapping)
+                or not isinstance(
+                    startup_cache_attestation.get("prewarm_audit"), Mapping
+                )
+                or not isinstance(
+                    startup_cache_attestation.get("prewarm_handoff"), Mapping
+                )
+            ):
+                raise RuntimeError(
+                    "runtime required cache attestation has an invalid schema"
+                )
+        else:
+            raise RuntimeError("runtime startup cache attestation status is invalid")
         handoff_status = "passed"
     elif source_status == "not_required":
         if api_source_dict != {"status": "not_required", "role": "api"} or (
@@ -499,5 +559,6 @@ def validate_runtime_attestation_handoff(
         "git_tree": api_shared.get("git_tree"),
         "source_root": api_shared.get("source_root"),
         "jax_compilation_cache": api_shared.get("jax_compilation_cache"),
+        "startup_cache_attestation": api_shared.get("startup_cache_attestation"),
         "launch_lock": api_lock_dict,
     }

@@ -839,7 +839,7 @@ def test_launcher_profiles_then_always_settles_before_final_journal_and_api() ->
 def _prewarm_trap_harness(tmp_path: Path) -> tuple[Path, Path]:
     source = _LAUNCHER.read_text(encoding="utf-8")
     start = source.index("prewarm_status=0\n")
-    end = source.index('\nexec "$uv_executable" run --active', start)
+    end = source.index('\ntrap - EXIT INT TERM\nif [[ -n "$prewarm_buckets" ]]', start)
     production_block = source[start:end]
     events = tmp_path / "events.txt"
     harness = tmp_path / "prewarm-trap-harness.sh"

@@ -23,7 +23,6 @@ import argparse
 import fcntl
 import hashlib
 import json
-import math
 import os
 import shlex
 import stat
@@ -38,9 +37,11 @@ from typing import Any, Callable, TextIO
 
 try:
     from rocm import probe_sft_compile as compile_probe
+    from rocm import qwen35_cache_attestation as cache_attestation
     from rocm.prepare_jax_cache_dir import prepare_cache
 except ModuleNotFoundError:
     import probe_sft_compile as compile_probe
+    import qwen35_cache_attestation as cache_attestation
     from prepare_jax_cache_dir import prepare_cache
 
 
@@ -677,102 +678,6 @@ def _revalidate_cache_after_compile(cache_path: Path) -> None:
         raise RuntimeError("private cache namespace changed during startup prewarm")
 
 
-def _executable_cache_snapshot(cache_path: Path) -> dict[str, tuple[int, int]]:
-    snapshot: dict[str, tuple[int, int]] = {}
-    with os.scandir(cache_path) as entries:
-        for entry in entries:
-            if not entry.name.endswith("-cache"):
-                continue
-            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-                raise RuntimeError(
-                    f"non-regular executable cache entry appeared: {entry.path}"
-                )
-            metadata = entry.stat(follow_symlinks=False)
-            snapshot[entry.name] = (metadata.st_size, metadata.st_mtime_ns)
-    return snapshot
-
-
-def _cache_evidence(
-    events: dict[str, int],
-    durations: dict[str, list[float]],
-    monitoring_issues: list[str],
-    before: dict[str, tuple[int, int]],
-    after: dict[str, tuple[int, int]],
-) -> dict[str, Any]:
-    added = sorted(after.keys() - before.keys())
-    removed = sorted(before.keys() - after.keys())
-    changed = sorted(
-        name for name in before.keys() & after.keys() if before[name] != after[name]
-    )
-    manifest = "\n".join(
-        f"{name}\0{size}\0{mtime_ns}"
-        for name, (size, mtime_ns) in sorted(after.items())
-    )
-    hits = events.get("/jax/compilation_cache/cache_hits", 0)
-    misses = events.get("/jax/compilation_cache/cache_misses", 0)
-    requests = events.get("/jax/compilation_cache/compile_requests_use_cache", 0)
-    saved = durations.get("/jax/compilation_cache/compile_time_saved_sec", [])
-    retrieval = durations.get("/jax/compilation_cache/cache_retrieval_time_sec", [])
-    has_exact_hit_durations = len(saved) == 1 and len(retrieval) == 1
-    has_any_durations = bool(saved or retrieval)
-    if monitoring_issues:
-        classification = "malformed_public_monitoring_evidence"
-    elif removed:
-        classification = "ambiguous_top_level_cache_removal"
-    elif requests == 1 and hits == 1 and misses == 0 and (added or changed):
-        classification = "ambiguous_hit_with_top_level_cache_mutation"
-    elif requests == 1 and hits == 1 and misses == 0 and has_exact_hit_durations:
-        classification = "strict_public_monitoring_hit"
-    elif requests == 1 and hits == 1 and misses == 0:
-        classification = "hit_without_exact_public_duration_evidence"
-    elif has_any_durations:
-        classification = "duration_events_without_single_cache_hit"
-    elif (
-        requests == 1 and hits == 0 and misses == 1 and len(added) == 1 and not changed
-    ):
-        classification = "strict_public_monitoring_miss_with_single_cache_add"
-    elif requests == 1 and hits == 0 and misses == 1 and len(added) > 1:
-        classification = "ambiguous_miss_with_multiple_added_cache_entries"
-    elif requests == 1 and hits == 0 and misses == 1 and changed:
-        classification = "ambiguous_miss_with_changed_cache_entry"
-    elif misses > 0 and (added or changed):
-        classification = "non_strict_miss_events_with_cache_change"
-    elif misses > 0:
-        classification = "miss_event_without_top_level_cache_change"
-    elif hits or misses or requests:
-        classification = "mixed_or_incomplete_public_monitoring_events"
-    else:
-        classification = "no_public_hit_or_miss_event_observed"
-    return {
-        "classification": classification,
-        "public_monitoring_events": {
-            "compile_requests_use_cache": requests,
-            "cache_hits": hits,
-            "cache_misses": misses,
-        },
-        "public_monitoring_duration_events": {
-            "compile_time_saved_sec": saved,
-            "cache_retrieval_time_sec": retrieval,
-        },
-        "public_monitoring_schema_issues": monitoring_issues,
-        "top_level_executable_cache": {
-            "entries_before": len(before),
-            "entries_after": len(after),
-            "bytes_before": sum(size for size, _mtime in before.values()),
-            "bytes_after": sum(size for size, _mtime in after.values()),
-            "added_entries": added,
-            "changed_entries": changed,
-            "removed_entries": removed,
-            "post_manifest_sha256": hashlib.sha256(manifest.encode()).hexdigest(),
-        },
-        "evidence_limit": (
-            "JAX 0.10.2 public monitoring reports process-level hit/miss and "
-            "duration events without a module or cache key; directory deltas are "
-            "observable but do not prove which key a compile request used"
-        ),
-    }
-
-
 def _run_compile_attempt(
     *,
     target: str,
@@ -784,75 +689,23 @@ def _run_compile_attempt(
     boot_validator: Callable[[], dict[str, Any]],
     output: TextIO,
 ) -> tuple[Any, float, float, dict[str, Any]]:
-    before = _executable_cache_snapshot(cache_path)
-    events: dict[str, int] = {}
-    durations: dict[str, list[float]] = {}
-    monitoring_issues: list[str] = []
-    event_names = {
-        "/jax/compilation_cache/cache_hits",
-        "/jax/compilation_cache/cache_misses",
-        "/jax/compilation_cache/compile_requests_use_cache",
-    }
-    duration_names = {
-        "/jax/compilation_cache/compile_time_saved_sec",
-        "/jax/compilation_cache/cache_retrieval_time_sec",
-    }
-
-    def listener(event: str, **metadata: str | int) -> None:
-        if event not in event_names:
-            return
-        if metadata:
-            monitoring_issues.append(f"unexpected event metadata for {event}")
-        events[event] = events.get(event, 0) + 1
-
-    def duration_listener(
-        event: str, duration_secs: float, **metadata: str | int
-    ) -> None:
-        if event not in duration_names:
-            return
-        if metadata:
-            monitoring_issues.append(f"unexpected duration metadata for {event}")
-        if (
-            isinstance(duration_secs, bool)
-            or not isinstance(duration_secs, (int, float))
-            or not math.isfinite(duration_secs)
-            or duration_secs < 0
-        ):
-            monitoring_issues.append(f"invalid numeric duration for {event}")
-            return
-        durations.setdefault(event, []).append(float(duration_secs))
-
+    before = cache_attestation.snapshot_cache(cache_path)
     result: tuple[Any, float, float] | None = None
     compile_error: BaseException | None = None
-    listener_registered = False
-    duration_listener_registered = False
+    capture = cache_attestation.PublicCacheMonitoringCapture(jax.monitoring)
+    operation_wall_start_ns = time.time_ns()
     try:
-        jax.monitoring.register_event_listener(listener)
-        listener_registered = True
-        jax.monitoring.register_event_duration_secs_listener(duration_listener)
-        duration_listener_registered = True
-        result = compile_fn()
+        with capture:
+            result = compile_fn()
     except BaseException as error:
         compile_error = error
-    finally:
-        if duration_listener_registered:
-            try:
-                jax.monitoring.unregister_event_duration_listener(duration_listener)
-            except BaseException as error:
-                if compile_error is None:
-                    compile_error = error
-        if listener_registered:
-            try:
-                jax.monitoring.unregister_event_listener(listener)
-            except BaseException as error:
-                if compile_error is None:
-                    compile_error = error
+    operation_wall_end_ns = time.time_ns()
 
     cache_error: BaseException | None = None
-    after: dict[str, tuple[int, int]] = {}
+    after: cache_attestation.CacheSnapshot | None = None
     try:
         _revalidate_cache_after_compile(cache_path)
-        after = _executable_cache_snapshot(cache_path)
+        after = cache_attestation.snapshot_cache(cache_path)
     except BaseException as error:
         cache_error = error
 
@@ -897,10 +750,44 @@ def _run_compile_attempt(
         ) from compile_error
     if result is None:
         raise RuntimeError(f"{target} compile attempt returned no result")
-    evidence = _cache_evidence(events, durations, monitoring_issues, before, after)
+    if after is None:
+        raise RuntimeError(f"{target} cache snapshot returned no result")
+    evidence = cache_attestation.compare_cache_transition(
+        before,
+        after,
+        capture.trace(),
+        operation_wall_start_ns=operation_wall_start_ns,
+        operation_wall_end_ns=operation_wall_end_ns,
+    )
+    # Preserve the older summary keys for downstream audit readers while the
+    # schema-versioned exact-key fields above remain authoritative.
+    monitoring = evidence["monitoring"]
+    snapshots = evidence["snapshots"]
+    evidence["public_monitoring_events"] = {
+        "compile_requests_use_cache": monitoring["compile_requests_use_cache"],
+        "cache_hits": monitoring["cache_hits"],
+        "cache_misses": monitoring["cache_misses"],
+    }
+    evidence["public_monitoring_duration_events"] = {
+        "compile_time_saved_sec": monitoring["compile_time_saved_sec"],
+        "cache_retrieval_time_sec": monitoring["cache_retrieval_time_sec"],
+    }
+    evidence["public_monitoring_schema_issues"] = monitoring["schema_issues"]
+    evidence["top_level_executable_cache"] = {
+        "entries_before": len(before.pairs),
+        "entries_after": len(after.pairs),
+        "bytes_before": sum(
+            pair.executable.size_bytes for pair in before.pairs.values()
+        ),
+        "bytes_after": sum(pair.executable.size_bytes for pair in after.pairs.values()),
+        "added_entries": [f"{key}-cache" for key in snapshots["executable_added"]],
+        "changed_entries": [f"{key}-cache" for key in snapshots["executable_changed"]],
+        "removed_entries": [f"{key}-cache" for key in snapshots["executable_removed"]],
+        "post_manifest_sha256": snapshots["executable_manifest_after_sha256"],
+    }
     accepted = evidence["classification"] in {
-        "strict_public_monitoring_hit",
-        "strict_public_monitoring_miss_with_single_cache_add",
+        cache_attestation.PREWARM_SEED_HIT,
+        cache_attestation.PREWARM_SEED_MISS,
     }
     _emit(
         {
@@ -1155,10 +1042,14 @@ def _run_rocm(
     if "abstract_model_load" not in JaxBackendConfig.model_fields:
         raise RuntimeError("SkyRL backend lacks the required abstract_model_load field")
 
-    setup_start = time.perf_counter()
-    backend = JaxBackendImpl(
-        str(model_path), JaxBackendConfig(**config_values), process_id=0
+    resolved_backend_config = JaxBackendConfig(**config_values)
+    resolved_backend_config_values = resolved_backend_config.model_dump(mode="json")
+    resolved_backend_config_sha256 = cache_attestation.canonical_json_sha256(
+        resolved_backend_config_values,
+        domain="skyrl-qwen35-resolved-jax-backend-config-v1",
     )
+    setup_start = time.perf_counter()
+    backend = JaxBackendImpl(str(model_path), resolved_backend_config, process_id=0)
     backend.create_model(
         _MODEL_ID,
         types.LoraConfig(rank=8, alpha=32.0, seed=0),
@@ -1181,12 +1072,15 @@ def _run_rocm(
             "timestamp": _utc_now(),
             "model": _MODEL,
             "model_revision": _MODEL_REVISION,
+            "model_path": str(model_path),
+            "construction": args.construction,
             "platform_resolved": resolved_backend,
             "platform_version": platform_version,
             "jax_version": jax.__version__,
             "jaxlib_version": jaxlib.__version__,
             "cache_path": str(cache_path),
-            "backend_config": config_values,
+            "backend_config": resolved_backend_config_values,
+            "backend_config_sha256": resolved_backend_config_sha256,
             "adapter_index": adapter_index,
             "setup_seconds": setup_seconds,
             "setup_dispatch_caveat": (
@@ -1323,8 +1217,13 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
     _emit(
         {
             "record_type": "manifest",
+            "artifact_schema_name": cache_attestation.SCHEMA_NAME,
+            "artifact_schema_version": cache_attestation.SCHEMA_VERSION,
             "timestamp": _utc_now(),
             "mode": "rocm_compile_only" if args.execute_rocm else "cpu_plan_only",
+            "model": _MODEL,
+            "model_revision": _MODEL_REVISION,
+            "construction": args.construction,
             "buckets": list(args.buckets),
             "batch_size": 1,
             "attention_backend": args.attention_backend,
@@ -1503,6 +1402,8 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
         _emit(
             {
                 "record_type": "complete",
+                "artifact_schema_name": cache_attestation.SCHEMA_NAME,
+                "artifact_schema_version": cache_attestation.SCHEMA_VERSION,
                 "timestamp": _utc_now(),
                 "buckets": list(args.buckets),
                 "optimizer_compiled": args.compile_optimizer,

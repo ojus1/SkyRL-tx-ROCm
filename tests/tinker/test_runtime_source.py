@@ -180,6 +180,7 @@ def test_runtime_source_claim_binds_full_tree_cwd_and_graph_free_cache_policy(
         "jax_enable_pgle": "false",
         "jax_compilation_cache_expect_pgle": "false",
         "pallas_attention": "1",
+        "startup_cache_attestation": {"status": "not_required"},
         "dont_write_bytecode": True,
     }
 
@@ -191,6 +192,90 @@ def test_generic_runtime_without_claims_remains_unchanged() -> None:
         package_file=Path("not-used"),
         environment={},
     ) == {"status": "not_required", "role": "api"}
+
+
+def _cache_claim_environment() -> dict[str, str]:
+    return {
+        runtime_source._T64_CACHE_ATTEST_ENV: "required-v1",
+        runtime_source._PREWARM_AUDIT_PATH_ENV: "/private/run/prewarm.jsonl",
+        runtime_source._PREWARM_AUDIT_SHA256_ENV: "d" * 64,
+        runtime_source._PREWARM_HANDOFF_PATH_ENV: (
+            "/private/run/prewarm-handoff.jsonl"
+        ),
+        runtime_source._PREWARM_HANDOFF_SHA256_ENV: "e" * 64,
+    }
+
+
+@pytest.mark.parametrize("missing", runtime_source._CACHE_ATTESTATION_ENVIRONMENT)
+def test_runtime_cache_claim_is_all_or_none(missing: str) -> None:
+    environment = _cache_claim_environment()
+    del environment[missing]
+
+    with pytest.raises(runtime_source.RuntimeSourceError, match="incomplete"):
+        runtime_source.validate_runtime_source(
+            role="api",
+            module_file=Path("unused"),
+            package_file=Path("unused"),
+            environment=environment,
+        )
+
+
+def test_runtime_cache_claim_cannot_exist_without_hardened_source() -> None:
+    with pytest.raises(runtime_source.RuntimeSourceError, match="hardened source"):
+        runtime_source.validate_runtime_source(
+            role="api",
+            module_file=Path("unused"),
+            package_file=Path("unused"),
+            environment=_cache_claim_environment(),
+        )
+
+
+def test_runtime_cache_claim_mode_is_exact() -> None:
+    environment = _cache_claim_environment()
+    environment[runtime_source._T64_CACHE_ATTEST_ENV] = "required-v2"
+
+    with pytest.raises(runtime_source.RuntimeSourceError, match="required-v1"):
+        runtime_source.validate_runtime_source(
+            role="api",
+            module_file=Path("unused"),
+            package_file=Path("unused"),
+            environment=environment,
+        )
+
+
+def test_required_runtime_cache_claim_is_shared_source_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture = _fixture(tmp_path, "api")
+    fixture["environment"].update(_cache_claim_environment())
+    observed: dict[str, object] = {}
+    expected = {
+        "status": "required-v1",
+        "schema_version": 1,
+        "seed": {"bucket": 64},
+    }
+
+    def validate(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(runtime_source, "_validate_startup_cache_claim", validate)
+
+    result = runtime_source.validate_runtime_source(
+        role="api",
+        module_file=fixture["module"],
+        package_file=fixture["package"],
+        environment=fixture["environment"],
+        cwd=fixture["source_root"],
+        dont_write_bytecode=True,
+    )
+
+    assert result["startup_cache_attestation"] == expected
+    assert observed["source_root"] == fixture["source_root"]
+    assert observed["git_head"] == fixture["head"]
+    assert observed["git_tree"] == "b" * 40
+    assert observed["jax_cache"] == fixture["jax_cache"]
+    assert observed["attention_backend"] == "1"
 
 
 def test_runtime_source_revalidation_rejects_attestation_drift(

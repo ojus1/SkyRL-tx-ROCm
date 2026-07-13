@@ -228,3 +228,91 @@ def test_cache_setup_precedes_backend_start_and_graphs_remain_disabled() -> None
     assert pgle_cache_disable < command_buffer_disable < backend_start
     assert cache_export < command_buffer_disable < backend_start
     assert source.count("export XLA_FLAGS=") == 1
+
+
+def _run_launcher_policy_only(**updates: str) -> subprocess.CompletedProcess[str]:
+    environment = {
+        "HOME": os.environ["HOME"],
+        "LANG": "C.UTF-8",
+        "PATH": "/opt/rocm/bin:/usr/bin:/bin",
+        **updates,
+    }
+    return subprocess.run(
+        [str(_LAUNCHER), "policy-test"],
+        env=environment,
+        cwd=_REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+
+@pytest.mark.parametrize("value", ["", "true", "2", "01"])
+def test_runtime_t64_cache_attestation_public_mode_is_exact(value: str) -> None:
+    result = _run_launcher_policy_only(SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=value)
+
+    assert result.returncode == 2
+    assert "must be exactly 0 or 1" in result.stderr
+
+
+@pytest.mark.parametrize("buckets", ["", "640", "32,640", "164"])
+def test_runtime_t64_cache_attestation_requires_exact_bucket_64(
+    buckets: str,
+) -> None:
+    result = _run_launcher_policy_only(
+        SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST="1",
+        SKYRL_QWEN35_PREWARM_BUCKETS=buckets,
+    )
+
+    assert result.returncode == 2
+    assert "requires exact bucket 64" in result.stderr
+
+
+def test_runtime_t64_cache_attestation_cannot_be_prewarm_only() -> None:
+    result = _run_launcher_policy_only(
+        SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST="1",
+        SKYRL_QWEN35_PREWARM_BUCKETS="64",
+        SKYRL_QWEN35_PREWARM_ONLY="1",
+    )
+
+    assert result.returncode == 2
+    assert "requires SKYRL_QWEN35_PREWARM_ONLY=0" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SKYRL_QWEN35_RUNTIME_T64_CACHE_ATTEST",
+        "SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_PATH",
+        "SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_SHA256",
+        "SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_PATH",
+        "SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_SHA256",
+    ],
+)
+def test_launcher_rejects_every_inherited_internal_cache_claim(name: str) -> None:
+    result = _run_launcher_policy_only(**{name: ""})
+
+    assert result.returncode == 2
+    assert f"launcher-owned cache-attestation claim: {name}" in result.stderr
+
+
+def test_cache_claim_is_formed_only_after_all_prewarm_release_gates() -> None:
+    source = _source()
+    claim = source.index("runtime_cache_attestation_environment=(", 100)
+    # Skip the empty initialization and select the populated assignment.
+    claim = source.index("runtime_cache_attestation_environment=(", claim + 1)
+    api_exec = source.index("exec /usr/bin/env -i", claim)
+
+    for gate in (
+        "if ((final_journal_status != 0))",
+        "if ((prewarm_handoff_status != 0))",
+        "if ((prewarm_termination_status != 0))",
+        "if ((prewarm_status != 0))",
+    ):
+        assert source.index(gate) < claim
+    assert claim < source.index("unset SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST")
+    assert api_exec < source.index('"${runtime_cache_attestation_environment[@]}"')
+    assert source.count('"${runtime_cache_attestation_environment[@]}"') == 1
+    assert '"abstract_model_load":false' in source
+    assert '"abstract_model_load":true' in source

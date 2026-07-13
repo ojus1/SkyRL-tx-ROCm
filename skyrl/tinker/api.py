@@ -605,6 +605,50 @@ async def _stop_background_engine(
     )
 
 
+def _validate_required_startup_cache_engine_config(
+    source_attestation: dict[str, object], engine_config: EngineConfig
+) -> None:
+    """Reject a required T64 claim before constructing a mismatched backend."""
+    claim = source_attestation.get("startup_cache_attestation")
+    if claim is None:
+        if source_attestation.get("status") == "not_required":
+            return
+        raise RuntimeError("hardened runtime startup cache claim is absent")
+    if not isinstance(claim, dict):
+        raise RuntimeError("runtime startup cache claim has an invalid type")
+    requirement = claim.get("status")
+    if requirement == "not_required":
+        if claim != {"status": "not_required"}:
+            raise RuntimeError("runtime cache opt-out claim has unexpected fields")
+        return
+    if requirement != "required-v1":
+        raise RuntimeError("runtime startup cache requirement is invalid")
+    seed = claim.get("seed")
+    if not isinstance(seed, dict):
+        raise RuntimeError("required runtime startup cache seed is absent")
+    memory_mode = source_attestation.get("memory_mode")
+    if memory_mode not in {"growth", "preallocate85"}:
+        raise RuntimeError("required runtime memory mode is invalid")
+    expected_backend_config = {
+        "max_lora_adapters": 2,
+        "max_lora_rank": 8,
+        "train_micro_batch_size": 1,
+        "sample_max_num_sequences": 1,
+        "gradient_checkpointing": True,
+        "loss_chunk_size": 64,
+        "abstract_model_load": memory_mode == "preallocate85",
+    }
+    if (
+        engine_config.backend != "jax"
+        or engine_config.backend_config != expected_backend_config
+        or str(engine_config.base_model) != seed.get("model_path")
+        or engine_config.external_inference_url is not None
+    ):
+        raise RuntimeError(
+            "required T64 cache attestation does not match the exact JAX engine config"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -629,6 +673,9 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             "startup_launch_id is internal; API configuration must leave it unset"
         )
+    _validate_required_startup_cache_engine_config(
+        runtime_source_attestation, engine_config
+    )
 
     db_url = get_async_database_url(engine_config.database_url)
     db_engine = create_async_engine(db_url, echo=False)

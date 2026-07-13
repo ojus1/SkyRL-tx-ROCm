@@ -150,6 +150,8 @@ def initializing_engine(launch_database, monkeypatch: pytest.MonkeyPatch):
     engine.runtime_source_attestation = _ENGINE_SOURCE_ATTESTATION
     engine.runtime_launch_lock_attestation = _LOCK_ATTESTATION
     engine.runtime_handoff_attestation = _HANDOFF_ATTESTATION
+    engine.cache_evidence_status = "not_required"
+    engine.cache_evidence = {}
 
     def validate_with_stubbed_liveness(*args: Any, **kwargs: Any) -> dict[str, Any]:
         kwargs["identity_is_live"] = lambda _identity: True
@@ -254,6 +256,22 @@ def test_publish_ready_transitions_only_exact_initializing_launch(
         assert record.cache_evidence_status == "not_required"
         assert record.cache_evidence == {}
         assert record.error_message is None
+
+
+def test_publish_ready_rejects_cache_evidence_without_matching_requirement(
+    initializing_engine: TinkerEngine,
+) -> None:
+    initializing_engine.cache_evidence_status = "strict_aot_t64_persistent_cache_hit_v1"
+    initializing_engine.cache_evidence = {"unbound": True}
+
+    with pytest.raises(RuntimeError, match="opt-out publication is inconsistent"):
+        initializing_engine._publish_engine_ready()
+
+    with Session(initializing_engine.db_engine) as session:
+        record = session.get(EngineLaunchDB, _LAUNCH_ID)
+        assert record is not None
+        assert record.status == EngineLaunchStatus.INITIALIZING
+        assert record.ready_at is None
 
 
 @pytest.mark.parametrize(
