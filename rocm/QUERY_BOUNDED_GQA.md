@@ -964,6 +964,49 @@ forward sentinel. It does not promote another padding boundary, replay,
 backward, model integration, SFT, GRPO, or a latency distribution. Do not
 replay this evidence run.
 
+### ROCm 7.2.4 valid832 result
+
+The separately reviewed `valid832` tile-boundary case then passed one fresh
+supervised process. Its sole checked candidate dispatch took
+`6.677336001303047 ms`. Aggregate relative L2 was `0.0023517532413045595`,
+cosine was `0.9999972346278734`, maximum absolute error was
+`0.00022698193788528442`, and the BF16 output SHA-256 was
+`dfcf8dba310e280e7e1fa3d06c26b5bb0c68731f42c8bd97ddb769cced8f01d1`.
+
+Worst row relative L2 was `0.002441286421821476` and minimum row cosine was
+`0.9999970289937067`. The exact 64-key boundary rows 831, 832, and 833 had
+relative L2 `0.002331141395267736`, `0.002332625186151203`, and
+`0.0023416354125648563`. Before transfer, the wrong-all-valid affected-row and
+first-affected-row relative L2 values were `0.31870534941703016` and
+`0.03485904288737268`, respectively.
+
+The structural, metadata, memory, and one-shot counter proofs remained exact:
+one sole q768 call per dialect, no outer `while`, canonical parsed/raw 768/256
+metadata, 6,295,552 argument bytes, 2,097,152 output bytes, 16,640 temporary
+bytes, zero aliases, one lower/compile/placement/candidate/retrieval, and zero
+warmup/replay/backward/accelerator-reference/device-reduction/model or
+multi-case calls.
+
+Across 409 measured samples, peak physical VRAM was `745218048` bytes, peak
+junction temperature was `50 C`, peak board power was `130 W`, minimum
+host-available memory was `60013879296` bytes, and swap use remained zero. The
+profiler returned zero with no signal; all eight child journals and child
+preflight/postflight were clean.
+
+The mode-`0600` artifacts and SHA-256 values are:
+
+- `/tmp/query-bounded-gqa-c256-t1024-valid832.jsonl`:
+  `6cd8b6613a4e6880ae312b1e127811c79c6e783d39c331831f5826b9900fd560`;
+- `/tmp/query-bounded-gqa-c256-t1024-valid832.telemetry.jsonl`:
+  `f9987aea1cb3ab7f8a5fa2f84319973177c788b59a97f75346bc9f994e1ea442`;
+- `/tmp/query-bounded-gqa-c256-t1024-valid832.telemetry.jsonl.summary.json`:
+  `fa0c5ba8416c9236ec57e1d1c3f111678c967385baf7a1252e24846a9f2a7a8d`.
+
+This promotes only `valid832` in addition to `valid769`; it does not promote
+the adjacent 831/833 cases or the sparse-tail 1023 case by inference. It also
+does not promote replay, backward, model integration, SFT, GRPO, or a latency
+distribution. Do not replay this evidence run.
+
 Each remaining case requires a separate command of this form. This is a
 pending `valid768` template, not evidence that it ran:
 
