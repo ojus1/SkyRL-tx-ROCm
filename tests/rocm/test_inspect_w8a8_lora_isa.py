@@ -39,6 +39,8 @@ def _elf(
     flags: int = 0x41,
     text_size: int = 8,
     extent: int | None = None,
+    extra_function: str | None = None,
+    extra_object: str | None = None,
 ) -> bytes:
     section_names = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.note\0"
     section_name_offsets = {
@@ -46,18 +48,32 @@ def _elf(
         for name in (".text", ".symtab", ".strtab", ".shstrtab", ".note")
     }
     string_table = b"\0"
-    function_offset = descriptor_offset = 0
+    function_offset = descriptor_offset = extra_function_offset = (
+        extra_object_offset
+    ) = 0
     if function is not None:
         function_offset = len(string_table)
         string_table += function.encode() + b"\0"
         descriptor_offset = len(string_table)
         string_table += f"{function}.kd".encode() + b"\0"
+    if extra_function is not None:
+        extra_function_offset = len(string_table)
+        string_table += extra_function.encode() + b"\0"
+    if extra_object is not None:
+        extra_object_offset = len(string_table)
+        string_table += extra_object.encode() + b"\0"
     symbols = bytearray(24)
     if function is not None:
         symbols += struct.pack(
             "<IBBHQQ", function_offset, 0x12, 3, 1, 0x1000, text_size
         )
         symbols += struct.pack("<IBBHQQ", descriptor_offset, 0x11, 0, 1, 0, 64)
+    if extra_function is not None:
+        symbols += struct.pack(
+            "<IBBHQQ", extra_function_offset, 0x12, 3, 1, 0x1000, text_size
+        )
+    if extra_object is not None:
+        symbols += struct.pack("<IBBHQQ", extra_object_offset, 0x11, 0, 1, 0, 64)
 
     cursor = 128
     text_offset = cursor
@@ -179,6 +195,15 @@ def _records(candidate: bytes) -> list[bytes]:
     nested = b"proto-prefix" + b"\x0a" + _varint(len(other)) + other
     nested += b"between" + b"\x0a" + _varint(len(candidate)) + candidate + b"tail"
     return [_ISA._EXPECTED_SPLIT_MANIFEST, b"", wrapper, b"", nested]
+
+
+def _bind_synthetic_wrapper(monkeypatch, records: list[bytes]) -> None:
+    wrapper_elf = records[2][: -_ISA._EXPECTED_ROCM_MODULE_IDENTIFIER_BYTES]
+    monkeypatch.setattr(
+        _ISA,
+        "_EXPECTED_EMPTY_WRAPPER_ELF_SHA256",
+        hashlib.sha256(wrapper_elf).hexdigest(),
+    )
 
 
 def _split_proto(
@@ -408,11 +433,7 @@ def test_inventory_selects_symbol_not_position_and_classifies_empty_wrapper(
 ) -> None:
     candidate = _elf(_ISA._EXPECTED_SYMBOL)
     records = _records(candidate)
-    monkeypatch.setattr(
-        _ISA,
-        "_EXPECTED_EMPTY_WRAPPER_RECORD_SHA256",
-        hashlib.sha256(records[2]).hexdigest(),
-    )
+    _bind_synthetic_wrapper(monkeypatch, records)
     monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_BYTES", len(candidate))
     monkeypatch.setattr(
         _ISA, "_EXPECTED_HSACO_SHA256", hashlib.sha256(candidate).hexdigest()
@@ -424,6 +445,13 @@ def test_inventory_selects_symbol_not_position_and_classifies_empty_wrapper(
     assert len(inventory) == 3
     assert inventory[0]["classification"] == "empty_top_level_wrapper_non_candidate"
     assert inventory[0]["global_functions"] == []
+    assert inventory[0]["rocm_module_identifier"]["bytes"] == 16
+    assert inventory[0]["rocm_module_identifier"]["values_pinned"] is False
+    assert inventory[0]["trailing_bytes"] == 16
+    assert (
+        inventory[0]["trailing_sha256"]
+        == inventory[0]["rocm_module_identifier"]["sha256"]
+    )
     selected = [
         item
         for item in inventory
@@ -436,11 +464,7 @@ def test_inventory_selects_symbol_not_position_and_classifies_empty_wrapper(
 def test_inventory_rejects_duplicate_symbol_and_unbound_magic(monkeypatch) -> None:
     candidate = _elf(_ISA._EXPECTED_SYMBOL)
     records = _records(candidate)
-    monkeypatch.setattr(
-        _ISA,
-        "_EXPECTED_EMPTY_WRAPPER_RECORD_SHA256",
-        hashlib.sha256(records[2]).hexdigest(),
-    )
+    _bind_synthetic_wrapper(monkeypatch, records)
     monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_BYTES", len(candidate))
     monkeypatch.setattr(
         _ISA, "_EXPECTED_HSACO_SHA256", hashlib.sha256(candidate).hexdigest()
@@ -459,6 +483,86 @@ def test_inventory_rejects_duplicate_symbol_and_unbound_magic(monkeypatch) -> No
     with pytest.raises(_ISA.VerificationError, match="protobuf"):
         _ISA._inventory_elfs(unbound)
 
+    decoy = _elf(_ISA._EXPECTED_SYMBOL, extra_function="other_kernel")
+    decoy_nested = list(records)
+    decoy_nested[4] += b"\x0a" + _varint(len(decoy)) + decoy
+    with pytest.raises(_ISA.VerificationError, match="isolated"):
+        _ISA._inventory_elfs(decoy_nested)
+
+    extra_object = _elf(_ISA._EXPECTED_SYMBOL, extra_object="other_object")
+    extra_object_nested = list(records)
+    extra_object_nested[4] += b"\x0a" + _varint(len(extra_object)) + extra_object
+    with pytest.raises(_ISA.VerificationError, match="descriptor"):
+        _ISA._inventory_elfs(extra_object_nested)
+
+    function_only = bytearray(_elf(_ISA._EXPECTED_SYMBOL))
+    descriptor = f"{_ISA._EXPECTED_SYMBOL}.kd".encode()
+    descriptor_offset = function_only.find(descriptor)
+    assert descriptor_offset >= 0
+    function_only[descriptor_offset : descriptor_offset + len(descriptor)] = (
+        b"x" * len(_ISA._EXPECTED_SYMBOL) + b".kd"
+    )
+    function_only_nested = list(records)
+    function_only_nested[4] += (
+        b"\x0a" + _varint(len(function_only)) + bytes(function_only)
+    )
+    with pytest.raises(_ISA.VerificationError, match="not paired"):
+        _ISA._inventory_elfs(function_only_nested)
+
+    descriptor_only = bytearray(_elf(_ISA._EXPECTED_SYMBOL))
+    function = _ISA._EXPECTED_SYMBOL.encode()
+    function_offset = descriptor_only.find(function)
+    assert function_offset >= 0
+    descriptor_only[function_offset : function_offset + len(function)] = b"x" * len(
+        function
+    )
+    descriptor_only_nested = list(records)
+    descriptor_only_nested[4] += (
+        b"\x0a" + _varint(len(descriptor_only)) + bytes(descriptor_only)
+    )
+    with pytest.raises(_ISA.VerificationError, match="not paired"):
+        _ISA._inventory_elfs(descriptor_only_nested)
+
+
+def test_inventory_accepts_variable_rocm_identifier_and_rejects_wrapper_mutations(
+    monkeypatch,
+) -> None:
+    candidate = _elf(_ISA._EXPECTED_SYMBOL)
+    records = _records(candidate)
+    _bind_synthetic_wrapper(monkeypatch, records)
+    monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_BYTES", len(candidate))
+    monkeypatch.setattr(
+        _ISA, "_EXPECTED_HSACO_SHA256", hashlib.sha256(candidate).hexdigest()
+    )
+
+    varied = list(records)
+    varied[2] = varied[2][:-16] + bytes(range(16))
+    _candidate, inventory = _ISA._inventory_elfs(varied)
+    identifier = inventory[0]["rocm_module_identifier"]
+    assert identifier["timestamp_nanoseconds_little_endian"] == int.from_bytes(
+        bytes(range(8)), "little"
+    )
+    assert identifier["random_identifier_u64_little_endian"] == int.from_bytes(
+        bytes(range(8, 16)), "little"
+    )
+
+    mutated_elf = list(records)
+    wrapper = bytearray(mutated_elf[2])
+    wrapper[1_000] ^= 1
+    mutated_elf[2] = bytes(wrapper)
+    with pytest.raises(_ISA.VerificationError, match="expected empty wrapper"):
+        _ISA._inventory_elfs(mutated_elf)
+
+    embedded_elf = list(records)
+    embedded_elf[2] = embedded_elf[2][:-16] + b"\x7fELF" + b"x" * 12
+    with pytest.raises(_ISA.VerificationError, match="expected empty wrapper"):
+        _ISA._inventory_elfs(embedded_elf)
+
+    short_identifier = list(records)
+    short_identifier[2] = short_identifier[2][:-1]
+    with pytest.raises(_ISA.VerificationError, match="expected empty wrapper"):
+        _ISA._inventory_elfs(short_identifier)
+
 
 def test_inventory_rejects_nested_elf_magic_amplification(monkeypatch) -> None:
     records = _records(_elf(_ISA._EXPECTED_SYMBOL))
@@ -470,11 +574,7 @@ def test_inventory_rejects_nested_elf_magic_amplification(monkeypatch) -> None:
         return original(data, offset, source=source)
 
     monkeypatch.setattr(_ISA, "_parse_elf", counted)
-    monkeypatch.setattr(
-        _ISA,
-        "_EXPECTED_EMPTY_WRAPPER_RECORD_SHA256",
-        hashlib.sha256(records[2]).hexdigest(),
-    )
+    _bind_synthetic_wrapper(monkeypatch, records)
     records[4] = b"prefix" + b"\x7fELF" * 33
 
     with pytest.raises(_ISA.VerificationError, match="nested ELF count"):
@@ -502,6 +602,12 @@ def test_llvm_output_gate_records_exact_resources_and_four_signed_iu8_wmma() -> 
             "resource",
         ),
         (_readobj(), _objdump(count=3), "exactly four"),
+        (_readobj(), _objdump(count=5), "exactly four"),
+        (
+            _readobj(),
+            _objdump().replace(b"neg_lo:[1,1,0]", b"neg_lo:[0,1,0]", 1),
+            "neg_lo",
+        ),
         (_readobj(), _objdump(instruction="v_wmma_f32_16x16x16_bf16"), "exactly four"),
         (_readobj().replace(b"gfx1100", b"gfx1101"), _objdump(), "target"),
     ],
@@ -590,11 +696,7 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
     monkeypatch.setattr(
         _ISA, "_EXPECTED_METADATA_SHA256", hashlib.sha256(metadata).hexdigest()
     )
-    monkeypatch.setattr(
-        _ISA,
-        "_EXPECTED_EMPTY_WRAPPER_RECORD_SHA256",
-        hashlib.sha256(records[2]).hexdigest(),
-    )
+    _bind_synthetic_wrapper(monkeypatch, records)
     monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_BYTES", len(candidate))
     monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_SHA256", expected_elf)
 
@@ -613,6 +715,13 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
         raise AssertionError(command)
 
     monkeypatch.setattr(_ISA, "_run_bounded", run)
+
+    with pytest.raises(_ISA.VerificationError, match="cache SHA-256"):
+        _ISA.inspect_cache(
+            cache,
+            expected_cache_sha256="0" * 64,
+            expected_elf_sha256=expected_elf,
+        )
 
     evidence = _ISA.inspect_cache(
         cache,

@@ -116,6 +116,27 @@ with the HLO call identity, this qualifies native gfx1100 signed-INT8 WMMA
 code generation for this exact Pallas microcase. It does not qualify runtime
 correctness or speed.
 
+The first guarded one-shot forward attempt at revision `2b38bfb3` failed
+closed before executable release in
+`/tmp/skyrl-w8a8-runtime-1783980961`. Lowering and compilation succeeded, but
+the offline inspector over-bound the complete top-level wrapper record even
+though its deterministic 1,904-byte empty ELF was unchanged; only OpenXLA's
+deliberately variable 16-byte ROCm module identifier differed. The probe
+emitted no executable-release, device-put, dispatch-started, dispatch,
+device-get, or runtime `numerical_validation` record, and its
+compiled-executable invocation count remained zero. The controller killed and
+reaped the scope in 67.1 ms and
+restored exact suspended/unowned idle state with a clean AMDGPU journal.
+Compilation peaked at 867,332,096 bytes physical VRAM, 51 C junction, and 101
+W sampled average power. This is failed-closed safety evidence, not runtime
+correctness or promotion evidence.
+
+The verifier now pins the deterministic empty ELF and exact 16-byte identifier
+shape while retaining caller-bound whole-cache SHA-256 integrity. CPU-only
+regression inspection passes both the previously qualified cache and the
+failed-attempt cache, which contain the same exact 8,440-byte W8 HSACO. A GPU
+retry remains a separate guarded rung.
+
 Peak observed physical VRAM, junction temperature, and sampled average power
 were 867,360,768 bytes, 51 C, and 113 W. Swap did not grow, all monitored
 limits passed, no driver fault appeared, and the device returned to its exact

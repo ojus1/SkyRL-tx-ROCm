@@ -105,7 +105,7 @@ _EXPECTED_HOST_SHA256 = {
     "expected": "964b0c1fe5f5c4cdbd60658717fee50a835006adf03011717b4914061ab4f88f",
 }
 _EXPECTED_SOURCE_SHA256 = {
-    "isa_inspector": "497105d3a8a0522191cb0d6f054f09a12fba842f867587a0de7569aa3b045acf",
+    "isa_inspector": "1a46c05700e5fbe6b5747632cfb23e872919f3b39fa77119c701836ce92cda07",
     "kernel": "1dec42508856d5e38a656bc4292dcb7033d4437bf8458f7b88030be4b4b4490a",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",

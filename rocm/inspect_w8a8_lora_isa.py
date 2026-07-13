@@ -8,11 +8,13 @@ libsnappy object are SHA-256 pinned.  Their dynamic loaders and transitive
 dependencies are not independently hash-closed.
 
 The cache's top-level 1,920-byte wrapper record contains an empty 1,904-byte
-ELF plus a 16-byte opaque trailer.  The generated code objects are nested in
-the final split-proto record.  Qualification therefore requires one and only
-one nested ELF with the exact forward symbol, the fixed gfx1100 resource
-contract, and exactly four IU8 WMMA instructions with the expected ``neg_lo``
-operand modifier.
+ELF plus the 16-byte timestamp/random module identifier that OpenXLA appends
+to ROCm binaries.  The generated code objects are nested in the final
+split-proto record.  Qualification therefore pins the deterministic empty ELF
+while treating the caller-hash-bound module identifier as evidence, and
+requires one and only one nested ELF with the exact forward symbol, the fixed
+gfx1100 resource contract, and exactly four IU8 WMMA instructions with the
+expected ``neg_lo`` operand modifier.
 """
 
 from __future__ import annotations
@@ -55,9 +57,12 @@ _EXPECTED_SPLIT_MANIFEST = bytes.fromhex(
 _EXPECTED_SPLIT_MANIFEST_SHA256 = (
     "9ca30cff5e8ca18187c33b6894a6403038bd9d4a67e2d9aa3b6ec0558301d4ee"
 )
-_EXPECTED_EMPTY_WRAPPER_RECORD_SHA256 = (
-    "c2958461eb1d5ca0a040819d1bb365c3fa87e3e15e8bcc5730c2ec5dcf4ee180"
+_EXPECTED_EMPTY_WRAPPER_ELF_BYTES = 1_904
+_EXPECTED_EMPTY_WRAPPER_ELF_SHA256 = (
+    "bf465081edca1fa73a8d1d73e9cc0a354d22038c47f21bc9f4e418388c8fd563"
 )
+_EXPECTED_WRAPPER_RECORD_BYTES = 1_920
+_EXPECTED_ROCM_MODULE_IDENTIFIER_BYTES = 16
 _RIEGELI_SIGNATURE = bytes.fromhex(
     "83af70d10d884a3f00000000000000004000000000000000"
     "91bac23c9287e1a90000000000000000e19f13c0e9b1c372"
@@ -483,7 +488,12 @@ def _extract_split_records(
         raise VerificationError("Riegeli record sizes do not match the chunk header")
     if len(values_raw) != decoded_size:
         raise VerificationError("Riegeli values do not match decoded_data_size")
-    if sizes[:4] != [len(_EXPECTED_SPLIT_MANIFEST), 0, 1920, 0]:
+    if sizes[:4] != [
+        len(_EXPECTED_SPLIT_MANIFEST),
+        0,
+        _EXPECTED_WRAPPER_RECORD_BYTES,
+        0,
+    ]:
         raise VerificationError("split-proto fixed record sizes changed")
     if sizes[4] <= 0 or sizes[4] > _MAX_SPLIT_RECORD:
         raise VerificationError("split-proto executable record is outside its bound")
@@ -685,13 +695,16 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
         raise VerificationError("split-proto record layout changed")
     inventory: list[dict[str, Any]] = []
     top, top_manifest = _parse_elf(records[2], 0, source="record[2]")
+    module_identifier = records[2][len(top) :]
     if (
-        len(top) != 1904
-        or len(records[2]) != 1920
+        len(top) != _EXPECTED_EMPTY_WRAPPER_ELF_BYTES
+        or len(records[2]) != _EXPECTED_WRAPPER_RECORD_BYTES
+        or len(module_identifier) != _EXPECTED_ROCM_MODULE_IDENTIFIER_BYTES
+        or b"\x7fELF" in module_identifier
         or top_manifest["global_functions"]
         or top_manifest["global_objects"]
         or top_manifest["section_sizes"].get(".text") != 0
-        or _sha256(records[2]) != _EXPECTED_EMPTY_WRAPPER_RECORD_SHA256
+        or _sha256(top) != _EXPECTED_EMPTY_WRAPPER_ELF_SHA256
     ):
         raise VerificationError(
             "top-level executable is not the expected empty wrapper"
@@ -699,8 +712,20 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
     top_manifest["classification"] = "empty_top_level_wrapper_non_candidate"
     top_manifest["record_bytes"] = len(records[2])
     top_manifest["record_sha256"] = _sha256(records[2])
-    top_manifest["trailing_bytes"] = len(records[2]) - len(top)
-    top_manifest["trailing_sha256"] = _sha256(records[2][len(top) :])
+    top_manifest["trailing_bytes"] = len(module_identifier)
+    top_manifest["trailing_sha256"] = _sha256(module_identifier)
+    top_manifest["rocm_module_identifier"] = {
+        "bytes": len(module_identifier),
+        "sha256": _sha256(module_identifier),
+        "timestamp_nanoseconds_little_endian": int.from_bytes(
+            module_identifier[:8], "little"
+        ),
+        "random_identifier_u64_little_endian": int.from_bytes(
+            module_identifier[8:], "little"
+        ),
+        "values_pinned": False,
+        "integrity_bound_by_caller_cache_sha256": True,
+    }
     inventory.append(top_manifest)
     nested = records[4]
     offsets: list[int] = []
@@ -723,7 +748,21 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
             raise VerificationError("nested ELF magic occurs inside another ELF")
         previous_end = offset + len(elf)
         inventory.append(manifest)
-        if manifest["global_functions"] == [_EXPECTED_SYMBOL]:
+        defines_expected_function = _EXPECTED_SYMBOL in manifest["global_functions"]
+        defines_expected_descriptor = (
+            f"{_EXPECTED_SYMBOL}.kd" in manifest["global_objects"]
+        )
+        if defines_expected_function != defines_expected_descriptor:
+            raise VerificationError(
+                "expected function and descriptor symbols are not paired"
+            )
+        if defines_expected_function:
+            if manifest["global_functions"] != [_EXPECTED_SYMBOL]:
+                raise VerificationError(
+                    "expected function is not isolated in one exact nested ELF"
+                )
+            if manifest["global_objects"] != [f"{_EXPECTED_SYMBOL}.kd"]:
+                raise VerificationError("candidate kernel descriptor symbol changed")
             if offset < 2:
                 raise VerificationError(
                     "candidate ELF is not bound by its exact protobuf field length"
@@ -750,11 +789,6 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
             "expected symbol does not identify one unique nested ELF"
         )
     candidate = candidates[0]
-    candidate_manifest = next(
-        item for item in inventory if item["sha256"] == _sha256(candidate)
-    )
-    if candidate_manifest["global_objects"] != [f"{_EXPECTED_SYMBOL}.kd"]:
-        raise VerificationError("candidate kernel descriptor symbol changed")
     if (
         len(candidate) != _EXPECTED_HSACO_BYTES
         or _sha256(candidate) != _EXPECTED_HSACO_SHA256

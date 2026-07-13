@@ -252,10 +252,17 @@ SHA-256, bounds zstd and Snappy output before accepting it, decodes the exact
 IFRT/Riegeli split record structure, inventories every embedded ELF, and uses
 hash-pinned ROCm LLVM tools. The decoded record sizes are
 `[56, 0, 1920, 0, 52425]`. The 1,920-byte wrapper record contains an empty
-1,904-byte ELF plus a 16-byte trailer; its `.text` is empty and it has no
-kernel, so it is explicitly rejected as ISA evidence. The final record
-contains five ELFs. Selection is by the unique exact function symbol rather
-than record position.
+1,904-byte ELF plus a 16-byte ROCm module identifier; its `.text` is empty and
+it has no kernel, so it is explicitly rejected as ISA evidence. OpenXLA
+deliberately appends a nanosecond timestamp and random 64-bit value to ROCm
+binaries so separately loaded identical HSACOs receive different module hashes
+([upstream implementation](https://github.com/openxla/xla/blob/5befee6e1873bddf3280d01e2a7c0c78e46e12be/xla/service/gpu/gpu_executable.cc#L498-L504)).
+The verifier therefore pins the deterministic 1,904-byte empty ELF, requires
+the exact 16-byte identifier shape, reports both values and its digest, and
+continues to integrity-bind every byte through the caller-supplied whole-cache
+SHA-256. The final record contains five ELFs. Selection is by the unique exact
+function/descriptor pair rather than record position; an ELF that defines the
+expected symbol alongside any decoy now fails closed.
 
 The retained result can be rechecked offline with:
 
@@ -290,7 +297,39 @@ headless and unowned, reached runtime suspend for three consecutive handoff
 samples, and left the whole-boot AMDGPU journal clean. These are compile and
 native-code-generation results, not performance measurements.
 
-The next permitted rung, now implemented but not yet run, is exactly one
+### First guarded forward attempt: failed closed before release
+
+Exact revision `2b38bfb380728e7a1920d599e27b5c2ab268a0be` made the first
+guarded one-shot attempt in `/tmp/skyrl-w8a8-runtime-1783980961`. Lowering and
+compilation completed in 1.119482 and 0.757109 seconds, but the then-current
+offline inspector incorrectly pinned the complete empty-wrapper record. The
+underlying 1,904-byte ELF was byte-identical to the qualified object with
+SHA-256
+`bf465081edca1fa73a8d1d73e9cc0a354d22038c47f21bc9f4e418388c8fd563`;
+only OpenXLA's deliberately variable 16-byte module identifier differed. The
+fresh nested object still contained the unique exact 8,440-byte W8 HSACO with
+SHA-256
+`606a80a508317af303966e5c2ca357d138d08828949c0dbfdcd73ccde1726389`.
+
+The probe emitted `compiled_unreleased` and then `error`. It emitted no
+`fresh_isa_qualification`, `executable_released`, `input_device_put`,
+`dispatch_started`, `dispatch`, `device_get`, numerical-validation, or
+completion record, and the compiled executable invocation count remained
+zero. This attempt is therefore neither runtime-correctness nor promotion
+evidence. The controller killed and reaped the complete scope in 67.1 ms,
+restored the exact VRAM/GTT idle baseline with the runtime suspended and device
+nodes unowned, and observed a clean whole-boot AMDGPU journal. Independently
+recomputed compile peaks were 867,332,096 bytes physical VRAM, 51 C junction,
+and 101 W sampled average power.
+
+After correcting only the nondeterministic-wrapper invariant, the CPU-only
+inspector passes both the prior cache
+`d00d54b9e684852a1d933eafb332e058c5b232d79f687dc936951887e3f646a2`
+and the failed-attempt cache
+`b1009c207c0c78bfe7a54c4fae568133034f2e6d0381367365cba10531bdec19`.
+No GPU access or executable dispatch is involved in that offline regression.
+
+The next permitted rung remains exactly one
 host-checked invocation of the same tiny forward. Only after that source and
 its fresh nested-ELF gate are independently reviewed will the ladder change one
 risk dimension at a time: signed base-only semantics;

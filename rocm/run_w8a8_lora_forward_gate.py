@@ -198,8 +198,8 @@ namespace = {
 exec(compile(payload, profile, "exec"), namespace)
 """
 _EXPECTED_SOURCE_SHA256 = {
-    "child": "79b73a0f425f78c91341d4f5288301a95d10404d849eb7b8df1c187099fec42f",
-    "isa_inspector": "497105d3a8a0522191cb0d6f054f09a12fba842f867587a0de7569aa3b045acf",
+    "child": "4916a81b56fc161041404c69cf5af5298f1d581b080e82c2cd6d6bca4d56157a",
+    "isa_inspector": "1a46c05700e5fbe6b5747632cfb23e872919f3b39fa77119c701836ce92cda07",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
     "handoff": "4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392",
     "profiler": "ed230758101a2a540b3a09e7f84ac92256d2bb41c70dbc399b9466fe0b979684",
