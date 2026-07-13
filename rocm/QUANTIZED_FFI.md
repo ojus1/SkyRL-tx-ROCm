@@ -123,8 +123,9 @@ integration.
 ### Guarded gfx1100 qualification entrypoint
 
 `rocm/run_w8a8_lora_forward_gate.py` and
-`rocm/probe_w8a8_lora_forward.py` implement only the first hardware rung. Their
-default invocations emit an abstract refusal without importing JAX. The ROCm
+`rocm/probe_w8a8_lora_forward.py` implement the compile-only rung and a
+separately guarded one-shot execute rung. Their default invocations emit an
+abstract refusal without importing JAX. The ROCm
 controller holds the global launch lock across an exact suspended/unowned
 RX 7900 XTX baseline, hash-bound `profile_rocm.py` supervision, the child, three
 consecutive one-second idle-handoff samples, and a final whole-boot journal
@@ -141,11 +142,15 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer=
 The fixed source requests the base-W8A8 plus LoRA-B/scaling Pallas epilogue at
 `M=3,K=64,N=17`, group 64, `block_m=block_n=16`, and physical grid `1x2`.
 Activation quantization and the LoRA-A contraction remain ordinary JAX work
-outside that Pallas call, so this is not an entire-forward megakernel. The only
-enabled hardware phase is an unpromoted compile diagnostic; it invokes no
-returned executable. `--phase execute` is rejected until retained gfx1100 ISA
-is qualified in a later source revision. The diagnostic contains no backward,
-warmup, repetition, replay, graph, model, or benchmark work.
+outside that Pallas call, so this is not an entire-forward megakernel. The
+compile phase invokes no returned executable. A separately guarded
+`--phase execute` branch is now implemented but **has not been run**. After
+fresh compilation it requalifies the exact nested gfx1100 code object before
+permitting one six-leaf input transfer, one compiled forward invocation with
+readiness, one output transfer, and a host-only comparison against the
+immutable oracle. It exposes no backward, warmup, repetition, replay, GPU
+reference, device-side error reduction, graph, model, or benchmark path, and
+it cannot promote the runtime or model path.
 
 The controller fixes sampled-sysfs thresholds of 2 GiB VRAM, 90 C junction,
 and 315 W `power1_average`, plus an 85 C child launch gate, 300-second child
@@ -181,17 +186,37 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
     --platform rocm --phase compile --allow-gpu --run-dir "$run_dir"
 ```
 
-Controller completion by itself does not establish runtime correctness or
-native INT8 ISA. It establishes only an unpromoted compile diagnostic whose
-private probe, telemetry, compiler, handoff, and final-journal artifacts must
-be reviewed together. Optimized HLO proving one Triton custom call is not an
-INT8 ISA proof, and surrounding optimized-HLO fusions may still launch
-separate kernels. The probe therefore persists raw StableHLO and optimized HLO
-and marks the result `passed_compile_diagnostic_unpromoted`. A separate offline
-audit must correlate an actual retained code object with the forward symbol,
-gfx1100 disassembly, and resource use. Runtime promotion additionally requires
-a guarded dispatch trace and host numerical comparison. If that chain is not
-available, the result remains only a Pallas Triton custom-call compile proof.
+The guarded execute branch has **not been invoked**. Only after its source,
+tests, and documentation are committed in a reviewed, clean tree may the exact
+one-shot request be made with:
+
+```bash
+umask 077
+run_dir="/tmp/skyrl-w8a8-runtime-$(date +%s)"
+XLA_FLAGS=--xla_gpu_enable_command_buffer= \
+  .venv/bin/python -I -S -B \
+    -X "pycache_prefix=$run_dir/python-cache" \
+    rocm/run_w8a8_lora_forward_gate.py \
+    --platform rocm --phase execute --allow-gpu --run-dir "$run_dir"
+```
+
+Even a passing invocation would establish only fixed `M=3,K=64,N=17`,
+group-64, rank-8 forward correctness under the retained W8 gate. It would not
+establish promotion, throughput, memory savings, backward correctness,
+warmup/replay safety, or model integration.
+
+Compile-phase controller completion by itself does not establish runtime
+correctness or native INT8 ISA. It establishes only an unpromoted compile
+diagnostic whose private probe, telemetry, compiler, handoff, and final-journal
+artifacts must be reviewed together. Optimized HLO proving one Triton custom
+call is not an INT8 ISA proof, and surrounding optimized-HLO fusions may still
+launch separate kernels. The probe therefore persists raw StableHLO and
+optimized HLO and marks the result `passed_compile_diagnostic_unpromoted`. A
+separate offline audit must correlate an actual retained code object with the
+forward symbol, gfx1100 disassembly, and resource use. Runtime promotion
+additionally requires a guarded dispatch trace and host numerical comparison.
+If that chain is not available, the result remains only a Pallas Triton
+custom-call compile proof.
 Version/origin checks and selected binary hashes do not constitute a complete
 hash closure over every JAX, NumPy, ML-dtypes, ROCm, and system runtime file;
 the untouched installed stack remains a recorded trust assumption.
@@ -265,10 +290,10 @@ headless and unowned, reached runtime suspend for three consecutive handoff
 samples, and left the whole-boot AMDGPU journal clean. These are compile and
 native-code-generation results, not performance measurements.
 
-The next separate rung is exactly one host-checked invocation of the same tiny
-forward. Only after that source and its fresh nested-ELF gate are independently
-reviewed will the ladder change one risk dimension at a time: signed base-only
-semantics;
+The next permitted rung, now implemented but not yet run, is exactly one
+host-checked invocation of the same tiny forward. Only after that source and
+its fresh nested-ELF gate are independently reviewed will the ladder change one
+risk dimension at a time: signed base-only semantics;
 `K=128`; three row superblocks; small base/fused VJPs; K-scan lengths 8/40/144;
 N-scan lengths 8/32/128/288; then the first real `K=2560,N=18432` gate/up
 rectangle. The artificial `K=9216,N=18432` rectangle is not a model shape and
@@ -414,7 +439,8 @@ The compile proof is not a reason to enable either route. Required gates are:
 The only current performance conclusion is feasibility: W8A8 and W4A4 can be
 compiled natively on this gfx1100 toolchain, the exact tiny Pallas W8A8 forward
 emits signed-IU8 WMMA, and the compact formats offer large, already-calculated
-residency savings. No Pallas W8 executable has run. Its speed advantage remains
-an experiment because runtime correctness, input quantization, group
-rescaling, LoRA work, backward, and bounded-launch overhead have not been
-benchmarked against the complete BF16 projection.
+residency savings. The guarded one-shot execute branch exists, but no Pallas W8
+executable has run. Its speed advantage remains an experiment because runtime
+correctness, input quantization, group rescaling, LoRA work, backward, and
+bounded-launch overhead have not been benchmarked against the complete BF16
+projection.

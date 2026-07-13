@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed gfx1100 compile diagnostic for one bounded W8A8+LoRA tile.
+"""Fail-closed gfx1100 qualification for one bounded W8A8+LoRA tile.
 
 The default abstract mode emits a refusal without importing JAX.  The sole
 ROCm contract is one ``M=3,K=64,N=17`` BF16/W8-group64/rank-8 forward.  A
@@ -8,12 +8,13 @@ controller must hold and pass SkyRL's global ROCm lock through
 RX 7900 XTX and render node, a clean boot, a headless AMD card, the exact sole
 command-buffer-disable flag, and a hardware power cap no greater than 315 W.
 
-The only enabled phase lowers and compiles but never invokes the executable.
-The execute phase is rejected until a later source revision qualifies retained
-gfx1100 ISA.  There is no runtime dispatch, backward, warmup, replay, benchmark,
-model dispatch, graph API, or command-buffer API in this probe. Compilation may
-still run bounded compiler profiling work, so it requires the outer telemetry
-and idle-handoff controller.
+The compile phase lowers and compiles but never invokes the executable.  The
+separately guarded execute phase first requalifies the exact fresh nested gfx1100
+code object, then performs exactly one input transfer, one compiled invocation,
+one output transfer, and a host-only numerical comparison.  There is no
+backward, warmup, replay, benchmark, model dispatch, graph API, or command-buffer
+API in this probe.  Both phases require the outer telemetry and idle-handoff
+controller.
 """
 
 from __future__ import annotations
@@ -62,6 +63,18 @@ _PALLAS_TARGETS = frozenset(
     }
 )
 _EXPECTED_KERNEL_NAME = "skyrl_qwen35_w8a8_lora_forward"
+_EXPECTED_NESTED_ELF_BYTES = 8_440
+_EXPECTED_NESTED_ELF_SHA256 = (
+    "606a80a508317af303966e5c2ca357d138d08828949c0dbfdcd73ccde1726389"
+)
+_EXPECTED_NESTED_ELF_TARGET = "amdgcn--amdhsa-amdgiz-gfx1100"
+_EXPECTED_INT8_WMMA_COUNT = 4
+_EXPECTED_SGPR_COUNT = 34
+_EXPECTED_VGPR_COUNT = 62
+_MAX_RELATIVE_L2_ERROR = 0.01
+_MIN_COSINE_SIMILARITY = 0.9999
+_MAX_ABSOLUTE_ERROR = 0.25
+_MAX_DISPATCH_SECONDS = 1.0
 _EXPECTED_PROFILE_BOOTSTRAP_SHA256 = (
     "d8d3589a8c160853f87960aa1e3a1571e0646428710e570579455339e8a65c28"
 )
@@ -92,6 +105,7 @@ _EXPECTED_HOST_SHA256 = {
     "expected": "964b0c1fe5f5c4cdbd60658717fee50a835006adf03011717b4914061ab4f88f",
 }
 _EXPECTED_SOURCE_SHA256 = {
+    "isa_inspector": "497105d3a8a0522191cb0d6f054f09a12fba842f867587a0de7569aa3b045acf",
     "kernel": "1dec42508856d5e38a656bc4292dcb7033d4437bf8458f7b88030be4b4b4490a",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
@@ -136,6 +150,7 @@ def _source_files() -> dict[str, Path]:
     repo = Path(__file__).resolve().parent.parent
     return {
         "probe": Path(__file__).resolve(),
+        "isa_inspector": repo / "rocm" / "inspect_w8a8_lora_isa.py",
         "kernel": repo / "skyrl" / "tx" / "kernels" / "rocm" / "w8a8_lora.py",
         "quantized_reference": repo / "skyrl" / "tx" / "kernels" / "quantized_lora.py",
         "safety": repo / "rocm" / "amdgpu_safety.py",
@@ -376,8 +391,9 @@ def _module_origin_manifest(modules: dict[str, Any]) -> dict[str, str]:
 
 
 def _exact_contract(phase: str) -> dict[str, Any]:
-    if phase != "compile":
-        raise RuntimeError("only the compile diagnostic contract is enabled")
+    if phase not in {"compile", "execute"}:
+        raise RuntimeError(f"unsupported W8 qualification phase: {phase}")
+    execute = phase == "execute"
     return {
         "model_family": "Qwen/Qwen3.5-4B",
         "operation": "w8a8_group64_rank8_lora_forward_only",
@@ -414,16 +430,37 @@ def _exact_contract(phase: str) -> dict[str, Any]:
             "row_superblock": _ROW_SUPERBLOCK,
         },
         "dispatch_plan": {
-            "compiled_executable_invocations": 0,
+            "host_oracle_attempts": 1,
+            "host_oracle_completions": 1,
+            "host_sensitivity_comparisons": 35 if execute else 0,
+            "backend_initialization_attempts": 1,
+            "backend_initialization_completions": 1,
+            "lower_attempts": 1,
+            "lower_completions": 1,
+            "compile_attempts": 1,
+            "compile_completions": 1,
+            "isa_qualification_attempts": 1 if execute else 0,
+            "isa_qualification_completions": 1 if execute else 0,
+            "tuple_device_put_attempts": 1 if execute else 0,
+            "tuple_device_put_completions": 1 if execute else 0,
+            "device_put_leaves": 6 if execute else 0,
+            "input_readiness_invocations": 1 if execute else 0,
+            "compiled_executable_invocations": 1 if execute else 0,
+            "compiled_executable_completions": 1 if execute else 0,
+            "output_readiness_invocations": 1 if execute else 0,
+            "device_get_attempts": 1 if execute else 0,
+            "device_get_completions": 1 if execute else 0,
+            "device_get_leaves": 1 if execute else 0,
             "backward_invocations": 0,
             "warmup_invocations": 0,
             "replay_invocations": 0,
             "gpu_reference_invocations": 0,
             "device_error_reduction_invocations": 0,
+            "model_invocations": 0,
         },
-        "runtime_numerical_gate_evaluated": False,
+        "runtime_numerical_gate_evaluated": execute,
         "runtime_promotion": False,
-        "execute_rung_enabled": False,
+        "execute_rung_enabled": execute,
         "outer_profile_rocm_required": True,
         "exact_idle_handoff_required": True,
     }
@@ -452,10 +489,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--platform rocm requires --launcher-lock-fd")
     if args.platform == "abstract" and args.launcher_lock_fd is not None:
         parser.error("--launcher-lock-fd is only valid with --platform rocm")
-    if args.phase == "execute":
-        parser.error(
-            "the execute rung is disabled until exact retained gfx1100 ISA is qualified"
-        )
     for path in (args.output, args.artifact_dir):
         if path is not None and path.exists():
             parser.error(f"refusing to overwrite existing path: {path}")
@@ -609,6 +642,7 @@ def _validate_inherited_lock(lock_fd: int) -> dict[str, Any]:
 def _validate_controller_supervision(
     run_dir: Path,
     lock_fd: int,
+    phase: str = "compile",
     *,
     proc_root: Path = Path("/proc"),
 ) -> dict[str, Any]:
@@ -620,13 +654,16 @@ def _validate_controller_supervision(
     if len(cgroup_lines) != 1 or not cgroup_lines[0].startswith("0::"):
         raise RuntimeError("probe is not in one exact unified cgroup")
     cgroup = cgroup_lines[0][3:]
+    scope_label = "compile" if phase == "compile" else "runtime"
+    if phase not in {"compile", "execute"}:
+        raise RuntimeError(f"unsupported W8 qualification phase: {phase}")
     scope_match = re.fullmatch(
         r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/"
-        r"app\.slice/(skyrl-w8a8-compile-[0-9]+-[0-9a-f]+\.scope)",
+        rf"app\.slice/(skyrl-w8a8-{scope_label}-[0-9]+-[0-9a-f]+\.scope)",
         cgroup,
     )
     if scope_match is None:
-        raise RuntimeError("probe is not in the private W8 compile scope")
+        raise RuntimeError(f"probe is not in the private W8 {scope_label} scope")
 
     parent_pid = os.getppid()
     parent_root = proc_root / str(parent_pid)
@@ -695,7 +732,7 @@ def _validate_controller_supervision(
         "--platform",
         "rocm",
         "--phase",
-        "compile",
+        phase,
         "--allow-gpu",
         "--output",
         str(run_dir / "probe.jsonl"),
@@ -925,6 +962,118 @@ def _array_manifest(name: str, value: Any) -> dict[str, Any]:
     }
 
 
+def _host_oracle(arguments: tuple[Any, ...]) -> Any:
+    """Evaluate the immutable candidate semantics using NumPy on the host."""
+    import ml_dtypes
+    import numpy as np
+
+    x, weight_codes, weight_scales, lora_a, lora_b, scaling = arguments
+    x_f32 = np.asarray(x, dtype=np.float32)
+    x_grouped = x_f32.reshape((_ROWS, -1, _GROUP_SIZE))
+    x_amax = np.max(np.abs(x_grouped), axis=-1)
+    x_scales = np.where(x_amax > 0, x_amax / 127.0, 1.0).astype(np.float32)
+    x_codes = np.clip(np.rint(x_grouped / x_scales[..., None]), -127, 127).astype(
+        np.int8
+    )
+    integer = np.einsum(
+        "mgk,gkn->mgn",
+        x_codes.astype(np.int32),
+        np.asarray(weight_codes, dtype=np.int8)
+        .reshape((-1, _GROUP_SIZE, _OUT_FEATURES))
+        .astype(np.int32),
+        dtype=np.int32,
+    )
+    base = np.sum(
+        integer.astype(np.float32)
+        * x_scales[..., None]
+        * np.asarray(weight_scales, dtype=np.float32)[None, :, :],
+        axis=1,
+        dtype=np.float32,
+    )
+    z = np.matmul(x_f32, np.asarray(lora_a, dtype=np.float32), dtype=np.float32)
+    low_rank = np.matmul(z, np.asarray(lora_b, dtype=np.float32), dtype=np.float32)
+    return (base + np.asarray(scaling, dtype=np.float32) * low_rank).astype(
+        ml_dtypes.bfloat16
+    )
+
+
+def _relative_l2(candidate: Any, expected: Any) -> float:
+    import numpy as np
+
+    candidate_f32 = np.asarray(candidate, dtype=np.float32)
+    expected_f32 = np.asarray(expected, dtype=np.float32)
+    denominator = float(np.linalg.norm(expected_f32.ravel()))
+    if not np.isfinite(denominator) or denominator <= 0:
+        raise RuntimeError("host oracle has no finite nonzero norm")
+    return float(np.linalg.norm((candidate_f32 - expected_f32).ravel()) / denominator)
+
+
+def _host_oracle_sensitivity(
+    arguments: tuple[Any, ...], expected: Any
+) -> dict[str, Any]:
+    """Prove 35 fixed omissions are visible above the 3% sensitivity floor."""
+    import numpy as np
+
+    comparisons: list[dict[str, Any]] = []
+
+    def record(label: str, candidate: Any) -> None:
+        error = _relative_l2(candidate, expected)
+        comparisons.append(
+            {"label": label, "relative_l2_error": error, "passed": error > 0.03}
+        )
+
+    names = (
+        "x",
+        "weight_codes",
+        "weight_scales",
+        "lora_a",
+        "lora_b",
+        "lora_scaling",
+    )
+    for index, name in enumerate(names):
+        mutated = list(arguments)
+        mutated[index] = np.zeros_like(mutated[index])
+        record(f"global_zero_{name}", _host_oracle(tuple(mutated)))
+    record("global_zero_output", np.zeros_like(expected))
+
+    for row in range(_ROWS):
+        candidate = np.array(expected, copy=True)
+        candidate[row, :] = 0
+        record(f"omitted_output_row_{row}", candidate)
+    for column in range(_OUT_FEATURES):
+        candidate = np.array(expected, copy=True)
+        candidate[:, column] = 0
+        record(f"omitted_output_column_{column}", candidate)
+    for rank in range(_RANK):
+        mutated = list(arguments)
+        lora_b = np.array(mutated[4], copy=True)
+        lora_b[rank, :] = 0
+        mutated[4] = lora_b
+        record(f"omitted_lora_rank_{rank}", _host_oracle(tuple(mutated)))
+
+    if len(comparisons) != 35 or not all(item["passed"] for item in comparisons):
+        failed = [item["label"] for item in comparisons if not item["passed"]]
+        raise RuntimeError(
+            "host oracle sensitivity failed exact 35-comparison gate: "
+            + ", ".join(failed)
+        )
+    return {
+        "comparison_count": len(comparisons),
+        "required_minimum_relative_l2_error_exclusive": 0.03,
+        "minimum_observed_relative_l2_error": min(
+            item["relative_l2_error"] for item in comparisons
+        ),
+        "groups": {
+            "global": 7,
+            "omitted_rows": 3,
+            "omitted_columns": 17,
+            "omitted_ranks": 8,
+        },
+        "comparisons": comparisons,
+        "passed": True,
+    }
+
+
 def _construct_host_case() -> tuple[tuple[Any, ...], list[dict[str, Any]], Any]:
     import ml_dtypes
     import numpy as np
@@ -964,30 +1113,8 @@ def _construct_host_case() -> tuple[tuple[Any, ...], list[dict[str, Any]], Any]:
     ).astype(ml_dtypes.bfloat16)
     scaling = np.asarray(_SCALING, dtype=np.float32)
 
-    x_f32 = np.asarray(x, dtype=np.float32)
-    x_grouped = x_f32.reshape((_ROWS, -1, _GROUP_SIZE))
-    x_amax = np.max(np.abs(x_grouped), axis=-1)
-    x_scales = np.where(x_amax > 0, x_amax / 127.0, 1.0).astype(np.float32)
-    x_codes = np.clip(np.rint(x_grouped / x_scales[..., None]), -127, 127).astype(
-        np.int8
-    )
-    integer = np.einsum(
-        "mgk,gkn->mgn",
-        x_codes.astype(np.int32),
-        weight_codes.reshape((-1, _GROUP_SIZE, _OUT_FEATURES)).astype(np.int32),
-        dtype=np.int32,
-    )
-    base = np.sum(
-        integer.astype(np.float32)
-        * x_scales[..., None]
-        * np.asarray(weight_scales, dtype=np.float32)[None, :, :],
-        axis=1,
-        dtype=np.float32,
-    )
-    z = np.matmul(x_f32, np.asarray(lora_a, dtype=np.float32), dtype=np.float32)
-    low_rank = np.matmul(z, np.asarray(lora_b, dtype=np.float32), dtype=np.float32)
-    expected = (base + scaling * low_rank).astype(ml_dtypes.bfloat16)
     arguments = (x, weight_codes, weight_scales, lora_a, lora_b, scaling)
+    expected = _host_oracle(arguments)
     manifests = [
         _array_manifest(name, value)
         for name, value in zip(
@@ -1001,6 +1128,114 @@ def _construct_host_case() -> tuple[tuple[Any, ...], list[dict[str, Any]], Any]:
     if observed_hashes != _EXPECTED_HOST_SHA256:
         raise RuntimeError("deterministic host boundary or oracle hash changed")
     return arguments, manifests, expected
+
+
+class _OneShotDispatchCapability:
+    """A fail-closed token consumed before the sole compiled invocation."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.completions = 0
+        self._consumed = False
+
+    def consume(self) -> None:
+        if self._consumed or self.attempts != 0 or self.completions != 0:
+            raise RuntimeError("one-shot dispatch capability was already consumed")
+        self._consumed = True
+        self.attempts = 1
+
+    def complete(self) -> None:
+        if not self._consumed or self.attempts != 1 or self.completions != 0:
+            raise RuntimeError("one-shot dispatch completion state is invalid")
+        self.completions = 1
+
+    def snapshot(self) -> dict[str, int | bool]:
+        return {
+            "consumed": self._consumed,
+            "compiled_executable_attempts": self.attempts,
+            "compiled_executable_completions": self.completions,
+        }
+
+
+def _runtime_numerical_validation(
+    actual: Any, expected: Any, dispatch_seconds: float
+) -> dict[str, Any]:
+    """Compare one copied-back result to the immutable host oracle."""
+    import numpy as np
+
+    actual_array = np.asarray(actual)
+    expected_array = np.asarray(expected)
+    actual_f32 = np.asarray(actual_array, dtype=np.float32)
+    expected_f32 = np.asarray(expected_array, dtype=np.float32)
+    difference = actual_f32 - expected_f32
+    expected_norm = float(np.linalg.norm(expected_f32.ravel()))
+    actual_norm = float(np.linalg.norm(actual_f32.ravel()))
+    relative_l2 = (
+        float(np.linalg.norm(difference.ravel()) / expected_norm)
+        if expected_norm > 0
+        else float("inf")
+    )
+    denominator = actual_norm * expected_norm
+    cosine = (
+        float(np.dot(actual_f32.ravel(), expected_f32.ravel()) / denominator)
+        if denominator > 0
+        else float("-inf")
+    )
+    maximum_absolute = float(np.max(np.abs(difference)))
+    bitwise_equal = bool(
+        actual_array.tobytes(order="C") == expected_array.tobytes(order="C")
+    )
+    if bitwise_equal:
+        relative_l2 = 0.0
+        cosine = 1.0
+        maximum_absolute = 0.0
+    element_count = int(actual_array.size)
+    finite_actual_count = int(np.count_nonzero(np.isfinite(actual_f32)))
+    finite_expected_count = int(np.count_nonzero(np.isfinite(expected_f32)))
+    checks = {
+        "actual_shape_exact": list(actual_array.shape) == [_ROWS, _OUT_FEATURES],
+        "expected_shape_exact": list(expected_array.shape) == [_ROWS, _OUT_FEATURES],
+        "actual_dtype_bfloat16": str(actual_array.dtype) == "bfloat16",
+        "expected_dtype_bfloat16": str(expected_array.dtype) == "bfloat16",
+        "actual_nbytes_exact": int(actual_array.nbytes) == 102,
+        "expected_nbytes_exact": int(expected_array.nbytes) == 102,
+        "actual_c_contiguous": bool(actual_array.flags.c_contiguous),
+        "expected_c_contiguous": bool(expected_array.flags.c_contiguous),
+        "all_51_actual_elements_finite": element_count == 51
+        and finite_actual_count == 51,
+        "all_51_expected_elements_finite": expected_array.size == 51
+        and finite_expected_count == 51,
+        "reference_norm_finite_nonzero": np.isfinite(expected_norm)
+        and expected_norm > 0,
+        "relative_l2_below_one_percent": np.isfinite(relative_l2)
+        and relative_l2 < _MAX_RELATIVE_L2_ERROR,
+        "cosine_at_least_0_9999": np.isfinite(cosine)
+        and cosine >= _MIN_COSINE_SIMILARITY,
+        "maximum_absolute_error_at_most_0_25": np.isfinite(maximum_absolute)
+        and maximum_absolute <= _MAX_ABSOLUTE_ERROR,
+        "dispatch_finite_below_one_second": np.isfinite(dispatch_seconds)
+        and 0 <= dispatch_seconds < _MAX_DISPATCH_SECONDS,
+    }
+    return {
+        "checks": checks,
+        "passed": all(checks.values()),
+        "element_count": element_count,
+        "finite_actual_count": finite_actual_count,
+        "finite_expected_count": finite_expected_count,
+        "relative_l2_error": relative_l2,
+        "cosine_similarity": cosine,
+        "maximum_absolute_error": maximum_absolute,
+        "dispatch_seconds": dispatch_seconds,
+        "limits": {
+            "maximum_relative_l2_error_exclusive": _MAX_RELATIVE_L2_ERROR,
+            "minimum_cosine_similarity_inclusive": _MIN_COSINE_SIMILARITY,
+            "maximum_absolute_error_inclusive": _MAX_ABSOLUTE_ERROR,
+            "maximum_dispatch_seconds_exclusive": _MAX_DISPATCH_SECONDS,
+        },
+        "actual": _array_manifest("actual", actual_array),
+        "expected": _array_manifest("expected", expected_array),
+        "bitwise_equal_diagnostic": bitwise_equal,
+    }
 
 
 def _mask_ir_strings_and_comments(text: str) -> str:
@@ -1578,6 +1813,69 @@ def _artifact_inventory(root: Path) -> dict[str, Any]:
     }
 
 
+def _qualify_fresh_nested_elf(
+    artifact_root: Path, artifact_inventory: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the exact offline inspector against this run's sole candidate cache."""
+    from rocm.inspect_w8a8_lora_isa import inspect_cache
+
+    candidates = [
+        item
+        for item in artifact_inventory.get("files", [])
+        if re.fullmatch(
+            r"jax-cache/jit_candidate-[0-9a-f]{64}-cache", item.get("path", "")
+        )
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"expected one fresh candidate cache artifact, observed {len(candidates)}"
+        )
+    cache_manifest = candidates[0]
+    cache_path = artifact_root / cache_manifest["path"]
+    evidence = inspect_cache(
+        cache_path,
+        expected_cache_sha256=cache_manifest["sha256"],
+        expected_elf_sha256=_EXPECTED_NESTED_ELF_SHA256,
+    )
+    isa = evidence.get("isa", {})
+    resources = isa.get("resources", {})
+    elf_inventory = evidence.get("elf_inventory", {})
+    candidate = evidence.get("candidate", {})
+    checks = {
+        "status_exact": evidence.get("status") == "passed_offline_isa_verification",
+        "offline_inspector": evidence.get("offline_only") is True
+        and evidence.get("device_access_performed") is False
+        and evidence.get("jax_modules_imported_by_verifier") is False,
+        "caller_bound_fresh_cache": evidence.get("cache", {}).get("path")
+        == str(cache_path)
+        and evidence.get("cache", {}).get("sha256") == cache_manifest["sha256"]
+        and evidence.get("cache", {}).get("expected_sha256_matched") is True,
+        "one_unique_exact_symbol_candidate": elf_inventory.get("elf_count") == 6
+        and elf_inventory.get("unique_exact_symbol_candidate_count") == 1,
+        "candidate_bytes_exact": candidate.get("bytes") == _EXPECTED_NESTED_ELF_BYTES,
+        "candidate_sha256_exact": candidate.get("sha256") == _EXPECTED_NESTED_ELF_SHA256
+        and candidate.get("expected_sha256_matched") is True,
+        "candidate_not_written_to_disk": candidate.get("written_elf") is None,
+        "symbol_exact": isa.get("symbol") == _EXPECTED_KERNEL_NAME,
+        "target_exact": isa.get("amdgpu_target") == _EXPECTED_NESTED_ELF_TARGET,
+        "four_static_signed_iu8_wmma": isa.get("static_instruction_count")
+        == _EXPECTED_INT8_WMMA_COUNT
+        and isa.get("instruction") == "v_wmma_i32_16x16x16_iu8"
+        and isa.get("signed_neg_lo") == [1, 1, 0],
+        "registers_exact": resources.get("sgpr_count") == _EXPECTED_SGPR_COUNT
+        and resources.get("vgpr_count") == _EXPECTED_VGPR_COUNT,
+        "zero_spills_and_private_segment": resources.get("sgpr_spill_count") == 0
+        and resources.get("vgpr_spill_count") == 0
+        and resources.get("private_segment_fixed_size") == 0,
+    }
+    if not all(checks.values()):
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        raise RuntimeError(
+            "fresh nested ELF qualification failed: " + ", ".join(failed)
+        )
+    return {"checks": checks, "passed": True, "evidence": evidence}
+
+
 def _json_scalars(values: Any) -> Any:
     if values is None or isinstance(values, (bool, int, float, str)):
         return values
@@ -1600,8 +1898,9 @@ def _run_rocm(
     device_root: Path,
     require_clean_boot: Callable[[], dict[str, Any]],
 ) -> int:
-    if args.phase != "compile":
-        raise RuntimeError("only the compile diagnostic backend path is enabled")
+    if args.phase not in {"compile", "execute"}:
+        raise RuntimeError(f"unsupported W8 qualification phase: {args.phase}")
+    execute = args.phase == "execute"
     import jax
     import jax.numpy as jnp
     import jaxlib
@@ -1612,6 +1911,9 @@ def _run_rocm(
     import skyrl.tx.kernels.rocm.w8a8_lora as w8a8_lora_module
 
     host_arguments, host_manifests, host_expected = _construct_host_case()
+    host_sensitivity = (
+        _host_oracle_sensitivity(host_arguments, host_expected) if execute else None
+    )
     signature = tuple(
         jax.ShapeDtypeStruct(value.shape, value.dtype) for value in host_arguments
     )
@@ -1645,10 +1947,14 @@ def _run_rocm(
             "lowering_consumed_host_values": False,
             "runtime_comparison_evaluated": False,
             "compiled_executable_invocations": 0,
+            "oracle_attempts": 1,
+            "oracle_completions": 1,
+            "sensitivity": host_sensitivity,
         },
         output,
     )
-    del host_arguments, host_expected
+    if not execute:
+        del host_arguments, host_expected
     hardware_limits = _read_hardware_limits(device_root)
     _emit(
         {
@@ -1662,6 +1968,8 @@ def _run_rocm(
             "hardware_limits": hardware_limits,
             "module_origins": module_origins,
             "compiled_executable_invocations": 0,
+            "backend_initialization_attempts": 1,
+            "backend_initialization_completions": 1,
         },
         output,
     )
@@ -1738,6 +2046,8 @@ def _run_rocm(
             "stablehlo_precompile_gate": stable_release,
             "journal_checkpoint": lower_checkpoint,
             "compiled_executable_invocations": 0,
+            "lower_attempts": 1,
+            "lower_completions": 1,
         },
         output,
     )
@@ -1784,7 +2094,7 @@ def _run_rocm(
     }
     _emit(
         {
-            "record_type": "compiled",
+            "record_type": "compiled_unreleased" if execute else "compiled",
             "timestamp": _utc_now(),
             "compile_seconds": compile_seconds,
             "hardware_limits_before_compile": limits_before_compile,
@@ -1796,6 +2106,9 @@ def _run_rocm(
             "journal_checkpoint": compile_checkpoint,
             "artifact_inventory": artifact_inventory,
             "compiled_executable_invocations": 0,
+            "compile_attempts": 1,
+            "compile_completions": 1,
+            "executable_released": False,
         },
         output,
     )
@@ -1804,7 +2117,212 @@ def _run_rocm(
             "compiled executable failed structural or memory release gate"
         )
 
-    del compiled
+    if not execute:
+        del compiled
+        source_postflight = _assert_bound_sources()
+        git_postflight = _git_manifest()
+        stack_postflight = _stack_manifest()
+        _emit(
+            {
+                "record_type": "completed",
+                "timestamp": _utc_now(),
+                "status": "passed_compile_diagnostic_unpromoted",
+                "runtime_promotion": False,
+                "isa_qualified": False,
+                "compiled_executable_invocations": 0,
+                "source_postflight": source_postflight,
+                "git_postflight": git_postflight,
+                "stack_postflight": stack_postflight,
+                "journal_postflight": require_clean_boot(),
+            },
+            output,
+        )
+        return 0
+
+    isa_qualification = _qualify_fresh_nested_elf(artifacts, artifact_inventory)
+    _emit(
+        {
+            "record_type": "fresh_isa_qualification",
+            "timestamp": _utc_now(),
+            "qualification": isa_qualification,
+            "isa_qualification_attempts": 1,
+            "isa_qualification_completions": 1,
+            "compiled_executable_invocations": 0,
+            "journal_checkpoint": require_clean_boot(),
+        },
+        output,
+    )
+    _emit(
+        {
+            "record_type": "executable_released",
+            "timestamp": _utc_now(),
+            "released_for": "one_exact_runtime_correctness_invocation",
+            "structural_gate_passed": structural["passed"],
+            "memory_gate_passed": memory_proof["passed"],
+            "fresh_isa_gate_passed": isa_qualification["passed"],
+            "runtime_promotion": False,
+            "compiled_executable_invocations": 0,
+        },
+        output,
+    )
+
+    device_put_start = time.perf_counter()
+    device_arguments = jax.device_put(host_arguments, device=devices[0])
+    jax.block_until_ready(device_arguments)
+    device_put_seconds = time.perf_counter() - device_put_start
+    _emit(
+        {
+            "record_type": "input_device_put",
+            "timestamp": _utc_now(),
+            "tuple_device_put_attempts": 1,
+            "tuple_device_put_completions": 1,
+            "device_put_leaves": 6,
+            "input_readiness_invocations": 1,
+            "device_put_seconds_including_readiness": device_put_seconds,
+            "compiled_executable_invocations": 0,
+        },
+        output,
+    )
+    _emit(
+        {
+            "record_type": "journal_checkpoint",
+            "stage": "after_input_device_put",
+            "timestamp": _utc_now(),
+            "safety": require_clean_boot(),
+        },
+        output,
+    )
+
+    dispatch_capability = _OneShotDispatchCapability()
+    _emit(
+        {
+            "record_type": "dispatch_preflight",
+            "timestamp": _utc_now(),
+            "hardware_limits": _read_hardware_limits(device_root),
+            "journal_checkpoint": require_clean_boot(),
+            "xla_flags": os.environ.get("XLA_FLAGS"),
+            "required_xla_flags": _COMMAND_BUFFER_FLAG,
+            "one_shot_capability": dispatch_capability.snapshot(),
+            "compiled_executable_invocations": 0,
+            "warmup_invocations": 0,
+            "replay_invocations": 0,
+            "backward_invocations": 0,
+            "gpu_reference_invocations": 0,
+            "device_error_reduction_invocations": 0,
+            "model_invocations": 0,
+        },
+        output,
+    )
+    if os.environ.get("XLA_FLAGS") != _COMMAND_BUFFER_FLAG:
+        raise RuntimeError("dispatch preflight lost the exact sole XLA_FLAGS value")
+
+    dispatch_capability.consume()
+    dispatch_started_wall_time_ns = time.time_ns()
+    dispatch_started_monotonic_ns = time.monotonic_ns()
+    _emit(
+        {
+            "record_type": "dispatch_started",
+            "timestamp": _utc_now(),
+            "wall_time_ns": dispatch_started_wall_time_ns,
+            "monotonic_ns": dispatch_started_monotonic_ns,
+            "one_shot_capability": dispatch_capability.snapshot(),
+            "output_readiness_invocations": 0,
+        },
+        output,
+    )
+    candidate_output: Any | None = None
+    dispatch_error: BaseException | None = None
+    dispatch_start = time.perf_counter()
+    try:
+        candidate_output = compiled(*device_arguments)
+        candidate_output.block_until_ready()
+    except BaseException as error:
+        dispatch_error = error
+    finally:
+        dispatch_end = time.perf_counter()
+        dispatch_completed_wall_time_ns = time.time_ns()
+        dispatch_completed_monotonic_ns = time.monotonic_ns()
+        dispatch_checkpoint = require_clean_boot()
+        _emit(
+            {
+                "record_type": "journal_checkpoint",
+                "stage": "after_candidate_dispatch_attempt",
+                "timestamp": _utc_now(),
+                "safety": dispatch_checkpoint,
+                "dispatch_completed_wall_time_ns": dispatch_completed_wall_time_ns,
+                "dispatch_completed_monotonic_ns": dispatch_completed_monotonic_ns,
+                "compiled_executable_attempts": dispatch_capability.attempts,
+                "compiled_executable_completions": dispatch_capability.completions,
+            },
+            output,
+        )
+    if dispatch_error is not None:
+        raise dispatch_error
+    if candidate_output is None:
+        raise RuntimeError("compiled invocation returned no candidate output")
+    dispatch_capability.complete()
+    dispatch_seconds = dispatch_end - dispatch_start
+    _emit(
+        {
+            "record_type": "dispatch",
+            "timestamp": _utc_now(),
+            "dispatch_started_wall_time_ns": dispatch_started_wall_time_ns,
+            "dispatch_completed_wall_time_ns": dispatch_completed_wall_time_ns,
+            "dispatch_started_monotonic_ns": dispatch_started_monotonic_ns,
+            "dispatch_completed_monotonic_ns": dispatch_completed_monotonic_ns,
+            "dispatch_seconds_including_output_readiness": dispatch_seconds,
+            "one_shot_capability": dispatch_capability.snapshot(),
+            "output_readiness_invocations": 1,
+        },
+        output,
+    )
+
+    device_get_start = time.perf_counter()
+    host_actual = jax.device_get(candidate_output)
+    device_get_seconds = time.perf_counter() - device_get_start
+    _emit(
+        {
+            "record_type": "device_get",
+            "timestamp": _utc_now(),
+            "device_get_attempts": 1,
+            "device_get_completions": 1,
+            "device_get_leaves": 1,
+            "device_get_seconds": device_get_seconds,
+            "one_shot_capability": dispatch_capability.snapshot(),
+        },
+        output,
+    )
+    _emit(
+        {
+            "record_type": "journal_checkpoint",
+            "stage": "after_candidate_device_get",
+            "timestamp": _utc_now(),
+            "safety": require_clean_boot(),
+        },
+        output,
+    )
+    numerical = _runtime_numerical_validation(
+        host_actual, host_expected, dispatch_seconds
+    )
+    _emit(
+        {
+            "record_type": "numerical_validation",
+            "timestamp": _utc_now(),
+            "validation": numerical,
+            "host_only_comparison": True,
+            "gpu_reference_invocations": 0,
+            "device_error_reduction_invocations": 0,
+            "one_shot_capability": dispatch_capability.snapshot(),
+        },
+        output,
+    )
+    if not numerical["passed"]:
+        failed = sorted(
+            name for name, passed in numerical["checks"].items() if not passed
+        )
+        raise RuntimeError("runtime numerical validation failed: " + ", ".join(failed))
+
+    del candidate_output, compiled, device_arguments
     source_postflight = _assert_bound_sources()
     git_postflight = _git_manifest()
     stack_postflight = _stack_manifest()
@@ -1812,10 +2330,18 @@ def _run_rocm(
         {
             "record_type": "completed",
             "timestamp": _utc_now(),
-            "status": "passed_compile_diagnostic_unpromoted",
+            "status": "passed_exact_m3_k64_n17_w8a8_lora_forward_runtime_correctness_only",
             "runtime_promotion": False,
-            "isa_qualified": False,
-            "compiled_executable_invocations": 0,
+            "isa_qualified": True,
+            "one_shot_capability": dispatch_capability.snapshot(),
+            "compiled_executable_invocations": 1,
+            "compiled_executable_completions": 1,
+            "warmup_invocations": 0,
+            "replay_invocations": 0,
+            "backward_invocations": 0,
+            "gpu_reference_invocations": 0,
+            "device_error_reduction_invocations": 0,
+            "model_invocations": 0,
             "source_postflight": source_postflight,
             "git_postflight": git_postflight,
             "stack_postflight": stack_postflight,
@@ -1868,7 +2394,7 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
         environment = _configure_environment(artifact_paths)
         stage = "controller_supervision"
         supervision = _validate_controller_supervision(
-            args.output.parent, args.launcher_lock_fd
+            args.output.parent, args.launcher_lock_fd, args.phase
         )
         _emit(
             {
@@ -1896,7 +2422,11 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             },
             output,
         )
-        stage = "rocm_compile_diagnostic"
+        stage = (
+            "rocm_compile_diagnostic"
+            if args.phase == "compile"
+            else "rocm_one_shot_runtime_correctness"
+        )
         return _run_rocm(
             args,
             output,
