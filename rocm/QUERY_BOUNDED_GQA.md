@@ -859,10 +859,10 @@ This promotes only the exact all-valid final-C256 T=1024 nonzero-scale forward
 sentinel. It does not authorize padding, another query chunk or length, replay,
 backward, model integration, SFT, GRPO, or a latency-distribution claim.
 
-## Pending T=1024/C=256 right-padding gates
+## T=1024/C=256 right-padding gates
 
 `rocm/probe_query_bounded_gqa_padding.py` defines the next isolated forward
-gate but has **not** been run on the GPU. Its exact case enum is
+gate. Its exact case enum is
 `valid768`, `valid769`, `valid831`, `valid832`, `valid833`, and `valid1023`.
 One explicit case is admitted per fresh process; the probe has no multi-case
 GPU path. These cases place the first masked key immediately before the final
@@ -919,8 +919,53 @@ and no more than 64 MiB temporary memory. Counters permit exactly one lower,
 compile, tuple placement, checked invocation, and retrieval, with no warmup,
 replay, backward, accelerator reference/reduction, or model call.
 
-After independent source review, each case would require a separate command
-of this form. This is a pending command template, not evidence that it ran:
+### ROCm 7.2.4 valid769 result
+
+After independent source review, `valid769` was executed exactly once under
+the documented supervisor. Its sole checked candidate dispatch took
+`6.522336996567901 ms`. Aggregate output relative L2 was
+`0.002358011106930757`, cosine was `0.9999972199554928`, and maximum absolute
+error was `0.0002086162567138672`. The BF16 output SHA-256 was
+`3249a150189478870550a0a541e28cf7e138ddd89e168493454a61d9ae3722ba`.
+
+Every query row passed. Worst row relative L2 was `0.002428750232187399`,
+minimum row cosine was `0.9999970526013587`, and worst row maximum absolute
+error was `0.0002086162567138672`. Rows 768, 769, and 770 had relative L2
+values `0.002363154786908979`, `0.0023671438827721747`, and
+`0.00234015679220429`, respectively. The pre-transfer wrong-all-valid control
+remained decisive: affected-row relative L2 was `0.3649149870684526` and the
+first affected row was `0.03749316685604765`.
+
+Both IR dialects retained one sole q768 ROCm Triton call, no outer `while`, and
+exact parsed and raw `query_start=768`/`query_size=256` metadata. Compiler
+memory was 6,295,552 argument bytes, 2,097,152 output bytes, 16,640 temporary
+bytes, and zero alias bytes. Final accounting recorded exactly one lower,
+compile, tuple placement, checked invocation, and retrieval, with zero
+warmups, replays, lowered-callable invocations, backward calls, accelerator
+references/reductions, model calls, or multi-case execution.
+
+The profiler completed with return code zero and no signal. Across 406
+measured samples, peak physical VRAM was `745218048` bytes, peak junction
+temperature was `49 C`, peak board power was `129 W`, minimum host-available
+memory was `59991953408` bytes, and swap use remained zero. All eight child
+journal checkpoints and child preflight/postflight were clean.
+
+The mode-`0600` evidence artifacts and SHA-256 values are:
+
+- `/tmp/query-bounded-gqa-c256-t1024-valid769.jsonl`:
+  `7b9409e16624e9fcca89b0cc867abd87614be2930f76b1e8bbd171aeee5002bb`;
+- `/tmp/query-bounded-gqa-c256-t1024-valid769.telemetry.jsonl`:
+  `adeff261aec958ac285a7fa0e72aa03d4dd9e929d28c08a365718fb7723b107c`;
+- `/tmp/query-bounded-gqa-c256-t1024-valid769.telemetry.jsonl.summary.json`:
+  `e5d9a4a69c374b8a973490f1856a43d87261693c9d132a414ac333db1ebb5231`.
+
+This promotes only the exact final-C256 T=1024 `valid769` key-only-padding
+forward sentinel. It does not promote another padding boundary, replay,
+backward, model integration, SFT, GRPO, or a latency distribution. Do not
+replay this evidence run.
+
+Each remaining case requires a separate command of this form. This is a
+pending `valid768` template, not evidence that it ran:
 
 ```bash
 .venv/bin/python rocm/profile_rocm.py \
@@ -940,9 +985,9 @@ of this form. This is a pending command template, not evidence that it ran:
        --output /tmp/query-bounded-gqa-c256-t1024-valid768.jsonl
 ```
 
-No case is promoted by this documentation or its CPU tests. A passing private
-child artifact and profiler telemetry must be independently audited before
-advancing to another case or to backward/model integration.
+No other case is promoted by this result. Every remaining private child
+artifact and profiler telemetry must be independently audited before advancing
+again or proceeding to backward/model integration.
 
 ## GPU promotion gates
 
