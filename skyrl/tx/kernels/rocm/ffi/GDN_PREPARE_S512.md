@@ -38,8 +38,9 @@ The kernel uses 49,664 bytes of statically bounded LDS: shared key Gram and
 strict-lower matrices, one 64-column forward-solve tile, and prefix/beta
 vectors. This is below the 64 KiB workgroup limit targeted by the design. The
 native-build result below records compile and code-object resource evidence;
-runtime occupancy and latency, numerical error, and watchdog safety remain
-unmeasured.
+the separately guarded one-shot gate records first-runtime latency, numerical
+error, and watchdog safety. Production occupancy and repeated-execution
+performance remain unmeasured.
 
 There is one HIP launch on JAX's supplied stream, no device or stream
 synchronization, no device-side scratch allocation, and no fast-math build
@@ -227,11 +228,11 @@ precursor is diagnostic evidence only, not a promoted result.
 This result promotes only exact S512 registration, lowering, compilation,
 layouts, compiler memory, and zero-invocation accounting. It does not validate
 the HIP launch, numerical U/W/G values, watchdog safety, runtime latency,
-occupancy, masking, recurrence, VJP, model integration, SFT, or GRPO. A first
-guarded numerical runtime probe may now be designed and reviewed, but this
-compile result does not authorize executing it.
+occupancy, masking, recurrence, VJP, model integration, SFT, or GRPO. It did
+not by itself authorize runtime execution; the separately reviewed one-shot
+numerical gate is recorded below.
 
-## Pending one-shot numerical runtime gate
+## Audited one-shot numerical runtime gate
 
 `rocm/probe_gdn_prepare_s512_runtime.py` is default-refusing. Its abstract path
 imports neither NumPy, JAX, the SkyRL ROCm package, nor a shared library:
@@ -289,8 +290,9 @@ below `3e-4` and maximum absolute residual at most `1e-4`. Less than 250 ms is
 promotable; 250 ms through less than 2 seconds is completed but unpromotable;
 2 seconds or more fails the hard gate.
 
-Only after independent static approval of exact source hashes may this command
-be considered. It has not been executed by this documentation change:
+After independent static approval of the exact source hashes, this command was
+executed exactly once. It must not be replayed as part of reproducing this
+documentation change:
 
 ```bash
 env \
@@ -303,7 +305,7 @@ env \
     --interval 0.05 \
     --timeout 120 \
     --sensor-grace-seconds 15 \
-    --max-junction-temp-c 90 \
+    --max-junction-temp-c 70 \
     --max-gpu-power-watts 315 \
     --max-vram-gib 2 \
     --min-host-available-gib 8 \
@@ -317,6 +319,46 @@ env \
       --output /tmp/gdn-prepare-s512-runtime-boot54ccf56c-run1.jsonl
 ```
 
-A pass would qualify only this prepare-only S512 all-valid one-shot boundary.
-It would not qualify padding, recurrence, reverse mode, repeated execution,
-model dispatch, training, SFT, GRPO, or production performance.
+The guarded run passed. Candidate latency, including output readiness, was
+`12.606937001692131 ms`. Full-output numerical results against the independent
+dense host oracle were:
+
+- U: SHA-256
+  `dcde3633e206505b28a69be2fb245b3e692e8b36e46e744c9c8dcbe63612cac1`,
+  relative L2 `4.25839918e-8`, cosine `0.9999999999999812`, maximum absolute
+  error `2.980232e-8`;
+- W: SHA-256
+  `2b52aab9c63c40b1c8a11f7158200b7f79becd418cb20513bf0c524c652c22a1`,
+  relative L2 `7.84664743e-8`, cosine `0.9999999999999563`, maximum absolute
+  error `1.490116e-8`;
+- gamma: SHA-256
+  `be49b883f1d6533dac79d89c74b8e4065fd9c5923fe4fe509d607f3e55da9c88`,
+  relative L2 `5.08727593e-8`, cosine `0.9999999999999984`, maximum absolute
+  error `1.1920929e-7`.
+
+The U and W equation-residual relative L2 values were respectively
+`4.44836e-8` and `7.56462e-8`. Accounting confirmed exactly one input-tuple
+transfer and readiness barrier, one candidate invocation and output-tuple
+readiness barrier, and one output-tuple retrieval. There was no warmup, replay,
+reference execution on the device, device reduction, model execution, or
+backward execution.
+
+Peak physical VRAM was `749793280` bytes, peak junction temperature was
+`49 C`, peak board power was `137 W`, minimum host-available memory was
+`60048465920` bytes, and swap use remained zero. All eleven child journal
+checkpoints were clean; the outer profiler exited successfully with the kernel
+log available.
+
+The mode-`0600` evidence artifacts are:
+
+- `/tmp/gdn-prepare-s512-runtime-boot54ccf56c-run1.jsonl`, SHA-256
+  `37a7e1d71713a7c3cb63dd62523d6b918e1475a5da3252df0cd14d885e54c83e`;
+- `/tmp/gdn-prepare-s512-runtime-boot54ccf56c-run1.telemetry.jsonl`, SHA-256
+  `1c26f9aeaa7187ba24d07c926aa7c144363edd039431fb35284d18655cc0d025`;
+- `/tmp/gdn-prepare-s512-runtime-boot54ccf56c-run1.telemetry.jsonl.summary.json`,
+  SHA-256
+  `3b506cb9849132fe5b553715ab64331493e3c9be5981f3359e431c46d5ac5cb3`.
+
+This result promotes only the prepare-only FP32 S512 dense all-valid one-shot
+boundary. It does not qualify padding, recurrence, reverse mode, repeated
+execution, model dispatch, training, SFT, GRPO, or production performance.
