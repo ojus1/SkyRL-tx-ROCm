@@ -964,10 +964,16 @@ def _run_optimizer_compile_attempt(
     )
 
 
-def _validate_inherited_lock(lock_fd: int) -> int:
+def _validate_inherited_lock(
+    lock_fd: int, runtime_dir: Path | None = None
+) -> int:
     if lock_fd < 0:
         raise RuntimeError("launcher lock descriptor must be nonnegative")
-    lock_parent = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    lock_parent = (
+        runtime_dir
+        if runtime_dir is not None
+        else Path("/run/user") / str(os.getuid())
+    )
     lock_dir = lock_parent / f"skyrl-qwen35-rocm-{os.getuid()}"
     path_metadata = lock_dir.lstat()
     descriptor_metadata = os.fstat(lock_fd)

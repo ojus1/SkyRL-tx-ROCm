@@ -74,6 +74,41 @@ def _tree_bytes_no_symlinks(path: Path) -> int:
     return total
 
 
+def validate_existing_cache(namespace: Path, max_autotune_bytes: int) -> Path:
+    """Validate one already-created exact namespace without repairing it."""
+    if max_autotune_bytes < 0:
+        raise ValueError("max_autotune_bytes must be nonnegative")
+    if not namespace.is_absolute():
+        raise RuntimeError("trusted cache namespace must be absolute")
+    try:
+        resolved = namespace.resolve(strict=True)
+        namespace_fd = os.open(namespace, _NOFOLLOW_DIRECTORY)
+    except OSError as error:
+        raise RuntimeError("trusted cache namespace is unavailable") from error
+    try:
+        if resolved != namespace:
+            raise RuntimeError("trusted cache namespace must be canonical")
+        _require_owned_directory(
+            namespace_fd, "SkyRL trusted cache namespace", exact_mode=0o700
+        )
+    finally:
+        os.close(namespace_fd)
+
+    _tree_bytes_no_symlinks(namespace)
+    autotune = namespace / _AUTOTUNE_SUBDIRECTORY
+    if autotune.exists():
+        if autotune.is_symlink() or not autotune.is_dir():
+            raise RuntimeError("autotune cache path is not a real directory")
+        autotune_bytes = _tree_bytes_no_symlinks(autotune)
+        if autotune_bytes > max_autotune_bytes:
+            raise RuntimeError(
+                "per-fusion autotune cache uses "
+                f"{autotune_bytes} bytes, above startup maximum "
+                f"{max_autotune_bytes}"
+            )
+    return namespace
+
+
 def _open_account_home() -> tuple[Path, int]:
     uid = os.getuid()
     home = Path(pwd.getpwuid(uid).pw_dir)
@@ -128,18 +163,7 @@ def _prepare_cache_in_open_home(
         namespace = home / ".cache" / _CACHE_BASE / _CACHE_NAMESPACE
         # Reject symlinks, sockets, devices, and other non-regular objects
         # anywhere JAX may read trusted executable or autotune content.
-        _tree_bytes_no_symlinks(namespace)
-        autotune = namespace / _AUTOTUNE_SUBDIRECTORY
-        if autotune.exists():
-            if autotune.is_symlink() or not autotune.is_dir():
-                raise RuntimeError("autotune cache path is not a real directory")
-            autotune_bytes = _tree_bytes_no_symlinks(autotune)
-            if autotune_bytes > max_autotune_bytes:
-                raise RuntimeError(
-                    "per-fusion autotune cache uses "
-                    f"{autotune_bytes} bytes, above startup maximum {max_autotune_bytes}"
-                )
-        return namespace
+        return validate_existing_cache(namespace, max_autotune_bytes)
     finally:
         for directory_fd in (namespace_fd, base_fd, cache_fd):
             if directory_fd is not None:

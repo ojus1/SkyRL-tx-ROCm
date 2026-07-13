@@ -173,20 +173,18 @@ def test_shared_hardware_preflight_fails_closed_on_fuser_outcomes(
         )
 
 
-def test_shared_lock_serializes_with_existing_probe_locks(tmp_path, monkeypatch):
+def test_shared_lock_serializes_with_existing_probe_locks(tmp_path):
     from rocm.probe_bfc_preallocation import _acquire_global_lock
 
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    lock_fd = acquire_qwen35_rocm_launch_lock()
+    lock_fd = acquire_qwen35_rocm_launch_lock(runtime_dir=tmp_path)
     try:
         with pytest.raises(RuntimeError, match="global launch lock"):
-            _acquire_global_lock()
+            _acquire_global_lock(runtime_dir=tmp_path)
     finally:
         os.close(lock_fd)
 
 
 def test_guard_releases_lock_when_hardware_preflight_fails(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setattr(
         _MODULE,
         "require_clean_amdgpu_boot",
@@ -199,10 +197,10 @@ def test_guard_releases_lock_when_hardware_preflight_fails(tmp_path, monkeypatch
     )
 
     with pytest.raises(RuntimeError, match="KFD refusal"):
-        with guarded_qwen35_rocm_process():
+        with guarded_qwen35_rocm_process(runtime_dir=tmp_path):
             pytest.fail("guard yielded after a failed preflight")
 
-    released_fd = acquire_qwen35_rocm_launch_lock()
+    released_fd = acquire_qwen35_rocm_launch_lock(runtime_dir=tmp_path)
     os.close(released_fd)
 
 

@@ -1,11 +1,29 @@
 """Background engine for processing training requests."""
 
+# Runtime source attestation intentionally precedes every third-party import.
+# ruff: noqa: E402
+
 import argparse
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+
+import skyrl as _skyrl_package
+from skyrl.tinker.runtime_source import (
+    revalidate_runtime_launch_lock,
+    revalidate_runtime_source,
+    validate_runtime_launch_lock,
+    validate_runtime_source,
+)
+
+_RUNTIME_LAUNCH_LOCK_ATTESTATION = validate_runtime_launch_lock()
+_RUNTIME_SOURCE_ATTESTATION = validate_runtime_source(
+    role="engine",
+    module_file=Path(__file__),
+    package_file=Path(_skyrl_package.__file__),
+)
 
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
@@ -249,6 +267,24 @@ class TinkerEngine:
     ):
         """Initialize the engine with a database connection and base model."""
         self.config = config
+        runtime_source_attestation = revalidate_runtime_source(
+            initial=_RUNTIME_SOURCE_ATTESTATION,
+            role="engine",
+            module_file=Path(__file__),
+            package_file=Path(_skyrl_package.__file__),
+        )
+        runtime_launch_lock_attestation = revalidate_runtime_launch_lock(
+            _RUNTIME_LAUNCH_LOCK_ATTESTATION
+        )
+        self.runtime_source_attestation = runtime_source_attestation
+        self.runtime_launch_lock_attestation = runtime_launch_lock_attestation
+        logger.info(
+            "Engine runtime source attestation: %s", runtime_source_attestation
+        )
+        logger.info(
+            "Engine runtime launch-lock attestation: %s",
+            runtime_launch_lock_attestation,
+        )
         self.db_engine = create_engine(config.database_url, echo=False)
         enable_sqlite_wal(self.db_engine)
 

@@ -214,6 +214,38 @@ def test_prepare_source_cache_reuses_without_mutating_stable_entry(
     assert _validate(repo, head, snapshot, site_packages)["status"] == "passed"
 
 
+def test_validate_source_cache_is_read_only_and_full_tree_bound(
+    tmp_path: Path,
+) -> None:
+    repo, head = _make_repo(tmp_path)
+    home = _make_account_home(tmp_path)
+    created = bootstrap.prepare_source_cache(
+        repo_root=repo, git_head=head, account_home=home
+    )
+    commit_root = Path(created["source_snapshot_root"]).parent
+    before = _cache_fingerprint(commit_root)
+
+    validated = bootstrap.validate_source_cache(
+        repo_root=repo, git_head=head, account_home=home
+    )
+
+    assert validated == {
+        **created,
+        "cache_status": "validated",
+    }
+    assert _cache_fingerprint(commit_root) == before
+
+    target = Path(created["source_snapshot_root"]) / "nested/data.bin"
+    target.write_bytes(b"mutated\n")
+    target.chmod(0o600)
+    with pytest.raises(
+        bootstrap.SourceVerificationError, match="does not equal HEAD blob"
+    ):
+        bootstrap.validate_source_cache(
+            repo_root=repo, git_head=head, account_home=home
+        )
+
+
 @pytest.mark.parametrize("present", ["snapshot", "archive"])
 def test_prepare_source_cache_rejects_partial_commit_pair(
     tmp_path: Path, present: str

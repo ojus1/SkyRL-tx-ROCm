@@ -27,7 +27,6 @@ mode-0600 ``--output`` artifact.  Wrap every GPU invocation with
 from __future__ import annotations
 
 import argparse
-import fcntl
 import gc
 import json
 import math
@@ -47,29 +46,16 @@ _MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 _DISABLE_COMMAND_BUFFERS = "--xla_gpu_enable_command_buffer="
 
 
-def _acquire_global_lock() -> int:
+def _acquire_global_lock(runtime_dir: Path | None = None) -> int:
     """Serialize all guarded Qwen3.5 ROCm processes before KFD preflight."""
-    lock_parent = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-    lock_dir = lock_parent / f"skyrl-qwen35-rocm-{os.getuid()}"
-    if lock_dir.is_symlink():
-        raise RuntimeError(f"refusing symlinked launch-lock directory: {lock_dir}")
     try:
-        lock_dir.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    info = lock_dir.stat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        raise RuntimeError(f"refusing unsafe launch-lock directory: {lock_dir}")
-    lock_dir.chmod(0o700)
-    lock_fd = os.open(lock_dir, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as error:
-        os.close(lock_fd)
-        raise RuntimeError(
-            "another Qwen3.5 ROCm process holds the global launch lock"
-        ) from error
-    return lock_fd
+        from rocm.amdgpu_safety import acquire_qwen35_rocm_launch_lock
+    except ModuleNotFoundError as error:  # Direct execution from the rocm directory.
+        if error.name != "rocm":
+            raise
+        from amdgpu_safety import acquire_qwen35_rocm_launch_lock
+
+    return acquire_qwen35_rocm_launch_lock(runtime_dir=runtime_dir)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

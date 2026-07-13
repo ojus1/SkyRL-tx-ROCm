@@ -169,17 +169,16 @@ def test_gpu_preflight_rejects_existing_kfd_owner(tmp_path):
         )
 
 
-def test_all_rocm_probes_share_one_exclusive_launch_lock(tmp_path, monkeypatch):
+def test_all_rocm_probes_share_one_exclusive_launch_lock(tmp_path):
     from rocm.probe_model_residency import _acquire_global_lock as residency_lock
     from rocm.probe_sft_compile import _acquire_global_lock as compile_lock
 
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    lock_fd = _PROBE_MODULE._acquire_global_lock()
+    lock_fd = _PROBE_MODULE._acquire_global_lock(runtime_dir=tmp_path)
     try:
         with pytest.raises(RuntimeError, match="global launch lock"):
-            residency_lock()
+            residency_lock(runtime_dir=tmp_path)
         with pytest.raises(RuntimeError, match="global launch lock"):
-            compile_lock()
+            compile_lock(runtime_dir=tmp_path)
     finally:
         os.close(lock_fd)
 

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import urllib.request
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -642,6 +643,155 @@ def test_build_cmd_engine(engine_config, parent_process_cmd, expected_cmd_start)
     assert cmd.startswith(" ".join(expected_cmd_start))
 
 
+def test_build_cmd_engine_preserves_validated_absolute_uv_and_snapshot_flags():
+    config = EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B")
+    snapshot = "/home/user/.cache/skyrl-source-snapshots-private-v1/" + "a" * 40 + "/source-head"
+    parent = [
+        "/home/user/.local/bin/uv",
+        "run",
+        "--active",
+        "--no-sync",
+        "--no-env-file",
+        "--directory",
+        snapshot,
+        "--project",
+        snapshot,
+        "-m",
+        "skyrl.tinker.api",
+    ]
+
+    command = _build_uv_run_cmd_engine(parent, config)
+
+    assert command[:9] == parent[:9]
+    assert command[0] == "/home/user/.local/bin/uv"
+    assert command[9:15] == [
+        "--extra",
+        "tinker",
+        "--extra",
+        "jax",
+        "-m",
+        "skyrl.tinker.engine",
+    ]
+
+
+def test_build_cmd_engine_module_match_wins_over_python_option_value():
+    config = EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B")
+    parent = [
+        "uv",
+        "run",
+        "--env-file",
+        "python",
+        "-m",
+        "skyrl.tinker.api",
+    ]
+
+    command = _build_uv_run_cmd_engine(parent, config)
+
+    assert command[:4] == ["uv", "run", "--env-file", "python"]
+
+
+def test_build_cmd_engine_hardened_runtime_requires_exact_snapshot_uv_prefix():
+    config = EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B")
+    snapshot = "/home/user/.cache/skyrl-source-snapshots-private-v1/" + "a" * 40 + "/source-head"
+    uv_executable = "/home/user/.local/bin/uv"
+    attestation = {
+        "status": "passed",
+        "source_root": snapshot,
+        "uv_executable": uv_executable,
+    }
+    parent = [
+        uv_executable,
+        "run",
+        "--active",
+        "--no-sync",
+        "--no-env-file",
+        "--no-config",
+        "--directory",
+        snapshot,
+        "--project",
+        snapshot,
+        "-m",
+        "skyrl.tinker.api",
+        "--port",
+        "8001",
+    ]
+
+    command = _build_uv_run_cmd_engine(
+        parent,
+        config,
+        runtime_source_attestation=attestation,
+    )
+
+    assert command[:10] == parent[:10]
+    assert command[10:16] == [
+        "--extra",
+        "tinker",
+        "--extra",
+        "jax",
+        "-m",
+        "skyrl.tinker.engine",
+    ]
+
+
+@pytest.mark.parametrize(
+    "parent",
+    [
+        [
+            "/home/user/.local/bin/uv",
+            "run",
+            "--active",
+            "--no-sync",
+            "--no-env-file",
+            "--directory",
+            "/snapshot",
+            "--project",
+            "/snapshot",
+            "-m",
+            "skyrl.tinker.api",
+        ],
+        [
+            "/home/user/.local/bin/uv",
+            "run",
+            "--isolated",
+            "--active",
+            "--no-sync",
+            "--no-env-file",
+            "--no-config",
+            "--directory",
+            "/snapshot",
+            "--project",
+            "/snapshot",
+            "-m",
+            "skyrl.tinker.api",
+        ],
+    ],
+)
+def test_build_cmd_engine_hardened_runtime_rejects_prefix_drift(parent):
+    config = EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B")
+    attestation = {
+        "status": "passed",
+        "source_root": "/snapshot",
+        "uv_executable": "/home/user/.local/bin/uv",
+    }
+
+    with pytest.raises(ValueError, match="exact snapshot uv policy"):
+        _build_uv_run_cmd_engine(
+            parent,
+            config,
+            runtime_source_attestation=attestation,
+        )
+
+
+def test_api_source_preserves_validated_launch_lock_for_nested_engine():
+    source = (Path(__file__).resolve().parents[2] / "skyrl/tinker/api.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'runtime_launch_lock_attestation["descriptor"]' in source
+    assert 'subprocess_options["pass_fds"]' in source
+    assert "asyncio.create_subprocess_exec(" in source
+
+
 @pytest.mark.parametrize(
     "engine_config, parent_process_cmd",
     [
@@ -649,6 +799,22 @@ def test_build_cmd_engine(engine_config, parent_process_cmd, expected_cmd_start)
             EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B"),
             # invalid parent process startup command
             ["python", "-m", "skyrl.tinker.api"],
+        ),
+        (
+            EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B"),
+            ["not-uv", "run", "-m", "skyrl.tinker.api"],
+        ),
+        (
+            EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B"),
+            ["/home/user/.local/bin/uv", "not-run", "-m", "skyrl.tinker.api"],
+        ),
+        (
+            EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B"),
+            ["uv", "run", "-m", "skyrl.tinker.engine"],
+        ),
+        (
+            EngineConfig(backend="jax", base_model="Qwen/Qwen3-0.6B"),
+            [],
         ),
     ],
 )

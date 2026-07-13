@@ -90,6 +90,37 @@ observed result was dK at `0.003628` (about 0.363%). The separate full-model and
 safety gates remain; neither compile success nor bounded autotuning qualifies
 the complete training path.
 
+### Stable-source T1024 executable-cache qualification
+
+Exact commit `5fb2b220bfbf202ac2b9295efb9e9a072cc00135` completed one
+launcher-supervised T1024 top-level-cache population and one matched fresh-process
+hit from the identical private commit-keyed snapshot. The population added only
+`jit_forward_backward_and_accumulate-f2c446a981cb5237c15fe0550221ed6b046c5dff8829de56d9a5cb1045c21fa6-cache`
+(6,002,623 bytes); the hit reported one hit, zero misses, `37.202892 s` saved,
+`6.797108 s` retrieval, and no cache addition, change, or removal.
+
+Matched T1024 compile time fell from `47.361373 s` to `6.897813 s` (85.44%,
+6.87x), while the complete profiled child fell from `135.804416 s` to
+`95.294999 s` (29.83%, 1.43x). Peak command-tree RSS fell by 1.278 GiB / 23.76%.
+Peak VRAM remained effectively identical at 17,901,096,960 versus
+17,901,109,248 bytes, so this is not a capacity gain. Both runs used zero swap,
+stayed below 63 C and 255 W, invoked no compiled model pass or optimizer step,
+and returned exactly to suspended, unowned baseline state with a clean journal.
+
+The stable snapshot contained 1,090 files / 35,333,482 bytes with source
+manifest `5179a0e25214a50ee8cb74b7793323fd0189759c8de9b63d23ec1e727caf23f0`.
+Its deterministic archive hash was
+`3222c78008e0e6bcf23ca034a96f4e7c075567e2a53381639598c48594f6547b`.
+Full timings, cache hashes, artifact hashes, and public-monitoring limitations
+are recorded in [`README.md`](README.md). The result proves repeated prewarm
+process reuse only. API/nested-engine source-path alignment is now implemented
+and CPU-qualified with sanitized environment, exact `uv` arguments, and full
+Git/archive/snapshot revalidation. The exact uv payload and one fixed per-UID
+lock namespace are pinned, and CPU probes confirm the locked descriptor reaches
+the nested engine. This transition has not yet consumed the cache in a hardware
+run. Engine readiness, actual cache consumption, ordinary warmup, and
+steady-state throughput remain unverified.
+
 ### Exact S512 GDN execute forward gate
 
 Revision `4c9e7877` qualified exactly one standalone typed-FFI forward

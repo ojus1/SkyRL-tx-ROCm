@@ -43,10 +43,27 @@ def acquire_qwen35_rocm_launch_lock(*, runtime_dir: Path | None = None) -> int:
     lock_parent = (
         runtime_dir
         if runtime_dir is not None
-        else Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+        else Path("/run/user") / str(os.getuid())
     )
     if not lock_parent.is_absolute():
         raise RuntimeError(f"launch-lock parent must be absolute: {lock_parent}")
+    try:
+        parent_metadata = lock_parent.lstat()
+        resolved_parent = lock_parent.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(
+            f"could not inspect fixed launch-lock parent: {lock_parent}"
+        ) from error
+    if (
+        resolved_parent != lock_parent
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
+        raise RuntimeError(
+            f"refusing unsafe fixed launch-lock parent: {lock_parent}"
+        )
     lock_dir = lock_parent / f"{_QWEN35_LOCK_DIRECTORY_PREFIX}{os.getuid()}"
     try:
         lock_dir.mkdir(mode=0o700)
@@ -217,9 +234,11 @@ def require_clean_amdgpu_boot(*, run_fn: Any = subprocess.run) -> dict[str, Any]
 
 
 @contextmanager
-def guarded_qwen35_rocm_process() -> Iterator[dict[str, Any]]:
+def guarded_qwen35_rocm_process(
+    *, runtime_dir: Path | None = None
+) -> Iterator[dict[str, Any]]:
     """Hold the shared lock and complete fail-closed hardware preflight."""
-    launch_lock = acquire_qwen35_rocm_launch_lock()
+    launch_lock = acquire_qwen35_rocm_launch_lock(runtime_dir=runtime_dir)
     try:
         yield {
             **require_clean_amdgpu_boot(),

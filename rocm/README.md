@@ -111,7 +111,7 @@ SKYRL_QWEN35_PREWARM_BUCKETS=64,256 \
 SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
   ./rocm/start_qwen35.sh prewarm-t64-t256-adam
 
-# Run the same supervised gates, then exit before the unattested API transition.
+# Run the same gates, then exit before the hardware-unqualified API transition.
 SKYRL_QWEN35_PREWARM_BUCKETS=512 \
 SKYRL_QWEN35_PREWARM_OPTIMIZER=1 \
 SKYRL_QWEN35_PREWARM_ONLY=1 \
@@ -137,7 +137,8 @@ occurs.
 `1`, and requires a nonempty bucket list. It does not weaken or skip any
 prewarm, handoff, or final-journal gate; after all of them pass, it disarms the
 launcher traps and exits zero before the API command. This is the qualification
-route while engine startup attestation remains unavailable.
+route while source-aligned engine startup and cache consumption remain
+hardware-unqualified.
 
 Every operational launcher prewarm also requires a clean Git worktree before
 the first hardware or JAX access. Fixed, sanitized Git commands bind the exact
@@ -165,8 +166,17 @@ revalidates the same tree after compilation, and refuses `complete` if source or
 Git state changed.
 Operational direct execution without the verified launcher lock is rejected;
 the unprivileged CPU planning mode remains directly usable. The launcher removes
-all prewarm-only claims before any API exec so they cannot masquerade as engine
-attestation.
+all helper-only claims before API exec. It then supplies a separate minimal set
+of runtime claims through a sanitized `env -i`; API and engine accept those
+claims only after independently revalidating the Git/archive/full-tree source,
+exact accelerator environment, memory mode, cache namespace, cwd, and origins.
+The transition also pins `uv 0.11.8` to SHA-256
+`646adf5cf12ba17d1a41fa77c8dd6496f73651dcfeeed6b5f4ec019b36bc7153`.
+All guarded entrypoints use the single fixed
+`/run/user/$UID/skyrl-qwen35-rocm-$UID` lock namespace rather than inherited
+`XDG_RUNTIME_DIR`; the API validates and explicitly passes that already-locked
+directory descriptor through nested `uv` to the engine, so an orphan engine
+continues to exclude a second guarded GPU process.
 
 This is an operational integrity boundary, not protection against a malicious
 same-UID process, root/kernel compromise, or compromised Git/Python binaries.
@@ -176,13 +186,17 @@ can reject those inherited variables.
 The explicitly added virtualenv `site-packages` directory supplies an
 exact-version-checked JAX stack, but its dependency file bytes are not yet
 cryptographically attested. Verified Python helper startup/execution in the
-prewarm-only path uses this isolation; this paragraph does not claim that the
-launcher, later API, or nested engine process is isolated by the same bootstrap.
+prewarm-only path uses isolated Python. The later API and nested engine use the
+normal virtualenv interpreter under fixed `uv --active --no-sync`, not the same
+isolated bootstrap; their source tree and runtime policy are revalidated, while
+third-party dependency bytes remain outside the attestation boundary.
 
-Initial archive creation/extraction and every-launch full-tree Git-blob,
+Initial archive creation/extraction and repeated full-tree Git-blob,
 deterministic-archive, and SHA-256 validation deliberately spend extra startup
-CPU, wall time, RAM, and disk. That overhead has not yet been measured separately
-from compilation and must be reported before enabling this path by default.
+CPU, wall time, RAM, and disk. Commit `5fb2b220` measured initial preparation at
+1.59 seconds and reuse validation at 1.18 seconds; the additional API/engine
+revalidation overhead in this new transition has not yet been hardware-run or
+timed end to end.
 The tar archive and extracted snapshot consume roughly twice the tracked-tree
 bytes once per retained commit, rather than once per run. Existing complete
 entries are validation-only and are never repaired or rewritten; partial,
@@ -210,17 +224,19 @@ those exact values. Running
 `python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
 CPU-only plan and never imports JAX.
 
-The exact cold T64-plus-Adam direct-tool population/hit pair and the supervised
-T512 Pallas population/hit pair described below are now hardware-qualified. The
-multi-bucket path, launcher-to-API transition, additional/repeated hits, and
-actual warmup remain unqualified. The launcher examples above provide the
+The exact cold T64-plus-Adam direct-tool pair, supervised T512 Pallas pair, and
+commit-keyed T1024 Pallas pair described below are now hardware-qualified. The
+launcher-to-API/nested-engine source-path alignment is implemented and
+CPU-qualified, but engine cache consumption, the multi-bucket path, additional
+repeated hits, and actual warmup remain hardware-unqualified. The launcher
+examples above provide the
 required telemetry, headless-display, exclusive-KFD, fatal-journal, and cleanup
 gates. The historical T64 direct-tool artifacts used equivalent external
 supervision; current operational ROCm prewarm is launcher-only. The API's
 current health endpoint does not prove that the nested engine has finished
-loading, inherited the intended cache policy, or consumed a particular cached
-executable. Therefore prewarm remains default-off until an engine readiness and
-startup-attestation contract is added and separately qualified. Each
+loading or consumed a particular cached executable. Therefore prewarm remains
+default-off until an engine readiness and in-engine cache-evidence contract is
+added and separately qualified. Each
 train-bucket and optimizer compile has separate timing, compiled-memory,
 postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
 process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`
@@ -502,6 +518,98 @@ This qualifies one cold T512 cache population and one matched compile-only hit;
 it is not a repeated-sample timing distribution. It does not prove per-key
 callback attribution, execute T512 training, establish steady-state throughput
 or memory, validate an engine transition, or authorize graph capture/replay.
+
+### ROCm 7.2.4 commit-keyed T1024 population and matched hit
+
+Commit `5fb2b220bfbf202ac2b9295efb9e9a072cc00135`, tree
+`4c560736eefd6395baedff692828db63ba86ce4d`, qualified the first exact
+same-source-path T1024 pair. Both launcher-supervised fresh processes used the
+same private snapshot at
+`$ACCOUNT_HOME/.cache/skyrl-source-snapshots-private-v1/$GIT_HEAD/source-head`.
+Independent reconstruction matched all 1,090 Git blobs, 239 directories, and
+35,333,482 source bytes; the source-manifest SHA-256 was
+`5179a0e25214a50ee8cb74b7793323fd0189759c8de9b63d23ec1e727caf23f0`.
+The retained deterministic archive was 36,290,560 bytes with SHA-256
+`3222c78008e0e6bcf23ca034a96f4e7c075567e2a53381639598c48594f6547b`.
+
+Separate CPU-only preparation created that archive/snapshot in `1.59 s` with
+141,588 KiB peak RSS, then revalidated it in `1.18 s` with 141,028 KiB peak RSS.
+The pair consumes 68.306 MiB per retained commit. Reuse changed none of the
+1,332 file/directory inode, mode, link, size, mtime, ctime, or content-hash
+records; the per-run empty bytecode-cache directory remained outside the stable
+snapshot.
+
+The first GPU process began with 190 top-level executable entries totaling
+23,553,082 bytes. T1024 reported one strict public-monitoring miss and added
+exactly one 6,002,623-byte entry, changing or removing none:
+`jit_forward_backward_and_accumulate-f2c446a981cb5237c15fe0550221ed6b046c5dff8829de56d9a5cb1045c21fa6-cache`.
+Its SHA-256 is
+`a5576049fc7109e508c17c43e2f2911ff1150266548774a7b99409c667a51fd4`.
+The matched fresh process then reported exactly one hit, zero misses,
+`37.202892 s` saved, `6.797108 s` retrieval, and no addition, change, or removal.
+The namespace stayed at 191 entries / 29,555,705 bytes with manifest SHA-256
+`f8987b8f629512eb89bad4c8a79aff7f86c4b605ed579a41e345e05171311ff4`.
+The public callbacks remain process-level and do not expose a request-to-key
+mapping; the single-entry delta and unchanged hit manifest are the available
+key-level filesystem evidence.
+
+| Matched metric | Population miss | Stable-path hit | Observed change |
+|---|---:|---:|---:|
+| T1024 compile | `47.361373 s` | `6.897813 s` | `85.44%` less; `6.87x` |
+| T1024 lowering | `7.515965 s` | `7.514467 s` | effectively unchanged |
+| T1024 lower + compile | `54.877338 s` | `14.412279 s` | `73.74%` less; `3.81x` |
+| Backend/model setup | `32.224181 s` | `32.637875 s` | effectively unchanged |
+| Entire profiled child | `135.804416 s` | `95.294999 s` | `29.83%` less; `1.43x` |
+| Peak command-tree RSS | `5,777,256,448 B` | `4,404,682,752 B` | `1.278 GiB` / `23.76%` less |
+| Peak physical VRAM | `17,901,096,960 B` | `17,901,109,248 B` | `+12 KiB`; no capacity gain |
+
+Argument, output, temporary, and alias memory fields matched exactly. As in the
+independent T64/T512/Adam cache loads, the deserialized handle's generated-code
+field was 16 bytes larger (`2,196` to `2,212` bytes); this is treated as fixed
+deserialization-accounting metadata, not byte-identical memory analysis. The
+population/hit maxima were 61/63 C junction, 255/192 W sampled board power, and
+zero swap. The hit started warmer and had higher mean/p95 power despite its lower
+maximum, so this pair does not establish a steady-power reduction.
+
+Both children used the exact sole
+`XLA_FLAGS=--xla_gpu_enable_command_buffer=`, recorded graph and command-buffer
+use as false, and invoked neither a compiled model pass nor an optimizer step.
+Both exact handoffs returned in about 8.3 seconds to suspended runtime,
+27,947,008-byte VRAM, 15,966,208-byte GTT, empty KFD/render owner lists, and a
+clean whole-boot journal. Private artifact SHA-256 values are:
+
+- population child / handoff / telemetry / summary under
+  `/tmp/skyrl-qwen35-runs/t1024-stable-populate-adamhit-5fb2b220-r1`:
+  `b684bb92e2d314c40eb226db7d64fb706bfe2b0fce41d4677a3cec55b390cc09`,
+  `3d85e55fe02a5f8bd754f9d0473209cfd09f911c52a59a0b6708530bddba52f4`,
+  `613147cc6d59def57f7485b231a9a07d929b3b4f8aaa20009a458f494ee9cf76`,
+  and `a317fb874cb2f23e29f873d5f90a2bcf9e98ce247f35d05b8b3e8a3fdec5dd05`;
+- hit child / handoff / telemetry / summary under
+  `/tmp/skyrl-qwen35-runs/t1024-stable-hit-adamhit-5fb2b220-r1`:
+  `d46564fb6c68383c30b971f6f0a13f45accc92b6438f5ee6bfab06486f31d0dc`,
+  `f81458764be19b927be9a45254de4b42eeadc374510b94a5b5966c7dc0bf21af`,
+  `9a0cacd074f3d0530580c846137a0af81a0720bccfb45dc568ba841fe7d946b1`,
+  and `8f4b2cc2e0dac0aa4886bee941b51047ef5d6731d10a00bdf823ee97709997a7`.
+
+This is a compile-only prewarm-process result, not a server-ready or training
+throughput result. At evidence commit `5fb2b220`, the API and nested engine still
+launched through `uv` from the mutable checkout while prewarm imported from the
+commit-keyed snapshot. The current launcher closes that source-path gap in code:
+its final API uses a sanitized `env -i`, fixed `uv`, explicit snapshot
+directory/project, disabled env/config discovery and bytecode, and the nested
+engine must reproduce the same exact prefix. Both processes revalidate the Git
+HEAD, deterministic archive, full snapshot layout/content, accelerator policy,
+memory mode, stack-versioned JAX cache, working directory, and module origins
+before backend construction. Disposable CPU tests prove API/engine origin
+selection, archive/full-tree binding, environment behavior, no snapshot
+mutation, and rejection of shadow modules. This new transition has not yet run
+on the GPU, so engine cache consumption and engine readiness remain unproven.
+Ordinary warmup, graph capture/replay, and any compiled-call invocation remain
+unauthorized. The older
+T1024 `93.144 s` then `47.655 s` runs were two misses with different source
+paths; their roughly 2x change is consistent with per-fusion autotune reuse, not
+a top-level hit. Consequently, the descriptive `93.144` to `6.898 s` gap must
+not be presented as a controlled cache-only `13.50x` result.
 
 The ROCm 7.2.4 post-reboot floor was re-established before any full-model
 probe: a no-preallocation JIT `float32[1]` add returned exact `[3.25]` for

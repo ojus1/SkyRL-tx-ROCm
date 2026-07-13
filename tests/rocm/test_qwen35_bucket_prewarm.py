@@ -1402,14 +1402,13 @@ def test_tool_wide_postflight_covers_all_gpu_capable_failure_stages(
 
 
 def test_inherited_lock_descriptor_must_name_private_global_lock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     lock_dir = tmp_path / f"skyrl-qwen35-rocm-{os.getuid()}"
     lock_dir.mkdir(mode=0o700)
     lock_fd = os.open(lock_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        assert prewarm._validate_inherited_lock(lock_fd) == lock_fd
+        assert prewarm._validate_inherited_lock(lock_fd, runtime_dir=tmp_path) == lock_fd
     finally:
         os.close(lock_fd)
 
@@ -1418,7 +1417,7 @@ def test_inherited_lock_descriptor_must_name_private_global_lock(
     wrong_fd = os.open(wrong_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
         with pytest.raises(RuntimeError, match="not the private global launch lock"):
-            prewarm._validate_inherited_lock(wrong_fd)
+            prewarm._validate_inherited_lock(wrong_fd, runtime_dir=tmp_path)
     finally:
         os.close(wrong_fd)
 
@@ -1777,10 +1776,20 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     invocation = "--module rocm.prewarm_qwen35_buckets"
     final_journal_gate = "if run_amdgpu_safety >/dev/null; then"
     api_exec = 'exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api'
+    stable_api_exec = "  exec /usr/bin/env -i \\\n"
     assert opt_in in source
     assert optimizer_opt_in in source
     assert prewarm_only_opt_in in source
     assert "0|1) ;;" in source
+    assert "PYTHON*|UV_*|__PYVENV_LAUNCHER__|VIRTUAL_ENV|VIRTUAL_ENV_PROMPT)" in (
+        source
+    )
+    assert 'lock_parent="/run/user/$UID"' in source
+    assert 'export SKYRL_QWEN35_LAUNCH_LOCK_FD="$launch_lock_fd"' in source
+    assert (
+        "refusing inherited Python, uv, or virtualenv startup variable during "
+        "operational prewarm"
+    ) in source
     assert "prewarm_optimizer_args=(--compile-optimizer)" in source
     assert '"${prewarm_optimizer_args[@]}"' in source
     assert "export JAX_ENABLE_PGLE=false" in source
@@ -1866,8 +1875,50 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     prewarm_only_gate = source.index(
         'if [[ "$prewarm_only" == "1" ]]', prewarm_status_gate
     )
+    stable_api_gate = source.index('if [[ -n "$prewarm_buckets" ]]', prewarm_only_gate)
+    stable_api_exec_index = source.index(stable_api_exec, stable_api_gate)
+    stable_uv_exec = source.index('    "$uv_executable" run \\', stable_api_exec_index)
+    stable_api_module = source.index("-m skyrl.tinker.api", stable_uv_exec)
     assert source.rindex(final_journal_gate) < prewarm_status_gate
     assert prewarm_status_gate < prewarm_only_gate < source.index(api_exec)
+    assert prewarm_only_gate < stable_api_gate < stable_api_exec_index
+    assert source.index('  cd -- "$source_snapshot"', stable_api_gate) < (
+        stable_api_exec_index
+    )
+    for assignment in (
+        'HOME="$source_account_home"',
+        "PATH=/opt/rocm/bin:/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE=1",
+        'VIRTUAL_ENV="$repo/.venv"',
+        'SKYRL_QWEN35_RUNTIME_GIT_HEAD="$source_git_head"',
+        'SKYRL_QWEN35_RUNTIME_MEMORY_MODE="$memory_mode"',
+        'SKYRL_QWEN35_RUNTIME_REPO_ROOT="$repo"',
+        'SKYRL_QWEN35_RUNTIME_SOURCE_ROOT="$source_snapshot"',
+        'SKYRL_QWEN35_RUNTIME_UV_EXECUTABLE="$uv_executable"',
+        'SKYRL_QWEN35_LAUNCH_LOCK_FD="$SKYRL_QWEN35_LAUNCH_LOCK_FD"',
+        '"${verified_runtime_environment[@]}"',
+    ):
+        assert stable_api_exec_index < source.index(assignment, stable_api_exec_index)
+        assert source.index(assignment, stable_api_exec_index) < stable_uv_exec
+    assert source.index("--active", stable_uv_exec) < stable_api_module
+    assert source.index("--no-sync", stable_uv_exec) < stable_api_module
+    assert source.index("--no-env-file", stable_uv_exec) < stable_api_module
+    assert source.index("--no-config", stable_uv_exec) < stable_api_module
+    assert source.index(
+        '--directory "$source_snapshot"', stable_uv_exec
+    ) < stable_api_module
+    assert source.index(
+        '--project "$source_snapshot"', stable_uv_exec
+    ) < stable_api_module
+    assert source.count("PYTHONDONTWRITEBYTECODE=1") == 1
+    assert source.count("SKYRL_QWEN35_RUNTIME_SOURCE_ROOT=") == 1
+    assert source.count("SKYRL_QWEN35_RUNTIME_GIT_HEAD=") == 1
+    assert source.count("expected_uv_version=") == 1
+    assert source.count("expected_uv_sha256=") == 1
+    assert source.count('cd -- "$source_snapshot"') == 1
+    assert stable_api_module < source.index(api_exec)
+    assert source.count(api_exec) == 1
+    assert f"\nfi\n{api_exec}" in source
     between_gate_and_api = source[
         source.rindex(final_journal_gate) + len(final_journal_gate) : source.index(
             api_exec
@@ -1913,7 +1964,7 @@ def test_launcher_prewarm_rejects_dirty_source_before_run_directory_or_hardware(
     run_root = tmp_path / "runs"
     environment = os.environ.copy()
     for name in tuple(environment):
-        if name.startswith("PYTHON") or name in {
+        if name.startswith(("PYTHON", "UV_")) or name in {
             "__PYVENV_LAUNCHER__",
             "VIRTUAL_ENV",
             "VIRTUAL_ENV_PROMPT",
@@ -1942,14 +1993,22 @@ def test_launcher_prewarm_rejects_dirty_source_before_run_directory_or_hardware(
 
 @pytest.mark.parametrize(
     "name",
-    ["PYTHONPATH", "PYTHONWARNINGS", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"],
+    [
+        "PYTHONPATH",
+        "PYTHONWARNINGS",
+        "VIRTUAL_ENV",
+        "__PYVENV_LAUNCHER__",
+        "UV_WORKING_DIR",
+        "UV_PROJECT",
+        "UV_ENV_FILE",
+    ],
 )
-def test_launcher_rejects_python_startup_injection_before_run_directory(
+def test_launcher_rejects_runtime_startup_injection_before_run_directory(
     tmp_path: Path, name: str
 ) -> None:
     environment = os.environ.copy()
     for inherited in tuple(environment):
-        if inherited.startswith("PYTHON") or inherited in {
+        if inherited.startswith(("PYTHON", "UV_")) or inherited in {
             "__PYVENV_LAUNCHER__",
             "VIRTUAL_ENV",
             "VIRTUAL_ENV_PROMPT",

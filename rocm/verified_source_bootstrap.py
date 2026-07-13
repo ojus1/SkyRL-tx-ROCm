@@ -799,6 +799,47 @@ def prepare_source_cache(
     }
 
 
+def validate_source_cache(
+    *, repo_root: Path, git_head: str, account_home: Path
+) -> dict[str, Any]:
+    """Revalidate an existing source-cache pair without creating or repairing it."""
+    home = _canonical_directory(account_home, "source-cache account home")
+    before = _inspect_git_repository(repo_root, git_head)
+    paths = source_cache_paths(home, before.head)
+    cache_parent = _canonical_directory(
+        home / ".cache", "private account cache directory", exact_mode=0o700
+    )
+    if paths.cache_root.parent != cache_parent:
+        raise SourceVerificationError(
+            "source-cache root escaped the private account cache"
+        )
+    _canonical_directory(paths.cache_root, "source-cache root", exact_mode=0o700)
+    expected_archive = _run_git(
+        before.repo_root, "archive", "--format=tar", before.head
+    )
+    records, total_bytes, archive_sha256 = _validate_source_cache_pair(
+        paths, before, expected_archive
+    )
+    after = _inspect_git_repository(repo_root, git_head)
+    if after != before:
+        raise SourceVerificationError(
+            "Git HEAD, index, status, or blob contents changed during source-cache "
+            "validation"
+        )
+    return {
+        "cache_status": "validated",
+        "format": "skyrl-private-source-cache-v1",
+        "git_head": before.head,
+        "git_tree": before.tree,
+        "source_archive_path": str(paths.archive),
+        "source_archive_sha256": archive_sha256,
+        "source_file_count": len(records),
+        "source_snapshot_root": str(paths.snapshot),
+        "source_total_bytes": total_bytes,
+        "full_head_tree_validated": True,
+    }
+
+
 def _validate_venv_site_packages(raw_path: Path | str) -> Path:
     site_packages = _canonical_directory(raw_path, "venv site-packages")
     expected_version = f"python{sys.version_info.major}.{sys.version_info.minor}"

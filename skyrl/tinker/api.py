@@ -1,3 +1,6 @@
+# Runtime source attestation intentionally precedes every third-party import.
+# ruff: noqa: E402
+
 import asyncio
 import os
 import random
@@ -6,8 +9,24 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated, Any, AsyncGenerator, ClassVar, Literal
 from uuid import uuid4
+
+import skyrl as _skyrl_package
+from skyrl.tinker.runtime_source import (
+    revalidate_runtime_launch_lock,
+    revalidate_runtime_source,
+    validate_runtime_launch_lock,
+    validate_runtime_source,
+)
+
+_RUNTIME_LAUNCH_LOCK_ATTESTATION = validate_runtime_launch_lock()
+_RUNTIME_SOURCE_ATTESTATION = validate_runtime_source(
+    role="api",
+    module_file=Path(__file__),
+    package_file=Path(_skyrl_package.__file__),
+)
 
 import fastapi
 import psutil
@@ -52,38 +71,145 @@ ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
 ID_MAX_LENGTH = 255
 
 API_SERVER_STARTUP_ARGS = ["-m", "skyrl.tinker.api"]
+_UV_RUN_OPTIONS_WITH_VALUES = {
+    "--allow-insecure-host",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--config-settings-package",
+    "--default-index",
+    "--directory",
+    "--env-file",
+    "--exclude-newer",
+    "--exclude-newer-package",
+    "--extra",
+    "--extra-index-url",
+    "--find-links",
+    "--fork-strategy",
+    "--group",
+    "--index",
+    "--index-strategy",
+    "--index-url",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-isolation-package",
+    "--no-build-package",
+    "--no-extra",
+    "--no-group",
+    "--no-sources-package",
+    "--only-group",
+    "--package",
+    "--prerelease",
+    "--project",
+    "--python",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--upgrade-group",
+    "--upgrade-package",
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+    "-C",
+    "-P",
+    "-f",
+    "-i",
+    "-p",
+    "-w",
+}
 
 # Timeout for graceful shutdown when engine crashes
 SHUTDOWN_TIMEOUT_SECONDS = 10
 
 
-def _get_parent_uv_run_args(parent_cmd: list[str]) -> list[str]:
+def _get_parent_uv_run_args(
+    parent_cmd: list[str],
+    runtime_source_attestation: dict[str, Any] | None = None,
+) -> list[str]:
     """Extract parent `uv run <uv run args>` flags for the engine launch given the parent process's startup command
 
     `uv run` starts this Python API process as a child. To recover the original
     `uv run <uv run args> ...` flags, we inspect the parent process command line
     and extract all the uv run args before the script argument.
     """
-    # the API server startup command can be
-    # uv run <uv run args> -m skyrl.tinker.api
-    # or uv run <uv run args> python -m skyrl.tinker.api
-    # or uv run <uv run args> -- python -m skyrl.tinker.api
-    stop_strings = ["--", "python"]
-    detected = False
-    for i in range(len(parent_cmd) - 1):
-        if parent_cmd[i] in stop_strings or parent_cmd[i : i + len(API_SERVER_STARTUP_ARGS)] == API_SERVER_STARTUP_ARGS:
-            detected = True
-            break
-    if not detected or i < 2:
+    if (
+        len(parent_cmd) < 4
+        or Path(parent_cmd[0]).name not in {"uv", "uv.exe"}
+        or parent_cmd[1] != "run"
+    ):
         raise ValueError(
             f"Unable to parse tinker API server startup command: {parent_cmd}. "
             "Ensure that the tinker API server was started with `uv run <uv run args> -m skyrl.tinker.api`"
         )
-    parent_cmd = parent_cmd[2:i]  # ignore uv run
-    return parent_cmd
+    if runtime_source_attestation is not None and (
+        runtime_source_attestation.get("status") == "passed"
+    ):
+        source_root = runtime_source_attestation["source_root"]
+        expected_prefix = [
+            runtime_source_attestation["uv_executable"],
+            "run",
+            "--active",
+            "--no-sync",
+            "--no-env-file",
+            "--no-config",
+            "--directory",
+            source_root,
+            "--project",
+            source_root,
+        ]
+        if (
+            parent_cmd[: len(expected_prefix)] != expected_prefix
+            or parent_cmd[
+                len(expected_prefix) : len(expected_prefix)
+                + len(API_SERVER_STARTUP_ARGS)
+            ]
+            != API_SERVER_STARTUP_ARGS
+        ):
+            raise ValueError(
+                "Hardened tinker API parent command does not match the exact "
+                "snapshot uv policy"
+            )
+        return expected_prefix[2:]
+
+    module_index = next(
+        (
+            index
+            for index in range(2, len(parent_cmd) - 1)
+            if parent_cmd[index : index + len(API_SERVER_STARTUP_ARGS)]
+            == API_SERVER_STARTUP_ARGS
+        ),
+        None,
+    )
+    if module_index is None:
+        raise ValueError(
+            f"Unable to parse tinker API server startup command: {parent_cmd}. "
+            "Ensure that the tinker API server was started with `uv run <uv run args> -m skyrl.tinker.api`"
+        )
+    stop_index = module_index
+    if stop_index > 2 and parent_cmd[stop_index - 1] == "python":
+        possible_option = parent_cmd[stop_index - 2]
+        if possible_option in _UV_RUN_OPTIONS_WITH_VALUES:
+            pass
+        elif possible_option.startswith("-") and possible_option != "--":
+            raise ValueError(
+                "Unable to distinguish the Python command from an unknown uv "
+                f"option value in startup command: {parent_cmd}"
+            )
+        else:
+            stop_index -= 1
+    if stop_index > 2 and parent_cmd[stop_index - 1] == "--":
+        stop_index -= 1
+    return parent_cmd[2:stop_index]
 
 
-def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) -> list[str]:
+def _build_uv_run_cmd_engine(
+    parent_cmd: list[str],
+    engine_config: BaseModel,
+    runtime_source_attestation: dict[str, Any] | None = None,
+) -> list[str]:
     """Builds uv run command for the engine
 
     Args:
@@ -92,8 +218,10 @@ def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) ->
     Returns:
         cmd: The uv run command for the tinker engine
     """
-    cmd = ["uv", "run"]
-    parent_flags = _get_parent_uv_run_args(parent_cmd)
+    parent_flags = _get_parent_uv_run_args(
+        parent_cmd, runtime_source_attestation=runtime_source_attestation
+    )
+    cmd = [parent_cmd[0], "run"]
     logger.debug(f"Detected API server uv run flags: {parent_flags}")
     cmd.extend(parent_flags)
     # NOTE: uv deduplicates extras so we can unconditionally add the tinker extra
@@ -106,6 +234,23 @@ def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) ->
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
+
+    runtime_source_attestation = revalidate_runtime_source(
+        initial=_RUNTIME_SOURCE_ATTESTATION,
+        role="api",
+        module_file=Path(__file__),
+        package_file=Path(_skyrl_package.__file__),
+    )
+    runtime_launch_lock_attestation = revalidate_runtime_launch_lock(
+        _RUNTIME_LAUNCH_LOCK_ATTESTATION
+    )
+    app.state.runtime_source_attestation = runtime_source_attestation
+    app.state.runtime_launch_lock_attestation = runtime_launch_lock_attestation
+    logger.info("API runtime source attestation: %s", runtime_source_attestation)
+    logger.info(
+        "API runtime launch-lock attestation: %s",
+        runtime_launch_lock_attestation,
+    )
 
     db_url = get_async_database_url(app.state.engine_config.database_url)
     app.state.db_engine = create_async_engine(db_url, echo=False)
@@ -150,9 +295,20 @@ async def lifespan(app: FastAPI):
 
     # Build subprocess command with engine config parameters.
     parent_cmd = psutil.Process(os.getppid()).cmdline()
-    cmd = _build_uv_run_cmd_engine(parent_cmd, app.state.engine_config)
+    cmd = _build_uv_run_cmd_engine(
+        parent_cmd,
+        app.state.engine_config,
+        runtime_source_attestation=runtime_source_attestation,
+    )
 
-    background_engine = await asyncio.create_subprocess_exec(*cmd)
+    subprocess_options: dict[str, Any] = {}
+    if runtime_launch_lock_attestation["status"] == "passed":
+        subprocess_options["pass_fds"] = (
+            runtime_launch_lock_attestation["descriptor"],
+        )
+    background_engine = await asyncio.create_subprocess_exec(
+        *cmd, **subprocess_options
+    )
     app.state.background_engine = background_engine
     logger.info(f"Started background engine with PID {background_engine.pid}: {' '.join(cmd)}")
 

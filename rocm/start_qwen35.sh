@@ -141,8 +141,8 @@ esac
 if [[ -n "$prewarm_buckets" ]]; then
   while IFS= read -r exported_name; do
     case "$exported_name" in
-      PYTHON*|__PYVENV_LAUNCHER__|VIRTUAL_ENV|VIRTUAL_ENV_PROMPT)
-        echo "refusing inherited Python or virtualenv startup variable during operational prewarm: $exported_name" >&2
+      PYTHON*|UV_*|__PYVENV_LAUNCHER__|VIRTUAL_ENV|VIRTUAL_ENV_PROMPT)
+        echo "refusing inherited Python, uv, or virtualenv startup variable during operational prewarm: $exported_name" >&2
         exit 2
         ;;
     esac
@@ -318,7 +318,12 @@ if [[ ! -x /usr/bin/flock ]]; then
   echo "refusing to launch because flock is unavailable" >&2
   exit 2
 fi
-lock_parent="${XDG_RUNTIME_DIR:-/tmp}"
+lock_parent="/run/user/$UID"
+if [[ -L "$lock_parent" || ! -d "$lock_parent" || ! -O "$lock_parent" \
+  || "$(/usr/bin/stat -c '%a' -- "$lock_parent")" != "700" ]]; then
+  echo "refusing unsafe fixed global launch-lock parent: $lock_parent" >&2
+  exit 2
+fi
 lock_dir="$lock_parent/skyrl-qwen35-rocm-$UID"
 if [[ -L "$lock_dir" || (-e "$lock_dir" && (! -d "$lock_dir" || ! -O "$lock_dir")) ]]; then
   echo "refusing unsafe global launch-lock directory: $lock_dir" >&2
@@ -338,6 +343,7 @@ if ! /usr/bin/flock -n "$launch_lock_fd"; then
   echo "refusing to launch while another Qwen3.5 ROCm server holds the global launch lock" >&2
   exit 2
 fi
+export SKYRL_QWEN35_LAUNCH_LOCK_FD="$launch_lock_fd"
 
 if ! /usr/bin/mkdir "$run_dir"; then
   echo "refusing to reuse existing run directory: $run_dir" >&2
@@ -463,7 +469,7 @@ if [[ -n "$prewarm_buckets" ]]; then
     LANG=C.UTF-8
     LC_ALL=C.UTF-8
     PATH=/opt/rocm/bin:/usr/bin:/bin
-    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    XDG_RUNTIME_DIR="$lock_parent"
     SKYRL_QWEN35_GIT_HEAD="$SKYRL_QWEN35_GIT_HEAD"
     SKYRL_QWEN35_GIT_TREE="$SKYRL_QWEN35_GIT_TREE"
     SKYRL_QWEN35_GIT_WORKTREE_CLEAN="$SKYRL_QWEN35_GIT_WORKTREE_CLEAN"
@@ -588,6 +594,18 @@ if [[ -n "$prewarm_buckets" ]]; then
   if [[ -L "$uv_executable" || ! -f "$uv_executable" \
     || ! -x "$uv_executable" || ! -O "$uv_executable" ]]; then
     echo "refusing to launch because the fixed user uv executable is unavailable" >&2
+    exit 2
+  fi
+  expected_uv_version="uv 0.11.8 (x86_64-unknown-linux-gnu)"
+  expected_uv_sha256="646adf5cf12ba17d1a41fa77c8dd6496f73651dcfeeed6b5f4ec019b36bc7153"
+  if ! uv_sha256="$(/usr/bin/sha256sum -- "$uv_executable")" \
+    || [[ "$uv_sha256" != "$expected_uv_sha256  $uv_executable" ]]; then
+    echo "refusing unqualified uv executable; expected exact uv 0.11.8 payload" >&2
+    exit 2
+  fi
+  if ! uv_version="$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin "$uv_executable" --version)" \
+    || [[ "$uv_version" != "$expected_uv_version" ]]; then
+    echo "refusing unqualified uv version output after payload verification" >&2
     exit 2
   fi
 else
@@ -968,6 +986,39 @@ if [[ "$prewarm_only" == "1" ]]; then
 fi
 
 trap - EXIT INT TERM
+if [[ -n "$prewarm_buckets" ]]; then
+  cd -- "$source_snapshot"
+  exec /usr/bin/env -i \
+    HOME="$source_account_home" \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/opt/rocm/bin:/usr/bin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    VIRTUAL_ENV="$repo/.venv" \
+    XDG_RUNTIME_DIR="$lock_parent" \
+    SKYRL_QWEN35_RUNTIME_GIT_HEAD="$source_git_head" \
+    SKYRL_QWEN35_RUNTIME_MEMORY_MODE="$memory_mode" \
+    SKYRL_QWEN35_RUNTIME_REPO_ROOT="$repo" \
+    SKYRL_QWEN35_RUNTIME_SOURCE_ROOT="$source_snapshot" \
+    SKYRL_QWEN35_RUNTIME_UV_EXECUTABLE="$uv_executable" \
+    SKYRL_QWEN35_LAUNCH_LOCK_FD="$SKYRL_QWEN35_LAUNCH_LOCK_FD" \
+    "${verified_runtime_environment[@]}" \
+    "$uv_executable" run \
+    --active \
+    --no-sync \
+    --no-env-file \
+    --no-config \
+    --directory "$source_snapshot" \
+    --project "$source_snapshot" \
+    -m skyrl.tinker.api \
+    --base-model "$model_path" \
+    --backend jax \
+    --backend-config "$backend_config" \
+    --host 127.0.0.1 \
+    --port "$port" \
+    --checkpoints-base "$run_dir/checkpoints" \
+    --database-url "sqlite:///$run_dir/tinker.db"
+fi
 exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api \
   --base-model "$model_path" \
   --backend jax \
