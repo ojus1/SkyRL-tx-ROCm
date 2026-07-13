@@ -1,8 +1,39 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
 umask 077
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$-" != *p* ]]; then
+  echo "refusing non-privileged Bash startup; execute this launcher directly so its /bin/bash -p shebang is honored" >&2
+  exit 2
+fi
+for injection_name in BASH_ENV ENV LD_AUDIT LD_LIBRARY_PATH LD_PRELOAD; do
+  if [[ -v "$injection_name" && -n "${!injection_name}" ]]; then
+    echo "refusing inherited interpreter or dynamic-loader injection variable: $injection_name" >&2
+    exit 2
+  fi
+done
+while IFS= read -r exported_name; do
+  if [[ "$exported_name" == BASH_FUNC_*%% ]]; then
+    echo "refusing inherited exported Bash function: $exported_name" >&2
+    exit 2
+  fi
+done < <(compgen -e)
+
+launcher_invocation="${BASH_SOURCE[0]}"
+if [[ "$launcher_invocation" != /* ]]; then
+  launcher_invocation="$(pwd -P)/$launcher_invocation"
+fi
+if [[ -L "$launcher_invocation" || ! -f "$launcher_invocation" || ! -O "$launcher_invocation" ]]; then
+  echo "refusing a symlinked, non-regular, or foreign-owned launcher" >&2
+  exit 2
+fi
+launcher_directory="$(cd -P -- "${launcher_invocation%/*}" && pwd -P)"
+launcher_path="$launcher_directory/${launcher_invocation##*/}"
+repo="$(cd -P -- "$launcher_directory/.." && pwd -P)"
+if [[ "$launcher_path" != "$repo/rocm/start_qwen35.sh" ]]; then
+  echo "refusing launcher path outside the canonical repository location" >&2
+  exit 2
+fi
 cd "$repo"
 
 if [[ $# -ne 1 || ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -107,8 +138,161 @@ case "$memory_mode" in
     ;;
 esac
 
+if [[ -n "$prewarm_buckets" ]]; then
+  while IFS= read -r exported_name; do
+    case "$exported_name" in
+      PYTHON*|__PYVENV_LAUNCHER__|VIRTUAL_ENV|VIRTUAL_ENV_PROMPT)
+        echo "refusing inherited Python or virtualenv startup variable during operational prewarm: $exported_name" >&2
+        exit 2
+        ;;
+    esac
+  done < <(compgen -e)
+  for executable in /usr/bin/chmod /usr/bin/env /usr/bin/getent /usr/bin/git /usr/bin/mkdir /usr/bin/python3.12 /usr/bin/sha256sum /usr/bin/stat /usr/bin/tar; do
+    if [[ ! -x "$executable" ]]; then
+      echo "refusing prewarm because required source-attestation executable is unavailable: $executable" >&2
+      exit 2
+    fi
+  done
+  source_git=(
+    /usr/bin/env -i
+    GIT_CONFIG_GLOBAL=/dev/null
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_NO_REPLACE_OBJECTS=1
+    GIT_OPTIONAL_LOCKS=0
+    HOME=/nonexistent
+    LC_ALL=C
+    PATH=/usr/bin:/bin
+    XDG_CONFIG_HOME=/nonexistent
+    /usr/bin/git
+    -c core.fsmonitor=false
+    -c core.untrackedCache=false
+    -C "$repo"
+  )
+  if ! source_git_top_level="$("${source_git[@]}" rev-parse --show-toplevel 2>&1)" \
+    || [[ "$source_git_top_level" != "$repo" ]]; then
+    echo "refusing prewarm because Git top-level does not match the repository" >&2
+    exit 2
+  fi
+  if ! source_git_head="$("${source_git[@]}" rev-parse --verify 'HEAD^{commit}' 2>&1)" \
+    || [[ ! "$source_git_head" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]; then
+    echo "refusing prewarm because Git HEAD commit is unavailable or malformed" >&2
+    exit 2
+  fi
+  if ! source_git_status="$("${source_git[@]}" status --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>&1)"; then
+    echo "refusing prewarm because Git worktree status is unavailable" >&2
+    exit 2
+  fi
+  if [[ -n "$source_git_status" ]]; then
+    echo "refusing operational ROCm prewarm from a dirty worktree" >&2
+    exit 2
+  fi
+
+  source_index_flags="$("${source_git[@]}" ls-files -v -- rocm/prewarm_qwen35_buckets.py rocm/start_qwen35.sh rocm/verified_source_bootstrap.py 2>&1)" || {
+    echo "refusing prewarm because runtime-source index flags are unavailable" >&2
+    exit 2
+  }
+  expected_source_index_flags=$'H rocm/prewarm_qwen35_buckets.py\nH rocm/start_qwen35.sh\nH rocm/verified_source_bootstrap.py'
+  if [[ "$source_index_flags" != "$expected_source_index_flags" ]]; then
+    echo "refusing prewarm because runtime source has assume-unchanged, skip-worktree, or unexpected index state" >&2
+    exit 2
+  fi
+
+  source_git_tree="$("${source_git[@]}" rev-parse --verify "$source_git_head^{tree}" 2>&1)" || {
+    echo "refusing prewarm because the exact Git tree is unavailable" >&2
+    exit 2
+  }
+  if [[ ! "$source_git_tree" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]; then
+    echo "refusing prewarm because the exact Git tree object ID is malformed" >&2
+    exit 2
+  fi
+
+  source_blob_oid() {
+    local relative_path="$1"
+    local expected_mode="$2"
+    local absolute_path="$repo/$relative_path"
+    local tree_record
+    local head_oid
+    local working_oid
+    if ! tree_record="$("${source_git[@]}" ls-tree "$source_git_head" -- "$relative_path" 2>&1)"; then
+      return 1
+    fi
+    head_oid="${tree_record#"$expected_mode blob "}"
+    head_oid="${head_oid%%$'\t'*}"
+    if [[ ! "$head_oid" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
+      || [[ "$tree_record" != "$expected_mode blob $head_oid"$'\t'"$relative_path" ]]; then
+      return 1
+    fi
+    if ! working_oid="$("${source_git[@]}" hash-object --no-filters -- "$absolute_path" 2>&1)" \
+      || [[ "$working_oid" != "$head_oid" ]]; then
+      return 1
+    fi
+    printf '%s\n' "$head_oid"
+  }
+
+  source_sha256() {
+    local source_path="$1"
+    local hash_output
+    local digest
+    if ! hash_output="$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /usr/bin/sha256sum -- "$source_path" 2>&1)"; then
+      return 1
+    fi
+    digest="${hash_output%% *}"
+    if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]] \
+      || [[ "$hash_output" != "$digest  $source_path" ]]; then
+      return 1
+    fi
+    printf '%s\n' "$digest"
+  }
+  source_blob_sha256() {
+    local blob_oid="$1"
+    local hash_output
+    local digest
+    if ! hash_output="$("${source_git[@]}" cat-file blob "$blob_oid" | /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /usr/bin/sha256sum 2>&1)"; then
+      return 1
+    fi
+    digest="${hash_output%% *}"
+    if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]] || [[ "$hash_output" != "$digest  -" ]]; then
+      return 1
+    fi
+    printf '%s\n' "$digest"
+  }
+  launcher_source_path="$launcher_path"
+  prewarm_source_path="$repo/rocm/prewarm_qwen35_buckets.py"
+  bootstrap_source_path="$repo/rocm/verified_source_bootstrap.py"
+  if ! launcher_source_blob_oid="$(source_blob_oid rocm/start_qwen35.sh 100755)" \
+    || ! prewarm_source_blob_oid="$(source_blob_oid rocm/prewarm_qwen35_buckets.py 100644)" \
+    || ! bootstrap_source_blob_oid="$(source_blob_oid rocm/verified_source_bootstrap.py 100644)" \
+    || ! launcher_source_sha256="$(source_sha256 "$launcher_source_path")" \
+    || ! prewarm_source_sha256="$(source_sha256 "$prewarm_source_path")" \
+    || ! bootstrap_source_sha256="$(source_sha256 "$bootstrap_source_path")" \
+    || ! launcher_blob_sha256="$(source_blob_sha256 "$launcher_source_blob_oid")" \
+    || ! prewarm_blob_sha256="$(source_blob_sha256 "$prewarm_source_blob_oid")" \
+    || ! bootstrap_blob_sha256="$(source_blob_sha256 "$bootstrap_source_blob_oid")" \
+    || [[ "$launcher_source_sha256" != "$launcher_blob_sha256" ]] \
+    || [[ "$prewarm_source_sha256" != "$prewarm_blob_sha256" ]] \
+    || [[ "$bootstrap_source_sha256" != "$bootstrap_blob_sha256" ]]; then
+    echo "refusing prewarm because exact runtime source does not match its HEAD blob" >&2
+    exit 2
+  fi
+  export SKYRL_QWEN35_GIT_HEAD="$source_git_head"
+  export SKYRL_QWEN35_GIT_TREE="$source_git_tree"
+  export SKYRL_QWEN35_GIT_WORKTREE_CLEAN=true
+  export SKYRL_QWEN35_LAUNCHER_BLOB_OID="$launcher_source_blob_oid"
+  export SKYRL_QWEN35_LAUNCHER_SHA256="$launcher_source_sha256"
+  export SKYRL_QWEN35_PREWARM_BLOB_OID="$prewarm_source_blob_oid"
+  export SKYRL_QWEN35_PREWARM_SHA256="$prewarm_source_sha256"
+  export SKYRL_QWEN35_BOOTSTRAP_BLOB_OID="$bootstrap_source_blob_oid"
+  export SKYRL_QWEN35_BOOTSTRAP_SHA256="$bootstrap_source_sha256"
+fi
+if [[ -n "$prewarm_buckets" ]]; then
+  export PATH=/opt/rocm/bin:/usr/bin:/bin
+fi
+
 run_root="${SKYRL_QWEN35_RUN_ROOT:-/tmp/skyrl-qwen35-runs}"
 run_dir="$run_root/$run_id"
+verified_python=()
+verified_basic_environment=()
+verified_runtime_environment=()
 port="${SKYRL_QWEN35_PORT:-8001}"
 if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$port > 65535)); then
   echo "SKYRL_QWEN35_PORT must be an integer in [1, 65535]." >&2
@@ -130,7 +314,7 @@ if [[ -L "$run_root" || ! -d "$run_root" || ! -O "$run_root" ]]; then
 fi
 chmod 700 "$run_root"
 
-if ! command -v flock >/dev/null 2>&1; then
+if [[ ! -x /usr/bin/flock ]]; then
   echo "refusing to launch because flock is unavailable" >&2
   exit 2
 fi
@@ -150,12 +334,144 @@ if [[ -L "$lock_dir" || ! -d "$lock_dir" || ! -O "$lock_dir" ]]; then
 fi
 chmod 700 "$lock_dir"
 exec {launch_lock_fd}<"$lock_dir"
-if ! flock -n "$launch_lock_fd"; then
+if ! /usr/bin/flock -n "$launch_lock_fd"; then
   echo "refusing to launch while another Qwen3.5 ROCm server holds the global launch lock" >&2
   exit 2
 fi
 
-if ! python3 -m rocm.amdgpu_safety >/dev/null; then
+if ! /usr/bin/mkdir "$run_dir"; then
+  echo "refusing to reuse existing run directory: $run_dir" >&2
+  exit 2
+fi
+/usr/bin/mkdir "$run_dir/checkpoints"
+
+if [[ -n "$prewarm_buckets" ]]; then
+  if ! passwd_record="$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /usr/bin/getent passwd "$UID")"; then
+    echo "refusing prewarm because the account home cannot be resolved" >&2
+    exit 2
+  fi
+  IFS=: read -r passwd_name _passwd_token passwd_uid passwd_gid _passwd_gecos source_account_home passwd_shell <<<"$passwd_record"
+  if [[ -z "$passwd_name" || "$passwd_uid" != "$UID" || -z "$passwd_gid" \
+    || "$source_account_home" != /* || -z "$passwd_shell" \
+    || -L "$source_account_home" || ! -d "$source_account_home" \
+    || ! -O "$source_account_home" ]]; then
+    echo "refusing prewarm because the account database returned an unsafe home" >&2
+    exit 2
+  fi
+  source_account_home="$(cd -P -- "$source_account_home" && pwd -P)"
+  venv_site_packages="$repo/.venv/lib/python3.12/site-packages"
+  if [[ -L "$venv_site_packages" || ! -d "$venv_site_packages" \
+    || ! -O "$venv_site_packages" \
+    || "$(cd -P -- "$venv_site_packages" && pwd -P)" != "$venv_site_packages" ]]; then
+    echo "refusing prewarm because the exact Python 3.12 virtualenv site-packages directory is unavailable" >&2
+    exit 2
+  fi
+
+  source_archive="$run_dir/source-head.tar"
+  source_snapshot="$run_dir/source-head"
+  source_pycache_prefix="$run_dir/python-cache-empty"
+  /usr/bin/mkdir -m 700 "$source_snapshot" "$source_pycache_prefix"
+  if ! "${source_git[@]}" archive \
+      --format=tar \
+      --output="$source_archive" \
+      "$source_git_head"; then
+    echo "refusing prewarm because the exact HEAD source archive could not be created" >&2
+    exit 2
+  fi
+  if [[ "$(/usr/bin/stat -c '%u:%h:%a:%F' -- "$source_archive")" \
+      != "$UID:1:600:regular file" ]]; then
+    echo "refusing prewarm because the source archive is not a private regular file" >&2
+    exit 2
+  fi
+  if ! source_archive_sha256="$(source_sha256 "$source_archive")"; then
+    echo "refusing prewarm because the source archive could not be hashed" >&2
+    exit 2
+  fi
+  if ! /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /usr/bin/tar \
+      --extract \
+      --no-same-owner \
+      --no-same-permissions \
+      --file="$source_archive" \
+      --directory="$source_snapshot"; then
+    echo "refusing prewarm because the exact HEAD source archive could not be extracted" >&2
+    exit 2
+  fi
+  if ! snapshot_prewarm_sha256="$(source_sha256 "$source_snapshot/rocm/prewarm_qwen35_buckets.py")" \
+    || ! snapshot_bootstrap_sha256="$(source_sha256 "$source_snapshot/rocm/verified_source_bootstrap.py")" \
+    || [[ "$snapshot_prewarm_sha256" != "$prewarm_source_sha256" ]] \
+    || [[ "$snapshot_bootstrap_sha256" != "$bootstrap_source_sha256" ]]; then
+    echo "refusing prewarm because extracted runtime source does not match HEAD" >&2
+    exit 2
+  fi
+  export SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256="$source_archive_sha256"
+  export SKYRL_QWEN35_SOURCE_ARCHIVE_PATH="$source_archive"
+  export SKYRL_QWEN35_SOURCE_REPO_ROOT="$repo"
+  export SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT="$source_snapshot"
+  export SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX="$source_pycache_prefix"
+  export SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES="$venv_site_packages"
+  export SKYRL_QWEN35_SOURCE_INTERPRETER=/usr/bin/python3.12
+  export SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS=-I,-S,-B,-P
+
+  verified_python=(
+    /usr/bin/python3.12
+    -I
+    -S
+    -B
+    -P
+    -X "pycache_prefix=$source_pycache_prefix"
+    "$source_snapshot/rocm/verified_source_bootstrap.py"
+    --repo-root "$repo"
+    --git-head "$source_git_head"
+    --snapshot-root "$source_snapshot"
+    --venv-site-packages "$venv_site_packages"
+  )
+  verified_basic_environment=(
+    HOME="$source_account_home"
+    LANG=C.UTF-8
+    LC_ALL=C.UTF-8
+    PATH=/opt/rocm/bin:/usr/bin:/bin
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    SKYRL_QWEN35_GIT_HEAD="$SKYRL_QWEN35_GIT_HEAD"
+    SKYRL_QWEN35_GIT_TREE="$SKYRL_QWEN35_GIT_TREE"
+    SKYRL_QWEN35_GIT_WORKTREE_CLEAN="$SKYRL_QWEN35_GIT_WORKTREE_CLEAN"
+    SKYRL_QWEN35_LAUNCHER_BLOB_OID="$SKYRL_QWEN35_LAUNCHER_BLOB_OID"
+    SKYRL_QWEN35_LAUNCHER_SHA256="$SKYRL_QWEN35_LAUNCHER_SHA256"
+    SKYRL_QWEN35_PREWARM_BLOB_OID="$SKYRL_QWEN35_PREWARM_BLOB_OID"
+    SKYRL_QWEN35_PREWARM_SHA256="$SKYRL_QWEN35_PREWARM_SHA256"
+    SKYRL_QWEN35_BOOTSTRAP_BLOB_OID="$SKYRL_QWEN35_BOOTSTRAP_BLOB_OID"
+    SKYRL_QWEN35_BOOTSTRAP_SHA256="$SKYRL_QWEN35_BOOTSTRAP_SHA256"
+    SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256="$SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256"
+    SKYRL_QWEN35_SOURCE_ARCHIVE_PATH="$SKYRL_QWEN35_SOURCE_ARCHIVE_PATH"
+    SKYRL_QWEN35_SOURCE_REPO_ROOT="$SKYRL_QWEN35_SOURCE_REPO_ROOT"
+    SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT="$SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT"
+    SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX="$SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX"
+    SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES="$SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES"
+    SKYRL_QWEN35_SOURCE_INTERPRETER="$SKYRL_QWEN35_SOURCE_INTERPRETER"
+    SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS="$SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS"
+  )
+fi
+
+run_verified_source_module() {
+  local target_module="$1"
+  shift
+  /usr/bin/env -i \
+    "${verified_basic_environment[@]}" \
+    "${verified_runtime_environment[@]}" \
+    "${verified_python[@]}" \
+    --module "$target_module" \
+    -- \
+    "$@"
+}
+
+run_amdgpu_safety() {
+  if [[ -n "$prewarm_buckets" ]]; then
+    run_verified_source_module rocm.amdgpu_safety
+  else
+    python3 -m rocm.amdgpu_safety
+  fi
+}
+
+if ! run_amdgpu_safety >/dev/null; then
   echo "refusing to launch until the fatal AMDGPU boot quarantine is cleared by a reboot" >&2
   exit 2
 fi
@@ -202,11 +518,11 @@ if ((${#connected_amd_connectors[@]} > 0)) && [[ "${SKYRL_ALLOW_AMD_DISPLAY:-0}"
 fi
 
 if [[ "${SKYRL_ALLOW_EXISTING_KFD:-0}" != "1" ]]; then
-  if ! command -v fuser >/dev/null 2>&1; then
+  if [[ ! -x /usr/bin/fuser ]]; then
     echo "refusing to launch because fuser is unavailable for the /dev/kfd ownership check" >&2
     exit 2
   fi
-  if kfd_owners="$(fuser /dev/kfd 2>&1)"; then
+  if kfd_owners="$(/usr/bin/fuser /dev/kfd 2>&1)"; then
     echo "refusing to launch while /dev/kfd is already owned by PID(s): $kfd_owners" >&2
     echo "Set SKYRL_ALLOW_EXISTING_KFD=1 only after verifying that sharing is intentional." >&2
     exit 2
@@ -219,7 +535,8 @@ if [[ "${SKYRL_ALLOW_EXISTING_KFD:-0}" != "1" ]]; then
   fi
 fi
 
-if ! python3 - "$port" <<'PY'
+if ! /usr/bin/env -i LC_ALL=C.UTF-8 PATH=/usr/bin:/bin \
+    /usr/bin/python3.12 -I -S -B -P -X pycache_prefix=/dev/null - "$port" <<'PY'
 import socket
 import sys
 
@@ -233,23 +550,42 @@ then
   exit 2
 fi
 
-if [[ ! -r .venv/bin/activate ]] || ! command -v uv >/dev/null 2>&1; then
+if [[ -n "$prewarm_buckets" ]]; then
+  uv_executable="$source_account_home/.local/bin/uv"
+  if [[ -L "$uv_executable" || ! -f "$uv_executable" \
+    || ! -x "$uv_executable" || ! -O "$uv_executable" ]]; then
+    echo "refusing to launch because the fixed user uv executable is unavailable" >&2
+    exit 2
+  fi
+else
+  uv_executable="$(command -v uv || true)"
+fi
+if [[ ! -x .venv/bin/python || ! -d .venv/lib/python3.12/site-packages \
+  || -z "$uv_executable" ]]; then
   echo "refusing to launch because the project virtualenv or uv is unavailable" >&2
   exit 2
 fi
 
-if ! mkdir "$run_dir"; then
-  echo "refusing to reuse existing run directory: $run_dir" >&2
-  exit 2
-fi
-mkdir "$run_dir/checkpoints"
-
-source .venv/bin/activate
+venv_site_packages="$repo/.venv/lib/python3.12/site-packages"
+export VIRTUAL_ENV="$repo/.venv"
+export PATH="$VIRTUAL_ENV/bin:$PATH"
+dependency_pycache_prefix="${source_pycache_prefix:-/dev/null}"
+dependency_home="${source_account_home:-${HOME:-/nonexistent}}"
 if ! model_path="$({
-  python - "$model_repo" "$model_revision" <<'PY'
+  /usr/bin/env -i \
+    HOME="$dependency_home" \
+    LC_ALL=C.UTF-8 \
+    PATH=/opt/rocm/bin:/usr/bin:/bin \
+    /usr/bin/python3.12 -I -S -B -P \
+      -X "pycache_prefix=$dependency_pycache_prefix" \
+      - \
+      "$venv_site_packages" \
+      "$model_repo" \
+      "$model_revision" <<'PY'
 import sys
 from pathlib import Path
 
+sys.path.insert(0, sys.argv.pop(1))
 from huggingface_hub import snapshot_download
 
 model_repo, revision = sys.argv[1:]
@@ -291,16 +627,15 @@ fi
 # Source/HLO changes still participate in JAX's cache key.  Future external FFI
 # libraries must additionally version this namespace by their exact hash.
 expected_jax_stack="0.10.2,0.10.2,0.10.2,0.10.2"
-if ! installed_jax_stack="$(python - <<'PY'
-from importlib.metadata import version
-
-print(
-    ",".join(
-        version(package)
-        for package in ("jax", "jaxlib", "jax-rocm7-plugin", "jax-rocm7-pjrt")
-    )
-)
-PY
+if ! installed_jax_stack="$(
+  /usr/bin/env -i \
+    HOME="$dependency_home" \
+    LC_ALL=C.UTF-8 \
+    PATH=/opt/rocm/bin:/usr/bin:/bin \
+    /usr/bin/python3.12 -I -S -B -P \
+      -X "pycache_prefix=$dependency_pycache_prefix" \
+      -c 'import sys; sys.path.insert(0, sys.argv[1]); from importlib.metadata import version; print(",".join(version(package) for package in ("jax", "jaxlib", "jax-rocm7-plugin", "jax-rocm7-pjrt")))' \
+      "$venv_site_packages"
 )"; then
   echo "refusing to configure the trusted JAX cache because stack-version discovery failed" >&2
   exit 2
@@ -321,7 +656,15 @@ if [[ -v JAX_COMPILATION_CACHE_DIR ]]; then
   echo "refusing inherited JAX_COMPILATION_CACHE_DIR; the trusted cache path is stack-versioned by the launcher" >&2
   exit 2
 fi
-if ! jax_cache_dir="$(
+if [[ -n "$prewarm_buckets" ]]; then
+  if ! jax_cache_dir="$(
+    run_verified_source_module rocm.prepare_jax_cache_dir \
+      --max-autotune-bytes 4294967296
+  )"; then
+    echo "refusing to start without a private, validated JAX compilation cache" >&2
+    exit 2
+  fi
+elif ! jax_cache_dir="$(
   python rocm/prepare_jax_cache_dir.py \
     --max-autotune-bytes 4294967296
 )"; then
@@ -346,6 +689,35 @@ export SKYRL_ROCM_PALLAS_ATTENTION="${SKYRL_ROCM_PALLAS_ATTENTION:-0}"
 # gfx1100 command-stream opcode. Disable XLA HIP-graph command-buffer capture
 # until the isolated replay probe establishes a narrower safe configuration.
 export XLA_FLAGS=--xla_gpu_enable_command_buffer=
+
+if [[ -n "$prewarm_buckets" ]]; then
+  verified_runtime_environment=(
+    HF_XET_HIGH_PERFORMANCE="$HF_XET_HIGH_PERFORMANCE"
+    JAX_COMPILATION_CACHE_DIR="$JAX_COMPILATION_CACHE_DIR"
+    JAX_COMPILATION_CACHE_EXPECT_PGLE="$JAX_COMPILATION_CACHE_EXPECT_PGLE"
+    JAX_COMPILATION_CACHE_MAX_SIZE="$JAX_COMPILATION_CACHE_MAX_SIZE"
+    JAX_ENABLE_COMPILATION_CACHE="$JAX_ENABLE_COMPILATION_CACHE"
+    JAX_ENABLE_PGLE="$JAX_ENABLE_PGLE"
+    JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES="$JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"
+    JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="$JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
+    JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="$JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"
+    JAX_PLATFORMS="$JAX_PLATFORMS"
+    JAX_RAISE_PERSISTENT_CACHE_ERRORS="$JAX_RAISE_PERSISTENT_CACHE_ERRORS"
+    LLVM_PATH="$LLVM_PATH"
+    ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"
+    SKYRL_ROCM_PALLAS_ATTENTION="$SKYRL_ROCM_PALLAS_ATTENTION"
+    XLA_FLAGS="$XLA_FLAGS"
+    XLA_PYTHON_CLIENT_PREALLOCATE="$XLA_PYTHON_CLIENT_PREALLOCATE"
+  )
+  if [[ "$memory_mode" == "preallocate85" ]]; then
+    verified_runtime_environment+=(
+      GPU_DEVICE_ORDINAL="$GPU_DEVICE_ORDINAL"
+      HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES"
+      XLA_CLIENT_MEM_FRACTION="$XLA_CLIENT_MEM_FRACTION"
+      XLA_PYTHON_CLIENT_ALLOCATOR="$XLA_PYTHON_CLIENT_ALLOCATOR"
+    )
+  fi
+fi
 
 # Default-off, compile-only static-bucket prewarm. This populates the trusted
 # persistent cache before the API starts, but never invokes a compiled model
@@ -394,7 +766,7 @@ finish_prewarm_once() {
   fi
 
   if ((prewarm_started != 0)); then
-    if python rocm/qwen35_prewarm_handoff.py settle \
+    if run_verified_source_module rocm.qwen35_prewarm_handoff settle \
         --output "$prewarm_handoff_artifact" \
         --timeout-seconds 120 \
         --poll-interval-seconds 1; then
@@ -404,7 +776,7 @@ finish_prewarm_once() {
     fi
   fi
 
-  if python3 -m rocm.amdgpu_safety >/dev/null; then
+  if run_amdgpu_safety >/dev/null; then
     final_journal_status=0
   else
     final_journal_status=$?
@@ -464,7 +836,7 @@ if [[ -n "$prewarm_buckets" ]]; then
       ;;
   esac
   prewarm_handoff_artifact="$run_dir/prewarm-handoff.jsonl"
-  if ! python rocm/qwen35_prewarm_handoff.py capture \
+  if ! run_verified_source_module rocm.qwen35_prewarm_handoff capture \
       --output "$prewarm_handoff_artifact"; then
     echo "refusing startup prewarm because the idle AMDGPU baseline could not be captured" >&2
     exit 2
@@ -474,7 +846,7 @@ if [[ -n "$prewarm_buckets" ]]; then
   trap 'on_prewarm_exit "$?"' EXIT
   prewarm_started=1
   prewarm_supervisor_waited=0
-  python rocm/profile_rocm.py \
+  run_verified_source_module rocm.profile_rocm \
       --output "$run_dir/prewarm.telemetry.jsonl" \
       --card "${amd_card_names[0]}" \
       --interval 0.1 \
@@ -488,7 +860,9 @@ if [[ -n "$prewarm_buckets" ]]; then
       --max-swap-gib 8 \
       --pass-fd "$launch_lock_fd" \
       -- \
-      python rocm/prewarm_qwen35_buckets.py \
+      "${verified_python[@]}" \
+        --module rocm.prewarm_qwen35_buckets \
+        -- \
         --execute-rocm \
         --allow-gpu \
         "${prewarm_optimizer_args[@]}" \
@@ -509,7 +883,7 @@ if [[ -n "$prewarm_buckets" ]]; then
 fi
 
 if [[ -z "$prewarm_buckets" ]]; then
-  if python3 -m rocm.amdgpu_safety >/dev/null; then
+  if run_amdgpu_safety >/dev/null; then
     final_journal_status=0
   else
     final_journal_status=$?
@@ -532,13 +906,36 @@ if ((prewarm_status != 0)); then
   exit "$prewarm_status"
 fi
 
+unset SKYRL_QWEN35_GIT_HEAD
+unset SKYRL_QWEN35_GIT_TREE
+unset SKYRL_QWEN35_GIT_WORKTREE_CLEAN
+unset SKYRL_QWEN35_LAUNCHER_BLOB_OID
+unset SKYRL_QWEN35_LAUNCHER_SHA256
+unset SKYRL_QWEN35_PREWARM_BLOB_OID
+unset SKYRL_QWEN35_PREWARM_SHA256
+unset SKYRL_QWEN35_BOOTSTRAP_BLOB_OID
+unset SKYRL_QWEN35_BOOTSTRAP_SHA256
+unset SKYRL_QWEN35_SOURCE_ARCHIVE_PATH
+unset SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256
+unset SKYRL_QWEN35_SOURCE_INTERPRETER
+unset SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS
+unset SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX
+unset SKYRL_QWEN35_SOURCE_REPO_ROOT
+unset SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT
+unset SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES
+unset SKYRL_VERIFIED_SOURCE_GIT_HEAD
+unset SKYRL_VERIFIED_SOURCE_GIT_TREE
+unset SKYRL_VERIFIED_SOURCE_MANIFEST_SHA256
+unset SKYRL_VERIFIED_SOURCE_RUNTIME_POLICY
+unset SKYRL_VERIFIED_SOURCE_SNAPSHOT_ROOT
+
 if [[ "$prewarm_only" == "1" ]]; then
   trap - EXIT INT TERM
   exit 0
 fi
 
 trap - EXIT INT TERM
-exec uv run --active --no-sync -m skyrl.tinker.api \
+exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api \
   --base-model "$model_path" \
   --backend jax \
   --backend-config "$backend_config" \

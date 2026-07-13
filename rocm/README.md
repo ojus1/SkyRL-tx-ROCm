@@ -139,6 +139,46 @@ prewarm, handoff, or final-journal gate; after all of them pass, it disarms the
 launcher traps and exits zero before the API command. This is the qualification
 route while engine startup attestation remains unavailable.
 
+Every operational launcher prewarm also requires a clean Git worktree before
+the first hardware or JAX access. Fixed, sanitized Git commands bind the exact
+commit and raw launcher/bootstrap/prewarm blobs to both their Git object IDs and
+SHA-256 digests. The launcher extracts the entire tracked HEAD tree into a
+private normalized snapshot, then every ROCm helper starts through the tracked
+stdlib-only bootstrap under Python `-I -S -B -P` with an empty private bytecode
+cache prefix and an allowlisted environment. For those Python helpers and
+module imports, this prevents executable `.pth`, `sitecustomize`, user-site,
+stale bytecode, ignored import shadows, and mutable working-tree modules from
+running before the full snapshot is checked. The launcher itself necessarily
+begins as working-tree shell code; it uses `/bin/bash -p`, no pre-gate external
+path lookup, and an exact HEAD-blob check rather than claiming snapshot
+execution. A tracked regular `rocm` package plus explicit package-search and
+target-origin checks prevent mutable site-packages from replacing an allowlisted
+module. The child records the snapshot-manifest hash in its first manifest,
+revalidates the same tree after compilation, and refuses `complete` if source or
+Git state changed.
+Operational direct execution without the verified launcher lock is rejected;
+the unprivileged CPU planning mode remains directly usable. The launcher removes
+all prewarm-only claims before any API exec so they cannot masquerade as engine
+attestation.
+
+This is an operational integrity boundary, not protection against a malicious
+same-UID process, root/kernel compromise, or compromised Git/Python binaries.
+The parent process and dynamic-loader environment are also outside the boundary:
+`LD_PRELOAD`/`LD_AUDIT` can act while `/bin/bash` is loading, before the launcher
+can reject those inherited variables.
+The explicitly added virtualenv `site-packages` directory supplies an
+exact-version-checked JAX stack, but its dependency file bytes are not yet
+cryptographically attested. Verified Python helper startup/execution in the
+prewarm-only path uses this isolation; this paragraph does not claim that the
+launcher, later API, or nested engine process is isolated by the same bootstrap.
+
+Archive creation/extraction and repeated full-tree Git-blob plus SHA-256
+validation deliberately spend extra startup CPU, wall time, RAM, and disk. That
+overhead has not yet been measured separately from compilation and must be
+reported before enabling this path by default; retaining both the tar archive
+and extracted snapshot also consumes roughly twice the tracked-tree bytes per
+run.
+
 Backend/model construction, pinned-weight loading, LoRA parameter and Adam-state
 initialization, array placement, and the explicit `block_until_ready` may still
 perform ordinary setup array work. Compilation can initialize ROCm, allocate
@@ -155,7 +195,7 @@ VRAM/GTT no higher than baseline, and then performs the final boot-journal gate
 before it can start the API. Neither path enables command buffers, HIP Graphs,
 PGLE, executable export, an actual warmup/replay, or an in-engine prewarm. The
 launcher exports both `JAX_ENABLE_PGLE=false` and
-`JAX_COMPILATION_CACHE_EXPECT_PGLE=false`, and the direct prewarm tool requires
+`JAX_COMPILATION_CACHE_EXPECT_PGLE=false`, and the operational child requires
 those exact values. Running
 `python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
 CPU-only plan and never imports JAX.
@@ -165,8 +205,8 @@ T512 Pallas population/hit pair described below are now hardware-qualified. The
 multi-bucket path, launcher-to-API transition, additional/repeated hits, and
 actual warmup remain unqualified. The launcher examples above provide the
 required telemetry, headless-display, exclusive-KFD, fatal-journal, and cleanup
-gates; any direct tool invocation still requires equivalent external
-supervision. The API's
+gates. The historical T64 direct-tool artifacts used equivalent external
+supervision; current operational ROCm prewarm is launcher-only. The API's
 current health endpoint does not prove that the nested engine has finished
 loading, inherited the intended cache policy, or consumed a particular cached
 executable. Therefore prewarm remains default-off until an engine readiness and
@@ -258,9 +298,10 @@ directory is:
 Command-buffer disabling is explicit in the child. PGLE disabling is indirect
 artifact-and-pinned-source evidence: reaching `backend_ready` required the
 pinned validator to accept both PGLE variables as `false`. The profiler records
-its own pinned script hash, but the child schema does not yet embed the prewarm
-script hash or Git HEAD, so source identity was reconstructed externally from
-the audited relevant files matching that commit and the run-directory name.
+its own pinned script hash, but that historical child schema did not embed the
+prewarm script hash or Git HEAD, so source identity was reconstructed externally
+from the audited relevant files matching that commit and the run-directory
+name.
 This run proves cold compile-only population and its resource cost. It does not
 measure a cache hit or startup time saved, invoke a training pass or Adam
 update, validate optimizer-step correctness, authorize a warmup or replay, or
@@ -436,14 +477,15 @@ Both telemetry manifests embed and exactly match profiler SHA-256
 `ed230758101a2a540b3a09e7f84ac92256d2bb41c70dbc399b9466fe0b979684`;
 both handoff baselines embed and exactly match helper SHA-256
 `4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392`.
-The child schema still does not embed the prewarm-tool, launcher, or Git hashes.
-Their correlation to commit `ab962c79` is reconstructed from current runtime
-source bytes matching HEAD, observed pre/post-run Git checks, commit/run
-timestamps, and run-directory names rather than direct runtime attestation.
-The prewarm tool and launcher currently match SHA-256
+Those historical child artifacts did not embed the prewarm-tool, launcher, or
+Git hashes. Their correlation to commit `ab962c79` was reconstructed at audit
+time from runtime source bytes matching HEAD, observed pre/post-run Git checks,
+commit/run timestamps, and run-directory names rather than direct runtime
+attestation.
+At that audit, the prewarm tool and launcher matched SHA-256
 `0ce082bbed81ee9013cae036c0619c3e2de5d15b0ed1efce5fcc7958fb303d7c`
-and `118d1ed67a1dd3662d2b43aad86e28ef0bba73d141e07e51ef3a1b0540fcb8f0`;
-the README is the sole tracked modification. Those external checks are not
+and `118d1ed67a1dd3662d2b43aad86e28ef0bba73d141e07e51ef3a1b0540fcb8f0`,
+and the README was the sole tracked modification. Those external checks are not
 embedded proof that the worktree stayed clean during execution.
 
 This qualifies one cold T512 cache population and one matched compile-only hit;

@@ -63,9 +63,241 @@ def test_default_is_cpu_only_plan_without_jax_or_gpu() -> None:
     assert manifest["optimizer_compile_calls_planned"] == 0
     assert manifest["executable_export_used"] is False
     assert manifest["graph_api_used"] is False
+    assert manifest["source_attestation"] == {
+        "status": "cpu_plan_only_self_hash",
+        "prewarm_source_sha256": prewarm._file_sha256(_TOOL),
+        "launcher_lock_fd_claim_present": False,
+    }
     assert plan["jax_imported"] is False
     assert plan["gpu_accessed"] is False
     assert "cannot populate the ROCm executable cache" in plan["note"]
+
+
+def _fake_verified_source_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, dict[str, str], dict[str, object]]:
+    original_repo = tmp_path / "repo"
+    original_repo.mkdir(mode=0o700)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    snapshot = run_dir / "source-head"
+    snapshot.mkdir(mode=0o700)
+    pycache = run_dir / "python-cache-empty"
+    pycache.mkdir(mode=0o700)
+    archive = run_dir / "source-head.tar"
+    archive.write_bytes(b"exact private HEAD archive")
+    archive.chmod(0o600)
+    site_packages = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
+    site_packages.mkdir(parents=True)
+
+    records = {
+        "rocm/start_qwen35.sh": {
+            "path": "rocm/start_qwen35.sh",
+            "git_oid": "1" * 40,
+            "sha256": "a" * 64,
+        },
+        "rocm/prewarm_qwen35_buckets.py": {
+            "path": "rocm/prewarm_qwen35_buckets.py",
+            "git_oid": "2" * 40,
+            "sha256": "b" * 64,
+        },
+        "rocm/verified_source_bootstrap.py": {
+            "path": "rocm/verified_source_bootstrap.py",
+            "git_oid": "3" * 40,
+            "sha256": "c" * 64,
+        },
+    }
+    manifest: dict[str, object] = {
+        "status": "passed",
+        "files": list(records.values()),
+        "git_head": "d" * 40,
+        "git_tree": "e" * 40,
+        "git_object_format": "sha1",
+        "original_repo_root": str(original_repo),
+        "snapshot_root": str(snapshot),
+        "source_manifest_sha256": "f" * 64,
+        "file_count": 1_087,
+        "total_source_bytes": 36_000_000,
+        "venv_site_packages": str(site_packages),
+        "threat_model_excludes": ["malicious process running as the same UID"],
+    }
+    monkeypatch.setattr(
+        prewarm,
+        "_runtime_isolation_checks",
+        lambda: {
+            "isolated": True,
+            "no_site": True,
+            "dont_write_bytecode": True,
+            "ignore_environment": True,
+            "safe_path": True,
+        },
+    )
+    monkeypatch.setattr(sys, "pycache_prefix", str(pycache))
+    environment = {
+        "SKYRL_QWEN35_GIT_HEAD": manifest["git_head"],
+        "SKYRL_QWEN35_GIT_TREE": manifest["git_tree"],
+        "SKYRL_QWEN35_GIT_WORKTREE_CLEAN": "true",
+        "SKYRL_QWEN35_LAUNCHER_BLOB_OID": records["rocm/start_qwen35.sh"]["git_oid"],
+        "SKYRL_QWEN35_LAUNCHER_SHA256": records["rocm/start_qwen35.sh"]["sha256"],
+        "SKYRL_QWEN35_PREWARM_BLOB_OID": records["rocm/prewarm_qwen35_buckets.py"]["git_oid"],
+        "SKYRL_QWEN35_PREWARM_SHA256": records["rocm/prewarm_qwen35_buckets.py"]["sha256"],
+        "SKYRL_QWEN35_BOOTSTRAP_BLOB_OID": records["rocm/verified_source_bootstrap.py"]["git_oid"],
+        "SKYRL_QWEN35_BOOTSTRAP_SHA256": records["rocm/verified_source_bootstrap.py"]["sha256"],
+        "SKYRL_QWEN35_SOURCE_ARCHIVE_PATH": str(archive),
+        "SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256": prewarm._file_sha256(archive),
+        "SKYRL_QWEN35_SOURCE_INTERPRETER": sys.executable,
+        "SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS": "-I,-S,-B,-P",
+        "SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX": str(pycache),
+        "SKYRL_QWEN35_SOURCE_REPO_ROOT": str(original_repo),
+        "SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT": str(snapshot),
+        "SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES": str(site_packages),
+        "SKYRL_VERIFIED_SOURCE_GIT_HEAD": manifest["git_head"],
+        "SKYRL_VERIFIED_SOURCE_GIT_TREE": manifest["git_tree"],
+        "SKYRL_VERIFIED_SOURCE_MANIFEST_SHA256": manifest[
+            "source_manifest_sha256"
+        ],
+        "SKYRL_VERIFIED_SOURCE_RUNTIME_POLICY": "true",
+        "SKYRL_VERIFIED_SOURCE_SNAPSHOT_ROOT": str(snapshot),
+    }
+    return snapshot, environment, manifest
+
+
+def test_source_attestation_binds_full_head_snapshot_and_runtime_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot, environment, manifest = _fake_verified_source_contract(
+        monkeypatch, tmp_path
+    )
+    calls: list[dict[str, object]] = []
+
+    def validator(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return manifest
+
+    result = prewarm._validated_source_attestation(
+        launcher_required=True,
+        repo_root=snapshot,
+        environment=environment,
+        snapshot_validator=validator,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["require_runtime_policy"] is False
+    assert calls[0]["target_module"] == "rocm.prewarm_qwen35_buckets"
+    assert result["status"] == "passed"
+    assert result["git_head"] == "d" * 40
+    assert result["git_tree"] == "e" * 40
+    assert result["source_manifest_sha256"] == "f" * 64
+    assert result["source_file_count"] == 1_087
+    assert result["full_head_tree_validated"] is True
+    assert result["site_initialization_blocked_by_preimport_bootstrap"] is True
+    assert result["launcher_source_role"] == "claimed_launcher_reference"
+    assert result["launcher_environment_names"] == list(
+        prewarm._SOURCE_ENVIRONMENT_NAMES
+    )
+    assert set(result["runtime_sources"]) == {"launcher", "prewarm", "bootstrap"}
+
+
+def test_direct_operational_source_attestation_is_disabled() -> None:
+    with pytest.raises(RuntimeError, match="direct ROCm prewarm is disabled"):
+        prewarm._validated_source_attestation(
+            launcher_required=False,
+            environment={},
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("SKYRL_QWEN35_GIT_HEAD", "0" * 40),
+        ("SKYRL_QWEN35_GIT_WORKTREE_CLEAN", "false"),
+        ("SKYRL_QWEN35_LAUNCHER_SHA256", "0" * 64),
+        ("SKYRL_QWEN35_PREWARM_BLOB_OID", "0" * 40),
+        ("SKYRL_QWEN35_BOOTSTRAP_SHA256", "0" * 64),
+        ("SKYRL_VERIFIED_SOURCE_RUNTIME_POLICY", "false"),
+    ),
+)
+def test_source_attestation_rejects_environment_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    snapshot, environment, manifest = _fake_verified_source_contract(
+        monkeypatch, tmp_path
+    )
+    environment[name] = value
+
+    with pytest.raises(RuntimeError, match="source attestation mismatch"):
+        prewarm._validated_source_attestation(
+            launcher_required=True,
+            repo_root=snapshot,
+            environment=environment,
+            snapshot_validator=lambda **_kwargs: manifest,
+        )
+
+
+def test_source_attestation_rejects_missing_claim_before_snapshot_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot, environment, _manifest = _fake_verified_source_contract(
+        monkeypatch, tmp_path
+    )
+    environment.pop("SKYRL_QWEN35_GIT_TREE")
+
+    with pytest.raises(RuntimeError, match="environment is incomplete"):
+        prewarm._validated_source_attestation(
+            launcher_required=True,
+            repo_root=snapshot,
+            environment=environment,
+            snapshot_validator=lambda **_kwargs: pytest.fail(
+                "validator must not run with incomplete claims"
+            ),
+        )
+
+
+def test_source_attestation_rejects_hardlinked_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot, environment, manifest = _fake_verified_source_contract(
+        monkeypatch, tmp_path
+    )
+    os.link(environment["SKYRL_QWEN35_SOURCE_ARCHIVE_PATH"], tmp_path / "archive-link")
+
+    with pytest.raises(RuntimeError, match="singly linked"):
+        prewarm._validated_source_attestation(
+            launcher_required=True,
+            repo_root=snapshot,
+            environment=environment,
+            snapshot_validator=lambda **_kwargs: manifest,
+        )
+
+
+def test_source_attestation_rejects_runtime_policy_regression(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot, environment, manifest = _fake_verified_source_contract(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(
+        prewarm,
+        "_runtime_isolation_checks",
+        lambda: {
+            "isolated": True,
+            "no_site": False,
+            "dont_write_bytecode": True,
+            "ignore_environment": True,
+            "safe_path": True,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="source attestation mismatch"):
+        prewarm._validated_source_attestation(
+            launcher_required=True,
+            repo_root=snapshot,
+            environment=environment,
+            snapshot_validator=lambda **_kwargs: manifest,
+        )
 
 
 @pytest.mark.parametrize(
@@ -160,6 +392,21 @@ def test_rocm_execution_requires_explicit_safe_contract(
     assert result.returncode == 2
     assert result.stdout == ""
     assert message in result.stderr
+
+
+def test_operational_rocm_cli_requires_verified_launcher_lock(tmp_path: Path) -> None:
+    result = _run(
+        "--execute-rocm",
+        "--allow-gpu",
+        "--model-path",
+        str(tmp_path / "model"),
+        "--output",
+        str(tmp_path / "audit.jsonl"),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "requires the verified launcher lock descriptor" in result.stderr
 
 
 def _exact_environment(monkeypatch: pytest.MonkeyPatch, cache: Path) -> None:
@@ -794,6 +1041,14 @@ def _patch_rocm_execution_for_postflight(
         launcher_lock_fd=None,
     )
 
+    def source_attestation(**_kwargs: object) -> dict[str, object]:
+        order.append("source_attestation")
+        return {"git_head": "a" * 40, "git_worktree_clean": True}
+
+    monkeypatch.setattr(
+        prewarm, "_validated_source_attestation", source_attestation
+    )
+
     monkeypatch.setattr(prewarm, "_validate_stack_and_model", lambda _path: model)
     monkeypatch.setattr(
         prewarm,
@@ -871,10 +1126,12 @@ def test_clean_postflight_follows_compile_and_cache_before_complete(
     assert prewarm._execute(args, output) == 0
 
     assert order == [
+        "source_attestation",
         "boot_preflight",
         "hardware_preflight",
         "bucket_compiled",
         "cache_revalidated",
+        "source_attestation",
         "boot_postflight",
     ]
     records = [json.loads(line) for line in output.getvalue().splitlines()]
@@ -884,9 +1141,88 @@ def test_clean_postflight_follows_compile_and_cache_before_complete(
         "hardware_postflight",
         "complete",
     ]
+    assert records[0]["source_attestation"] == {
+        "git_head": "a" * 40,
+        "git_worktree_clean": True,
+    }
     assert records[-2]["status"] == "clean"
     assert records[-2]["amdgpu_boot_clean"] is True
+    assert records[-2]["source_attestation_revalidated"] is True
+    assert records[-2]["inherited_launcher_lock_validated"] is False
     assert records[-1]["amdgpu_postflight_clean"] is True
+    assert records[-1]["source_attestation_revalidated"] is True
+    assert records[-1]["inherited_launcher_lock_validated"] is False
+
+
+def test_changed_source_attestation_after_compile_fails_before_complete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args, _order = _patch_rocm_execution_for_postflight(
+        monkeypatch, tmp_path, postflight_error=None
+    )
+    source_calls = 0
+
+    def changing_source(**_kwargs: object) -> dict[str, object]:
+        nonlocal source_calls
+        source_calls += 1
+        return {
+            "git_head": "a" * 40,
+            "git_worktree_clean": True,
+            "prewarm_source_sha256": str(source_calls),
+        }
+
+    monkeypatch.setattr(
+        prewarm, "_validated_source_attestation", changing_source
+    )
+    output = StringIO()
+
+    assert prewarm._execute(args, output) == 1
+
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "manifest",
+        "bucket_compiled",
+        "hardware_postflight",
+        "error",
+    ]
+    assert records[-2]["source_attestation_revalidated"] is False
+    assert records[-1]["stage"] == "source_postflight"
+    assert "changed during operational prewarm" in records[-1]["message"]
+    assert not any(record["record_type"] == "complete" for record in records)
+
+
+def test_later_failure_preserves_successful_inherited_lock_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args, _order = _patch_rocm_execution_for_postflight(
+        monkeypatch, tmp_path, postflight_error=None
+    )
+    inherited_lock = tmp_path / "inherited-lock"
+    inherited_lock.mkdir()
+    inherited_fd = os.open(inherited_lock, os.O_RDONLY | os.O_DIRECTORY)
+    args.launcher_lock_fd = inherited_fd
+    monkeypatch.setattr(
+        prewarm,
+        "_validate_inherited_lock",
+        lambda descriptor: descriptor,
+    )
+    monkeypatch.setattr(
+        prewarm,
+        "_run_rocm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("late compile failure")
+        ),
+    )
+    output = StringIO()
+
+    assert prewarm._execute(args, output) == 1
+
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    postflight = next(
+        record for record in records if record["record_type"] == "hardware_postflight"
+    )
+    assert postflight["inherited_launcher_lock_validated"] is True
+    assert records[-1]["stage"] == "rocm_compile_only"
 
 
 def test_fatal_postflight_fails_without_complete_record(
@@ -901,9 +1237,10 @@ def test_fatal_postflight_fails_without_complete_record(
 
     assert prewarm._execute(args, output) == 1
 
-    assert order[-3:] == [
+    assert order[-4:] == [
         "bucket_compiled",
         "cache_revalidated",
+        "source_attestation",
         "boot_postflight",
     ]
     records = [json.loads(line) for line in output.getvalue().splitlines()]
@@ -917,7 +1254,8 @@ def test_fatal_postflight_fails_without_complete_record(
 
 
 @pytest.mark.parametrize(
-    "failure_point", ["snapshot", "jax_import", "backend_setup", "signature"]
+    "failure_point",
+    ["source_attestation", "snapshot", "jax_import", "backend_setup", "signature"],
 )
 def test_tool_wide_postflight_covers_all_gpu_capable_failure_stages(
     monkeypatch: pytest.MonkeyPatch,
@@ -944,7 +1282,25 @@ def test_tool_wide_postflight_covers_all_gpu_capable_failure_stages(
         return {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []}
 
     monkeypatch.setattr(prewarm, "_require_clean_amdgpu_boot", boot_check)
-    if failure_point == "snapshot":
+    monkeypatch.setattr(
+        prewarm,
+        "_validated_source_attestation",
+        lambda **_kwargs: {"git_head": "a" * 40, "git_worktree_clean": True},
+    )
+    if failure_point == "source_attestation":
+        monkeypatch.setattr(
+            prewarm,
+            "_validated_source_attestation",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("source_attestation fault")
+            ),
+        )
+        monkeypatch.setattr(
+            prewarm,
+            "_file_sha256",
+            lambda _path: pytest.fail("source failure fallback must not re-read source"),
+        )
+    elif failure_point == "snapshot":
         monkeypatch.setattr(
             prewarm,
             "_validate_stack_and_model",
@@ -982,17 +1338,34 @@ def test_tool_wide_postflight_covers_all_gpu_capable_failure_stages(
     output = StringIO()
     assert prewarm._execute(args, output) == 1
 
-    assert len(boot_calls) == (1 if failure_point == "snapshot" else 2)
+    assert len(boot_calls) == (
+        0
+        if failure_point == "source_attestation"
+        else 1
+        if failure_point == "snapshot"
+        else 2
+    )
     records = [json.loads(line) for line in output.getvalue().splitlines()]
-    assert [record["record_type"] for record in records] == [
-        "manifest",
-        "hardware_postflight",
-        "error",
-    ]
-    assert records[-2]["operation_succeeded"] is False
-    assert records[-2]["amdgpu_boot_clean"] is True
+    assert [record["record_type"] for record in records] == (
+        ["manifest", "error"]
+        if failure_point == "source_attestation"
+        else ["manifest", "hardware_postflight", "error"]
+    )
+    if failure_point != "source_attestation":
+        assert records[-2]["operation_succeeded"] is False
+        assert records[-2]["amdgpu_boot_clean"] is True
+    else:
+        assert records[0]["source_attestation"]["prewarm_source_sha256"] is None
+        assert (
+            records[0]["source_attestation"]["source_hash_retried_after_failure"]
+            is False
+        )
     assert records[-1]["stage"] == (
-        "static_validation" if failure_point == "snapshot" else "rocm_compile_only"
+        "source_attestation"
+        if failure_point == "source_attestation"
+        else "static_validation"
+        if failure_point == "snapshot"
+        else "rocm_compile_only"
     )
     assert f"{failure_point} fault" in records[-1]["message"]
     assert not any(record["record_type"] == "complete" for record in records)
@@ -1371,9 +1744,9 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     opt_in = 'prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"'
     optimizer_opt_in = 'prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"'
     prewarm_only_opt_in = 'prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"'
-    invocation = "python rocm/prewarm_qwen35_buckets.py"
-    final_journal_gate = "python3 -m rocm.amdgpu_safety >/dev/null"
-    api_exec = "exec uv run --active --no-sync -m skyrl.tinker.api"
+    invocation = "--module rocm.prewarm_qwen35_buckets"
+    final_journal_gate = "if run_amdgpu_safety >/dev/null; then"
+    api_exec = 'exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api'
     assert opt_in in source
     assert optimizer_opt_in in source
     assert prewarm_only_opt_in in source
@@ -1384,6 +1757,51 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     assert "export JAX_COMPILATION_CACHE_EXPECT_PGLE=false" in source
     assert source.count("export JAX_ENABLE_PGLE=") == 1
     assert source.count("export JAX_COMPILATION_CACHE_EXPECT_PGLE=") == 1
+    source_gate = source.index('if [[ -n "$prewarm_buckets" ]]')
+    assert source.index("export JAX_ENABLE_PGLE=false") < source_gate
+    initial_journal_gate = source.index("if ! run_amdgpu_safety >/dev/null; then")
+    assert source_gate < initial_journal_gate
+    assert "/usr/bin/git" in source[source_gate : source.index("run_root=")]
+    assert "/usr/bin/sha256sum" in source[source_gate : source.index("run_root=")]
+    assert "GIT_CONFIG_NOSYSTEM=1" in source
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in source
+    assert "GIT_NO_REPLACE_OBJECTS=1" in source
+    assert "GIT_OPTIONAL_LOCKS=0" in source
+    assert "HOME=/nonexistent" in source
+    assert "XDG_CONFIG_HOME=/nonexistent" in source
+    assert "core.fsmonitor=false" in source
+    assert "core.untrackedCache=false" in source
+    assert "--ignore-submodules=none" in source
+    assert 'export SKYRL_QWEN35_GIT_HEAD="$source_git_head"' in source
+    assert 'export SKYRL_QWEN35_GIT_TREE="$source_git_tree"' in source
+    assert "export SKYRL_QWEN35_GIT_WORKTREE_CLEAN=true" in source
+    assert 'export SKYRL_QWEN35_LAUNCHER_SHA256="$launcher_source_sha256"' in source
+    assert 'export SKYRL_QWEN35_PREWARM_SHA256="$prewarm_source_sha256"' in source
+    assert 'export SKYRL_QWEN35_BOOTSTRAP_SHA256="$bootstrap_source_sha256"' in source
+    assert 'source_blob_oid rocm/start_qwen35.sh 100755' in source
+    assert 'source_blob_oid rocm/prewarm_qwen35_buckets.py 100644' in source
+    assert 'source_blob_oid rocm/verified_source_bootstrap.py 100644' in source
+    assert '"${source_git[@]}" archive' in source
+    assert '--no-same-permissions' in source
+    assert 'source_snapshot="$run_dir/source-head"' in source
+    assert '/usr/bin/python3.12' in source
+    for flag in ("-I", "-S", "-B", "-P"):
+        assert f"    {flag}\n" in source
+    assert '"$source_snapshot/rocm/verified_source_bootstrap.py"' in source
+    assert 'run_verified_source_module rocm.profile_rocm' in source
+    assert 'run_verified_source_module rocm.qwen35_prewarm_handoff' in source
+    assert "source .venv/bin/activate" not in source
+    assert 'runpy.run_path("/dev/stdin"' not in source
+    assert "sys.path.insert(0, sys.argv.pop(1))" in source
+    source_claim_unset = source.index("unset SKYRL_QWEN35_GIT_HEAD")
+    for claim_name in prewarm._SOURCE_ENVIRONMENT_NAMES:
+        assert f"unset {claim_name}" in source
+    final_prewarmer_gate = source.index(
+        "if ((prewarm_status != 0))",
+        source.rindex(final_journal_gate),
+    )
+    assert final_prewarmer_gate < source_claim_unset
+    assert source_claim_unset < source.index(api_exec)
     assert 'if [[ -n "$prewarm_buckets" ]]' in source
     assert "--execute-rocm" in source
     assert "--allow-gpu" in source
@@ -1423,9 +1841,192 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     assert 'amd_device_ids+=("$(<"$card_path/device/device")")' in source
     assert '[[ "${amd_device_ids[0]:-}" != "0x744c" ]]' in source
     assert source.index('[[ "${amd_device_ids[0]:-}" != "0x744c" ]]') < source.index(
-        "python rocm/prepare_jax_cache_dir.py"
+        "run_verified_source_module rocm.prepare_jax_cache_dir"
     )
     subprocess.run(["bash", "-n", str(_LAUNCHER)], check=True)
+
+
+def test_launcher_prewarm_rejects_dirty_source_before_run_directory_or_hardware(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    rocm = repo / "rocm"
+    rocm.mkdir(parents=True)
+    launcher = rocm / "start_qwen35.sh"
+    launcher.write_bytes(_LAUNCHER.read_bytes())
+    launcher.chmod(0o700)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(repo), "add", "--", str(launcher)], check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Source Test",
+            "-c",
+            "user.email=source@example.invalid",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+        check=True,
+    )
+    launcher.write_bytes(launcher.read_bytes() + b"\n# dirty after commit\n")
+    run_root = tmp_path / "runs"
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith("PYTHON") or name in {
+            "__PYVENV_LAUNCHER__",
+            "VIRTUAL_ENV",
+            "VIRTUAL_ENV_PROMPT",
+        }:
+            environment.pop(name)
+    environment.pop("JAX_ENABLE_PGLE", None)
+    environment.pop("JAX_COMPILATION_CACHE_EXPECT_PGLE", None)
+    environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = "64"
+    environment["SKYRL_QWEN35_RUN_ROOT"] = str(run_root)
+
+    result = subprocess.run(
+        [str(launcher), "dirty-source"],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "dirty worktree" in result.stderr
+    assert "AMDGPU" not in result.stderr
+    assert not run_root.exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["PYTHONPATH", "PYTHONWARNINGS", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"],
+)
+def test_launcher_rejects_python_startup_injection_before_run_directory(
+    tmp_path: Path, name: str
+) -> None:
+    environment = os.environ.copy()
+    for inherited in tuple(environment):
+        if inherited.startswith("PYTHON") or inherited in {
+            "__PYVENV_LAUNCHER__",
+            "VIRTUAL_ENV",
+            "VIRTUAL_ENV_PROMPT",
+        }:
+            environment.pop(inherited)
+    environment.pop("JAX_ENABLE_PGLE", None)
+    environment.pop("JAX_COMPILATION_CACHE_EXPECT_PGLE", None)
+    environment[name] = "/tmp/hostile-python-startup"
+    environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = "64"
+    environment["SKYRL_QWEN35_RUN_ROOT"] = str(tmp_path / "runs")
+
+    result = subprocess.run(
+        [str(_LAUNCHER), "injected-python-startup"],
+        cwd=_REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert f"operational prewarm: {name}" in result.stderr
+    assert not (tmp_path / "runs").exists()
+
+
+def test_privileged_launcher_shebang_does_not_execute_bash_env(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "bash-env-ran"
+    bash_env = tmp_path / "bash-env.sh"
+    bash_env.write_text(f"touch {marker}\n", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["BASH_ENV"] = str(bash_env)
+
+    result = subprocess.run(
+        [str(_LAUNCHER), "bash-env-injection"],
+        cwd=_REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "injection variable: BASH_ENV" in result.stderr
+    assert not marker.exists()
+
+
+def test_source_archive_extraction_strips_inherited_tar_options(
+    tmp_path: Path,
+) -> None:
+    payload_root = tmp_path / "payload"
+    payload_root.mkdir()
+    (payload_root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    archive = tmp_path / "source.tar"
+    subprocess.run(
+        [
+            "/usr/bin/env",
+            "-i",
+            "LC_ALL=C",
+            "PATH=/usr/bin:/bin",
+            "/usr/bin/tar",
+            "--create",
+            f"--file={archive}",
+            f"--directory={payload_root}",
+            "tracked.txt",
+        ],
+        check=True,
+    )
+    hostile_environment = os.environ.copy()
+    hostile_environment["TAR_OPTIONS"] = "--definitely-not-a-valid-tar-option"
+    control = tmp_path / "control"
+    control.mkdir()
+    control_result = subprocess.run(
+        [
+            "/usr/bin/tar",
+            "--extract",
+            f"--file={archive}",
+            f"--directory={control}",
+        ],
+        env=hostile_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert control_result.returncode != 0
+
+    destination = tmp_path / "sanitized"
+    destination.mkdir()
+    result = subprocess.run(
+        [
+            "/usr/bin/env",
+            "-i",
+            "LC_ALL=C",
+            "PATH=/usr/bin:/bin",
+            "/usr/bin/tar",
+            "--extract",
+            "--no-same-owner",
+            "--no-same-permissions",
+            f"--file={archive}",
+            f"--directory={destination}",
+        ],
+        env=hostile_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (destination / "tracked.txt").read_text(encoding="utf-8") == "tracked\n"
+    launcher = _LAUNCHER.read_text(encoding="utf-8")
+    assert "LC_ALL=C PATH=/usr/bin:/bin /usr/bin/tar" in launcher
 
 
 @pytest.mark.parametrize(
@@ -1447,7 +2048,7 @@ def test_launcher_optimizer_opt_in_fails_closed_before_hardware_access(
     environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = buckets
 
     result = subprocess.run(
-        ["bash", str(_LAUNCHER), "invalid-opt-in-test"],
+        [str(_LAUNCHER), "invalid-opt-in-test"],
         cwd=_REPO,
         env=environment,
         capture_output=True,
@@ -1480,7 +2081,7 @@ def test_launcher_prewarm_only_fails_closed_before_hardware_access(
     environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = buckets
 
     result = subprocess.run(
-        ["bash", str(_LAUNCHER), "invalid-prewarm-only-test"],
+        [str(_LAUNCHER), "invalid-prewarm-only-test"],
         cwd=_REPO,
         env=environment,
         capture_output=True,
@@ -1514,7 +2115,7 @@ def test_launcher_rejects_conflicting_pgle_environment_before_hardware_access(
     environment["SKYRL_QWEN35_PREWARM_BUCKETS"] = ""
 
     result = subprocess.run(
-        ["bash", str(_LAUNCHER), "invalid-pgle-test"],
+        [str(_LAUNCHER), "invalid-pgle-test"],
         cwd=_REPO,
         env=environment,
         capture_output=True,

@@ -29,6 +29,7 @@ import shlex
 import stat
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from importlib import metadata
@@ -67,10 +68,299 @@ _CACHE_ENVIRONMENT = {
     "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1",
     "JAX_COMPILATION_CACHE_MAX_SIZE": "17179869184",
 }
+_SOURCE_ENVIRONMENT_NAMES = (
+    "SKYRL_QWEN35_GIT_HEAD",
+    "SKYRL_QWEN35_GIT_TREE",
+    "SKYRL_QWEN35_GIT_WORKTREE_CLEAN",
+    "SKYRL_QWEN35_LAUNCHER_BLOB_OID",
+    "SKYRL_QWEN35_LAUNCHER_SHA256",
+    "SKYRL_QWEN35_PREWARM_BLOB_OID",
+    "SKYRL_QWEN35_PREWARM_SHA256",
+    "SKYRL_QWEN35_BOOTSTRAP_BLOB_OID",
+    "SKYRL_QWEN35_BOOTSTRAP_SHA256",
+    "SKYRL_QWEN35_SOURCE_ARCHIVE_PATH",
+    "SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256",
+    "SKYRL_QWEN35_SOURCE_INTERPRETER",
+    "SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS",
+    "SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX",
+    "SKYRL_QWEN35_SOURCE_REPO_ROOT",
+    "SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT",
+    "SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES",
+    "SKYRL_VERIFIED_SOURCE_GIT_HEAD",
+    "SKYRL_VERIFIED_SOURCE_GIT_TREE",
+    "SKYRL_VERIFIED_SOURCE_MANIFEST_SHA256",
+    "SKYRL_VERIFIED_SOURCE_RUNTIME_POLICY",
+    "SKYRL_VERIFIED_SOURCE_SNAPSHOT_ROOT",
+)
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _stable_regular_file_bytes(
+    path: Path, label: str, *, require_private_writes: bool
+) -> tuple[Path, bytes]:
+    """Read one stable inode through O_NOFOLLOW and recheck its path endpoint."""
+    if not path.is_absolute():
+        raise RuntimeError(f"{label} path must be absolute")
+    try:
+        parent = path.parent.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"cannot resolve {label} parent: {error}") from error
+    if parent != path.parent:
+        raise RuntimeError(f"{label} parent path must not contain a symlink")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        parent_descriptor = os.open(
+            parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except OSError as error:
+        raise RuntimeError(f"cannot open {label} parent: {error}") from error
+    try:
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise RuntimeError(f"cannot open {label}: {error}") from error
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or (
+                    require_private_writes
+                    and stat.S_IMODE(before.st_mode) & 0o022
+                )
+            ):
+                raise RuntimeError(
+                    f"{label} must be a stable regular file owned by the current "
+                    "user, singly linked, and not writable by group or other"
+                )
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            endpoint = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            stable_fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+                raise RuntimeError(f"{label} changed while it was being read")
+            if any(getattr(after, field) != getattr(endpoint, field) for field in stable_fields):
+                raise RuntimeError(f"{label} path changed while it was being read")
+            payload = b"".join(chunks)
+            if len(payload) != after.st_size:
+                raise RuntimeError(f"{label} size changed while it was being read")
+            return path, payload
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _file_sha256(path: Path) -> str:
+    resolved = path.resolve(strict=True)
+    _stable_path, payload = _stable_regular_file_bytes(
+        resolved, "source file", require_private_writes=False
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _best_effort_self_hash() -> dict[str, Any]:
+    try:
+        return {"prewarm_source_sha256": _file_sha256(Path(__file__).resolve())}
+    except BaseException as error:
+        return {
+            "prewarm_source_sha256": None,
+            "prewarm_source_hash_error_type": type(error).__name__,
+            "prewarm_source_hash_error": str(error),
+        }
+
+
+def _validated_source_file(path: Path, label: str) -> tuple[Path, str]:
+    resolved, payload = _stable_regular_file_bytes(
+        path, label, require_private_writes=True
+    )
+    return resolved, hashlib.sha256(payload).hexdigest()
+
+
+def _runtime_isolation_checks() -> dict[str, bool]:
+    return {
+        "isolated": sys.flags.isolated == 1,
+        "no_site": sys.flags.no_site == 1,
+        "dont_write_bytecode": sys.flags.dont_write_bytecode == 1,
+        "ignore_environment": sys.flags.ignore_environment == 1,
+        "safe_path": bool(sys.flags.safe_path),
+    }
+
+
+def _validated_source_attestation(
+    *,
+    launcher_required: bool,
+    repo_root: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    snapshot_validator: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Revalidate the private full-HEAD snapshot selected before Python imports."""
+    if not launcher_required:
+        raise RuntimeError(
+            "operational direct ROCm prewarm is disabled; use start_qwen35.sh"
+        )
+    observed = os.environ if environment is None else environment
+    missing = [name for name in _SOURCE_ENVIRONMENT_NAMES if name not in observed]
+    if missing:
+        raise RuntimeError(f"verified source environment is incomplete: {missing!r}")
+
+    snapshot_root = (
+        Path(observed["SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT"])
+        if repo_root is None
+        else repo_root
+    )
+    try:
+        snapshot_root = snapshot_root.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"cannot resolve verified source snapshot: {error}") from error
+    loaded_root = Path(__file__).resolve(strict=True).parents[1]
+    if repo_root is None and loaded_root != snapshot_root:
+        raise RuntimeError("prewarm module was not loaded from the claimed source snapshot")
+
+    if snapshot_validator is None:
+        from rocm.verified_source_bootstrap import validate_snapshot
+
+        snapshot_validator = validate_snapshot
+    manifest = snapshot_validator(
+        repo_root=Path(observed["SKYRL_QWEN35_SOURCE_REPO_ROOT"]),
+        git_head=observed["SKYRL_QWEN35_GIT_HEAD"],
+        snapshot_root=snapshot_root,
+        venv_site_packages=Path(
+            observed["SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES"]
+        ),
+        target_module="rocm.prewarm_qwen35_buckets",
+        require_runtime_policy=False,
+    )
+    if manifest.get("status") != "passed":
+        raise RuntimeError("verified source snapshot did not return passed status")
+    file_records = {
+        record["path"]: record
+        for record in manifest.get("files", [])
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    }
+    required_records = {
+        "launcher": file_records.get("rocm/start_qwen35.sh"),
+        "prewarm": file_records.get("rocm/prewarm_qwen35_buckets.py"),
+        "bootstrap": file_records.get("rocm/verified_source_bootstrap.py"),
+    }
+    if any(record is None for record in required_records.values()):
+        raise RuntimeError("verified source manifest omits a required runtime source")
+
+    archive_path = Path(observed["SKYRL_QWEN35_SOURCE_ARCHIVE_PATH"])
+    expected_archive_path = snapshot_root.parent / "source-head.tar"
+    if archive_path != expected_archive_path:
+        raise RuntimeError("source archive path does not match the private run snapshot")
+    _archive_path, archive_sha256 = _validated_source_file(
+        archive_path, "source archive"
+    )
+    if sys.pycache_prefix is None:
+        raise RuntimeError("verified source interpreter has no pycache prefix")
+    pycache_prefix = Path(sys.pycache_prefix)
+    try:
+        pycache_metadata = pycache_prefix.lstat()
+        pycache_resolved = pycache_prefix.resolve(strict=True)
+        pycache_entries = list(os.scandir(pycache_prefix))
+    except OSError as error:
+        raise RuntimeError(f"cannot validate private pycache prefix: {error}") from error
+    if (
+        pycache_resolved != pycache_prefix
+        or stat.S_ISLNK(pycache_metadata.st_mode)
+        or not stat.S_ISDIR(pycache_metadata.st_mode)
+        or pycache_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(pycache_metadata.st_mode) != 0o700
+        or pycache_entries
+    ):
+        raise RuntimeError("verified source pycache prefix must remain empty and mode 0700")
+
+    assert required_records["launcher"] is not None
+    assert required_records["prewarm"] is not None
+    assert required_records["bootstrap"] is not None
+    expected_claims = {
+        "SKYRL_QWEN35_GIT_HEAD": manifest["git_head"],
+        "SKYRL_QWEN35_GIT_TREE": manifest["git_tree"],
+        "SKYRL_QWEN35_GIT_WORKTREE_CLEAN": "true",
+        "SKYRL_QWEN35_LAUNCHER_BLOB_OID": required_records["launcher"]["git_oid"],
+        "SKYRL_QWEN35_LAUNCHER_SHA256": required_records["launcher"]["sha256"],
+        "SKYRL_QWEN35_PREWARM_BLOB_OID": required_records["prewarm"]["git_oid"],
+        "SKYRL_QWEN35_PREWARM_SHA256": required_records["prewarm"]["sha256"],
+        "SKYRL_QWEN35_BOOTSTRAP_BLOB_OID": required_records["bootstrap"]["git_oid"],
+        "SKYRL_QWEN35_BOOTSTRAP_SHA256": required_records["bootstrap"]["sha256"],
+        "SKYRL_QWEN35_SOURCE_ARCHIVE_PATH": str(archive_path),
+        "SKYRL_QWEN35_SOURCE_ARCHIVE_SHA256": archive_sha256,
+        "SKYRL_QWEN35_SOURCE_INTERPRETER": sys.executable,
+        "SKYRL_QWEN35_SOURCE_INTERPRETER_FLAGS": "-I,-S,-B,-P",
+        "SKYRL_QWEN35_SOURCE_PYCACHE_PREFIX": str(pycache_prefix),
+        "SKYRL_QWEN35_SOURCE_REPO_ROOT": manifest["original_repo_root"],
+        "SKYRL_QWEN35_SOURCE_SNAPSHOT_ROOT": manifest["snapshot_root"],
+        "SKYRL_QWEN35_SOURCE_VENV_SITE_PACKAGES": manifest["venv_site_packages"],
+        "SKYRL_VERIFIED_SOURCE_GIT_HEAD": manifest["git_head"],
+        "SKYRL_VERIFIED_SOURCE_GIT_TREE": manifest["git_tree"],
+        "SKYRL_VERIFIED_SOURCE_MANIFEST_SHA256": manifest[
+            "source_manifest_sha256"
+        ],
+        "SKYRL_VERIFIED_SOURCE_RUNTIME_POLICY": "true",
+        "SKYRL_VERIFIED_SOURCE_SNAPSHOT_ROOT": manifest["snapshot_root"],
+    }
+    mismatches = {
+        name: {"expected": expected, "observed": observed.get(name)}
+        for name, expected in expected_claims.items()
+        if observed.get(name) != expected
+    }
+    runtime_checks = _runtime_isolation_checks()
+    if mismatches or not all(runtime_checks.values()):
+        raise RuntimeError(
+            "launcher/bootstrap source attestation mismatch: "
+            f"claims={mismatches!r}, runtime={runtime_checks!r}"
+        )
+    return {
+        "status": "passed",
+        "repo_root": manifest["original_repo_root"],
+        "git_head": manifest["git_head"],
+        "git_tree": manifest["git_tree"],
+        "git_object_format": manifest["git_object_format"],
+        "git_worktree_clean": True,
+        "source_snapshot_root": manifest["snapshot_root"],
+        "source_manifest_sha256": manifest["source_manifest_sha256"],
+        "source_file_count": manifest["file_count"],
+        "source_total_bytes": manifest["total_source_bytes"],
+        "source_archive_path": str(archive_path),
+        "source_archive_sha256": archive_sha256,
+        "runtime_sources": required_records,
+        "interpreter": sys.executable,
+        "interpreter_flags": "-I,-S,-B,-P",
+        "interpreter_runtime_checks": runtime_checks,
+        "pycache_prefix": str(pycache_prefix),
+        "venv_site_packages": manifest["venv_site_packages"],
+        "site_initialization_blocked_by_preimport_bootstrap": True,
+        "full_head_tree_validated": True,
+        "launcher_lock_fd_claim_present": True,
+        "launcher_source_role": "claimed_launcher_reference",
+        "launcher_environment_names": list(_SOURCE_ENVIRONMENT_NAMES),
+        "launcher_environment_match": True,
+        "threat_model_excludes": manifest["threat_model_excludes"],
+        "dependency_integrity_limit": (
+            "virtualenv dependency versions are pinned separately, but dependency "
+            "file bytes are not part of this source manifest"
+        ),
+    }
 
 
 def _require_clean_amdgpu_boot() -> dict[str, Any]:
@@ -210,6 +500,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.output is not None and args.output.exists():
         parser.error(f"refusing to overwrite existing output: {args.output}")
+    if args.execute_rocm and args.launcher_lock_fd is None:
+        parser.error(
+            "operational ROCm prewarm requires the verified launcher lock descriptor"
+        )
     return args
 
 
@@ -987,6 +1281,28 @@ def _run_rocm(
 
 
 def _execute(args: argparse.Namespace, output: TextIO) -> int:
+    source_attestation: dict[str, Any]
+    source_error: BaseException | None = None
+    if args.execute_rocm:
+        try:
+            source_attestation = _validated_source_attestation(
+                launcher_required=args.launcher_lock_fd is not None
+            )
+        except BaseException as error:
+            source_error = error
+            source_attestation = {
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "prewarm_source_sha256": None,
+                "source_hash_retried_after_failure": False,
+            }
+    else:
+        source_attestation = {
+            "status": "cpu_plan_only_self_hash",
+            "launcher_lock_fd_claim_present": False,
+            **_best_effort_self_hash(),
+        }
     _emit(
         {
             "record_type": "manifest",
@@ -1005,6 +1321,7 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             "optimizer_step_invocations": 0,
             "executable_export_used": False,
             "graph_api_used": False,
+            "source_attestation": source_attestation,
         },
         output,
     )
@@ -1025,20 +1342,37 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             output,
         )
         return 0
+    if source_error is not None:
+        _emit(
+            {
+                "record_type": "error",
+                "timestamp": _utc_now(),
+                "stage": "source_attestation",
+                "error_type": type(source_error).__name__,
+                "message": str(source_error),
+                "compiled_callable_invocations": 0,
+                "optimizer_step_invocations": 0,
+                "status": "failed",
+            },
+            output,
+        )
+        return 1
 
     lock_fd = None
     stage = "static_validation"
     failure_stage = stage
     primary_error: BaseException | None = None
+    source_attestation_revalidated = False
+    inherited_launcher_lock_validated = False
     try:
         try:
             model_path = _validate_stack_and_model(args.model_path)
             stage = "global_lock"
-            lock_fd = (
-                compile_probe._acquire_global_lock()
-                if args.launcher_lock_fd is None
-                else _validate_inherited_lock(args.launcher_lock_fd)
-            )
+            if args.launcher_lock_fd is None:
+                lock_fd = compile_probe._acquire_global_lock()
+            else:
+                lock_fd = _validate_inherited_lock(args.launcher_lock_fd)
+                inherited_launcher_lock_validated = True
             stage = "hardware_preflight"
             hardware = {
                 **_require_clean_amdgpu_boot(),
@@ -1064,6 +1398,15 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 raise RuntimeError(
                     "compile-only bucket stage returned a nonzero status"
                 )
+            stage = "source_postflight"
+            final_source_attestation = _validated_source_attestation(
+                launcher_required=args.launcher_lock_fd is not None
+            )
+            if final_source_attestation != source_attestation:
+                raise RuntimeError(
+                    "runtime source attestation changed during operational prewarm"
+                )
+            source_attestation_revalidated = True
         except BaseException as error:
             failure_stage = stage
             primary_error = error
@@ -1114,6 +1457,10 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 "timestamp": _utc_now(),
                 "status": "clean",
                 "operation_succeeded": primary_error is None,
+                "source_attestation_revalidated": source_attestation_revalidated,
+                "inherited_launcher_lock_validated": (
+                    inherited_launcher_lock_validated
+                ),
                 **postflight,
                 "model_pass_executable_invocations": 0,
                 "optimizer_step_invocations": 0,
@@ -1148,6 +1495,10 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 "optimizer_compile_calls": 1 if args.compile_optimizer else 0,
                 "cache_revalidated_after_each_compile": True,
                 "amdgpu_postflight_clean": True,
+                "source_attestation_revalidated": True,
+                "inherited_launcher_lock_validated": (
+                    inherited_launcher_lock_validated
+                ),
                 "status": "passed",
                 "model_pass_executable_invocations": 0,
                 "optimizer_step_invocations": 0,

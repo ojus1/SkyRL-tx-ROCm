@@ -765,7 +765,7 @@ def test_launcher_rejects_invalid_long_timeout_before_hardware_access(
     environment["SKYRL_QWEN35_RUN_ROOT"] = str(run_root)
 
     result = subprocess.run(
-        ["bash", str(_LAUNCHER), "invalid-timeout"],
+        [str(_LAUNCHER), "invalid-timeout"],
         cwd=_REPO,
         env=environment,
         capture_output=True,
@@ -781,12 +781,12 @@ def test_launcher_rejects_invalid_long_timeout_before_hardware_access(
 
 def test_launcher_profiles_then_always_settles_before_final_journal_and_api() -> None:
     source = _LAUNCHER.read_text(encoding="utf-8")
-    capture = "python rocm/qwen35_prewarm_handoff.py capture"
-    profiler = "python rocm/profile_rocm.py"
-    child = "python rocm/prewarm_qwen35_buckets.py"
-    settle = "python rocm/qwen35_prewarm_handoff.py settle"
-    final_journal = "python3 -m rocm.amdgpu_safety >/dev/null"
-    api = "exec uv run --active --no-sync -m skyrl.tinker.api"
+    capture = "run_verified_source_module rocm.qwen35_prewarm_handoff capture"
+    profiler = "run_verified_source_module rocm.profile_rocm"
+    child = "--module rocm.prewarm_qwen35_buckets"
+    settle = "run_verified_source_module rocm.qwen35_prewarm_handoff settle"
+    final_journal = "if run_amdgpu_safety >/dev/null; then"
+    api = 'exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api'
 
     assert source.index(capture) < source.index(profiler) < source.index(child)
     cleanup_definition = source.index("finish_prewarm_once()")
@@ -839,7 +839,7 @@ def test_launcher_profiles_then_always_settles_before_final_journal_and_api() ->
 def _prewarm_trap_harness(tmp_path: Path) -> tuple[Path, Path]:
     source = _LAUNCHER.read_text(encoding="utf-8")
     start = source.index("prewarm_status=0\n")
-    end = source.index("\nexec uv run --active", start)
+    end = source.index('\nexec "$uv_executable" run --active', start)
     production_block = source[start:end]
     events = tmp_path / "events.txt"
     harness = tmp_path / "prewarm-trap-harness.sh"
@@ -857,11 +857,13 @@ SKYRL_ROCM_PALLAS_ATTENTION=0
 model_path=/mock/qwen35
 amd_card_names=(card1)
 exec {launch_lock_fd}</dev/null
+verified_python=(/mock/verified-python)
 
-python() {
-  local script="$1"
-  if [[ "$script" == "rocm/qwen35_prewarm_handoff.py" ]]; then
-    if [[ "$2" == "capture" ]]; then
+run_verified_source_module() {
+  local module="$1"
+  shift
+  if [[ "$module" == "rocm.qwen35_prewarm_handoff" ]]; then
+    if [[ "$1" == "capture" ]]; then
       printf 'capture\n' >>"$events"
       return 0
     fi
@@ -869,7 +871,7 @@ python() {
     sleep "${FAKE_SETTLE_DELAY:-0}"
     return "${FAKE_SETTLE_STATUS:-0}"
   fi
-  if [[ "$script" == "rocm/profile_rocm.py" ]]; then
+  if [[ "$module" == "rocm.profile_rocm" ]]; then
     printf 'profile_start\n' >>"$events"
     case "${FAKE_PROFILE_MODE:-exit0}" in
       exit0) printf 'profile_exit\n' >>"$events"; return 0 ;;
@@ -885,7 +887,7 @@ python() {
   return 98
 }
 
-python3() {
+run_amdgpu_safety() {
   printf 'journal\n' >>"$events"
   sleep "${FAKE_JOURNAL_DELAY:-0}"
   return "${FAKE_JOURNAL_STATUS:-0}"

@@ -221,7 +221,9 @@ def test_cache_setup_precedes_backend_start_and_graphs_remain_disabled() -> None
     )
     pgle_disable = source.index("export JAX_ENABLE_PGLE=false")
     pgle_cache_disable = source.index("export JAX_COMPILATION_CACHE_EXPECT_PGLE=false")
-    backend_start = source.index("exec uv run --active --no-sync -m skyrl.tinker.api")
+    backend_start = source.index(
+        'exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api'
+    )
     assert pgle_disable < command_buffer_disable < backend_start
     assert pgle_cache_disable < command_buffer_disable < backend_start
     assert cache_export < command_buffer_disable < backend_start
