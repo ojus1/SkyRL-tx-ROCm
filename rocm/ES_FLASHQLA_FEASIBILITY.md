@@ -335,7 +335,28 @@ on SM90/SM100 (SM120 is forward-only). That maps to the local three-stage plan:
 2. bounded state/output execution with native Q-head to V-head grouping; and
 3. explicit reverse-superblock recomputation/custom VJP.
 
-The CPU semantic and compiler evidence for that AMD-specific boundary is in
+Commit `f3f711d4` adds an import-light CPU gate for the previously unresolved
+representation change. `gdn_forward_oracle.py` independently evaluates the
+token recurrence, FlashQLA's no-decay KKT inverse followed by its decayed
+`Ag`, and SkyRL's decay-folded U/W triangular solve. It proves the two chunk
+representations are related by diagonal decay conjugation and produce the same
+output and final state.
+
+The exact Qwen `Hk=16`, `Hv=32`, `Dk=Dv=128` cases passed at S=64 and S=128
+with nonzero initial state, and right-padding boundaries 63/64/65 passed with
+native `hv -> hv // 2` grouping. Across the exact-geometry tests, worst
+absolute and relative drift from the direct recurrence were respectively
+`4.47e-8` and `5.2914e-7`; an additional 72-case CPU stress matrix had worst
+absolute drift `4.10e-8`. Ten committed tests passed, the default import loaded
+no JAX, JAXlib, PyTorch, or TileLang, and no accelerator was used. The oracle
+and test SHA-256 values are
+`1a6394e24ec2dc2cc5481569e92b3eb5f75c2f001c19cea68c8de531edffe87f`
+and `5f2a8d994c9d291dbf62cde6da66787a89f4cb7e6192597857facf19cc400567`.
+
+This clears FP32 forward algebra for a source-level adaptation; it does not
+validate BF16 storage or scheduling, HIP numerics, FlashQLA's analytic
+backward, or an integrated custom VJP. The wider CPU semantic and compiler
+evidence for the AMD-specific boundary remains in
 [`GDN_SUPERBLOCK.md`](GDN_SUPERBLOCK.md). At 32K it removes a full-sequence
 temporary-growth term in the CPU compiler estimate; at 512/1,024 its portable
 automatic VJP is worse, so the oracle must not be wired as a production
