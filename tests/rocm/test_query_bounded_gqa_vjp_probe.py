@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import hashlib
 import importlib.util
 import inspect
@@ -77,6 +78,11 @@ def test_default_is_abstract_refusal_without_accelerator_import():
         (("--replay",), "unrecognized arguments"),
         (("--padding",), "unrecognized arguments"),
         (("--second-vjp",), "unrecognized arguments"),
+        (("--compile-diagnostic",), "only valid with --platform rocm"),
+        (
+            ("--platform", "rocm", "--compile-diagnostic"),
+            "requires the explicit --allow-gpu",
+        ),
     ],
 )
 def test_parser_refuses_implicit_gpu_and_scope_broadening(arguments, message, capsys):
@@ -92,6 +98,31 @@ def test_private_output_is_exclusive_mode_0600(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with pytest.raises(SystemExit):
         _PROBE._parse_args(["--output", str(path)])
+
+
+def test_compile_diagnostic_requires_full_rocm_acknowledgement_and_private_output(
+    tmp_path,
+):
+    path = tmp_path / "compile-diagnostic.jsonl"
+    args = _PROBE._parse_args(
+        [
+            "--platform",
+            "rocm",
+            "--allow-gpu",
+            "--compile-diagnostic",
+            "--output",
+            str(path),
+        ]
+    )
+    assert args.platform == "rocm"
+    assert args.allow_gpu is True
+    assert args.compile_diagnostic is True
+    assert args.output == path
+    contract = _PROBE._compile_diagnostic_contract()
+    assert contract["checked_capability_creation_or_release_authorized"] is False
+    assert contract["host_reference_construction_authorized"] is False
+    assert contract["executable_invocation_authorized"] is False
+    assert contract["always_stop_after_compile_and_postflight"] is True
 
 
 def test_exact_contract_fixes_shape_dispatch_memory_and_numerical_gates():
@@ -126,7 +157,11 @@ def test_exact_contract_fixes_shape_dispatch_memory_and_numerical_gates():
         "dkdv": 1,
     }
     assert contract["compile_gate"]["exact_total_custom_calls"] == 3
-    assert contract["compile_gate"]["sole_target"] == _TARGET
+    assert contract["compile_gate"]["sole_target_is_exact_rocm_triton"] is True
+    assert (
+        contract["compile_gate"]["sole_target_sha256"]
+        == hashlib.sha256(_TARGET.encode()).hexdigest()
+    )
     assert (
         contract["compile_gate"]["all_calls_directly_owned_by_sole_entry_computation"]
         is True
@@ -456,6 +491,52 @@ def test_strict_ir_accepts_exact_three_calls_metadata_and_target(dialect):
 
 
 @pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_raw_quote_first_lexing_ignores_escaped_quotes_braces_and_call_lookalikes(
+    dialect,
+):
+    payload = (
+        r"prefix \22 { custom-call( stablehlo.custom_call func.call ENTRY } suffix"
+    )
+    if dialect == "stablehlo":
+        text = _stablehlo_calls().replace(
+            "() : () -> tensor<1xbf16>",
+            f'() {{backend_config = "{payload}"}} : () -> tensor<1xbf16>',
+        )
+    else:
+        text = f'HloModule quoted_spoof, config="{payload}"\n' + _optimized_hlo_calls()
+    summary = _PROBE._strict_vjp_ir_summary(text, dialect)
+    assert summary["passed"] is True
+    lexing = summary["quote_lexing_diagnostic"]
+    assert lexing["syntax_was_lexed_before_local_escape_decoding"] is True
+    assert lexing["raw_unquoted_custom_call_count"] == 3
+    assert lexing["decoded_then_masked_custom_call_count_diagnostic_only"] != 3
+    assert lexing["raw_mlir_hex_quote_escape_count"] > 0
+    assert lexing["raw_quote_scan_passed"] is True
+    serialized = json.dumps(summary)
+    assert payload not in serialized
+    assert "quoted_spoof" not in serialized
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        'HloModule broken, config="unterminated\n',
+        'HloModule broken, config="bad \\q escape"\n',
+    ),
+)
+def test_optimized_quote_scanner_fails_closed_on_unterminated_or_unknown_escape(
+    corrupt,
+):
+    summary = _PROBE._strict_vjp_ir_summary(
+        corrupt + _optimized_hlo_calls(), "optimized_hlo"
+    )
+    assert summary["passed"] is False
+    ownership = summary["entry_call_ownership"]
+    assert ownership["raw_quote_scan"]["passed"] is False
+    assert ownership["checks"]["raw_quote_escapes_are_well_formed"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
 @pytest.mark.parametrize("main_invocations", (0, 2))
 def test_strict_ir_rejects_unreachable_or_repeated_helper_owned_calls(
     dialect, main_invocations
@@ -465,6 +546,130 @@ def test_strict_ir_rejects_unreachable_or_repeated_helper_owned_calls(
     )
     assert summary["custom_call_count"] == 3
     assert summary["entry_call_ownership"]["direct_entry_custom_call_count"] == 0
+    helper = next(
+        item
+        for item in summary["entry_call_ownership"]["computations"]
+        if item["is_entry"] is False
+    )
+    assert helper["saturated_entry_multiplicity"] == (
+        0 if main_invocations == 0 else ">1"
+    )
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_helper_called_once_is_reported_once_but_runtime_direct_entry_gate_rejects(
+    dialect,
+):
+    summary = _PROBE._strict_vjp_ir_summary(
+        _helper_owned_calls(dialect, main_invocations=1), dialect
+    )
+    ownership = summary["entry_call_ownership"]
+    helper = next(
+        item for item in ownership["computations"] if item["is_entry"] is False
+    )
+    assert helper["reachable_from_entry"] is True
+    assert helper["saturated_entry_multiplicity"] == 1
+    assert ownership["direct_entry_custom_call_count"] == 0
+    assert summary["passed"] is False
+    serialized = json.dumps(summary)
+    assert "helper" not in serialized
+    assert _TARGET not in serialized
+
+
+def _cyclic_helper_owned_calls(dialect: str) -> str:
+    text = _helper_owned_calls(dialect, main_invocations=1)
+    if dialect == "stablehlo":
+        return text.replace(
+            "  func.func private @helper() {",
+            "  func.func private @helper() {\n    func.call @helper() : () -> ()",
+            1,
+        )
+    return text.replace(
+        "helper {",
+        "helper {\n  %recursive = () call(), to_apply=%helper",
+        1,
+    )
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_reachable_recursive_helper_is_cycle_unknown_and_rejected(dialect):
+    summary = _PROBE._strict_vjp_ir_summary(
+        _cyclic_helper_owned_calls(dialect), dialect
+    )
+    ownership = summary["entry_call_ownership"]
+    assert ownership["entry_multiplicity"]["cycle_detected"] is True
+    helper = next(
+        item for item in ownership["computations"] if item["is_entry"] is False
+    )
+    assert helper["saturated_entry_multiplicity"] == "unknown"
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_direct_custom_call_with_called_computation_is_unknown_and_rejected(dialect):
+    if dialect == "stablehlo":
+        text = (
+            _stablehlo_calls()
+            .replace(
+                "module {",
+                "module {\n  func.func private @helper() { return }",
+                1,
+            )
+            .replace(
+                f'@"{_TARGET}"()',
+                f'@"{_TARGET}"() {{called_computations = [@helper]}}',
+                1,
+            )
+        )
+    else:
+        lines = _optimized_hlo_calls().splitlines()
+        lines[1] += ", called_computations={%helper}"
+        text = "\n".join(
+            [
+                "HloModule called_custom",
+                "helper {",
+                "  ROOT %helper_root = () tuple()",
+                "}",
+                *lines,
+            ]
+        )
+    summary = _PROBE._strict_vjp_ir_summary(text, dialect)
+    ownership = summary["entry_call_ownership"]
+    assert (
+        ownership["calls"][0]["has_nonempty_or_malformed_called_computations"] is True
+    )
+    assert ownership["forbidden_container_count"] > 0
+    helper = next(
+        item for item in ownership["computations"] if item["is_entry"] is False
+    )
+    assert helper["saturated_entry_multiplicity"] == "unknown"
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        "%wrapped = () conditional(), branch_computations={%helper}",
+        "%wrapped = () while(), condition=%helper, body=%helper",
+        "%wrapped = () async-start(), calls={%helper}",
+        "%wrapped = () async-start(), calls=%helper",
+        "%wrapped = () mystery(), to_apply=%helper",
+    ),
+)
+def test_optimized_conditional_loop_async_and_unknown_wrappers_are_unknown_rejected(
+    instruction,
+):
+    text = _helper_owned_calls("optimized_hlo", main_invocations=0).replace(
+        "ENTRY main {", f"ENTRY main {{\n  {instruction}", 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["forbidden_container_count"] > 0
+    helper = next(
+        item for item in ownership["computations"] if item["is_entry"] is False
+    )
+    assert helper["saturated_entry_multiplicity"] == "unknown"
     assert summary["passed"] is False
 
 
@@ -518,6 +723,17 @@ def test_strict_ir_rejects_target_marker_count_while_and_duplicate_metadata(
         )
     )
     assert _PROBE._strict_vjp_ir_summary(text, dialect)["passed"] is False
+
+
+def test_optimized_target_nested_only_in_backend_config_cannot_spoof_top_level_target():
+    forged = _optimized_hlo_calls().replace(
+        f'custom_call_target="{_TARGET}"',
+        f'backend_config={{custom_call_target="{_TARGET}"}}',
+    )
+    summary = _PROBE._strict_vjp_ir_summary(forged, "optimized_hlo")
+    assert summary["custom_call_count"] == 3
+    assert all(call["target_count"] == 0 for call in summary["calls"])
+    assert summary["passed"] is False
 
 
 def test_structural_gate_requires_both_dialects():
@@ -630,7 +846,7 @@ def test_compile_mock_uses_explicit_scale_three_calls_and_releases_without_invoc
         return arguments[0]
 
     counters = _PROBE._zero_counters()
-    checked, report = _PROBE._compile_checked_vjp(
+    compiled_artifact, report = _PROBE._compile_vjp_artifact(
         _JaxFake(state, lowered),
         SimpleNamespace(bfloat16="bf16", int32="i32"),
         api,
@@ -638,6 +854,7 @@ def test_compile_mock_uses_explicit_scale_three_calls_and_releases_without_invoc
         counters,
         io.StringIO(),
     )
+    checked = _PROBE._release_checked_vjp(compiled_artifact, report, counters)
     assert checked.proof["passed"] is True
     assert state["lower_calls"] == state["compile_calls"] == 1
     assert state["compiled_invocations"] == 0
@@ -779,6 +996,87 @@ def test_nonfinite_candidate_duration_serializes_dispatch_then_fails_validation(
     assert validation["gates"]["promotion_duration_passed"] is False
 
 
+def test_compile_diagnostic_destroys_unreleased_artifact_with_all_runtime_counters_zero(
+    monkeypatch,
+):
+    state = {"invocations": 0, "destroyed": 0}
+
+    class NeverCallable:
+        def __call__(self, *_arguments):
+            state["invocations"] += 1
+            raise AssertionError("compile diagnostic invoked compiled executable")
+
+        def __del__(self):
+            state["destroyed"] += 1
+
+    def compile_artifact(_jax, _jnp, _api, _clean, counters, _output):
+        for name in (
+            "lower_attempts",
+            "lower_completions",
+            "compile_attempts",
+            "compile_completions",
+        ):
+            counters[name] += 1
+        return NeverCallable(), {
+            "structural_gate": {"passed": True},
+            "compiled_memory_gate": {"passed": True},
+            "release_gate": {"passed": True},
+        }
+
+    monkeypatch.setattr(_PROBE, "_compile_vjp_artifact", compile_artifact)
+    for forbidden in (
+        "_release_checked_vjp",
+        "_construct_host_case",
+        "_device_put_inputs",
+        "_dispatch_candidate",
+        "_device_get_candidate",
+    ):
+        monkeypatch.setattr(
+            _PROBE,
+            forbidden,
+            lambda *_args, _name=forbidden, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"compile diagnostic reached {_name}")
+            ),
+        )
+    counters = _PROBE._zero_counters()
+    output = io.StringIO()
+    result = _PROBE._run_compile_diagnostic(
+        object(),
+        object(),
+        lambda *_args, **_kwargs: None,
+        lambda: dict(_CLEAN),
+        counters,
+        output,
+    )
+    gc.collect()
+    assert result == 0
+    assert state == {"invocations": 0, "destroyed": 1}
+    assert counters == _PROBE._compile_diagnostic_completed_counters()
+    for name in (
+        "input_device_put_attempts",
+        "input_device_put_completions",
+        "candidate_attempts",
+        "candidate_completions",
+        "device_get_attempts",
+        "device_get_completions",
+        "lowered_callable_invocations",
+        "checked_executable_invocations",
+        "checked_capability_release_attempts",
+        "checked_capability_release_completions",
+        "host_reference_construction_attempts",
+        "host_reference_construction_completions",
+    ):
+        assert counters[name] == 0
+    [record] = _records(output)
+    assert record["record_type"] == "compile_diagnostic_completed"
+    assert record["status"] == "structure_and_memory_passed_no_release"
+    assert record["checked_capability_created_or_released"] is False
+    assert record["host_reference_constructed"] is False
+    assert record["host_or_device_inputs_constructed"] is False
+    assert record["executable_invoked"] is False
+    assert record["device_output_retrieved"] is False
+
+
 def test_fake_run_rocm_executes_one_put_one_checked_call_one_get_and_exact_counters(
     monkeypatch,
 ):
@@ -798,7 +1096,7 @@ def test_fake_run_rocm_executes_one_put_one_checked_call_one_get_and_exact_count
         ):
             counters[name] = 1
         return (
-            _PROBE._wrap_checked(_CompiledFake(state), {"passed": True}, counters),
+            _CompiledFake(state),
             {
                 "release_gate": {"passed": True},
                 "compiled_memory_gate": {"passed": True},
@@ -868,7 +1166,7 @@ def test_fake_run_rocm_executes_one_put_one_checked_call_one_get_and_exact_count
         lambda: {"passed": True, "architecture": "gfx1100"},
     )
     monkeypatch.setattr(_PROBE, "_assert_kernel_binding", lambda _api: {"passed": True})
-    monkeypatch.setattr(_PROBE, "_compile_checked_vjp", compile_checked)
+    monkeypatch.setattr(_PROBE, "_compile_vjp_artifact", compile_checked)
     monkeypatch.setattr(_PROBE, "_journal_checkpoint", checkpoint)
     monkeypatch.setattr(
         _PROBE,
@@ -929,7 +1227,7 @@ def test_ast_proves_lazy_import_one_compile_one_vjp_and_one_checked_execution():
         for alias in node.names
     }
     assert {"jax", "jaxlib", "numpy", "ml_dtypes", "skyrl"}.isdisjoint(roots)
-    compile_source = inspect.getsource(_PROBE._compile_checked_vjp)
+    compile_source = inspect.getsource(_PROBE._compile_vjp_artifact)
     assert compile_source.count("jax.vjp(") == 1
     assert compile_source.count(".lower(") == 1
     assert compile_source.count("lowered.compile(") == 1
@@ -944,6 +1242,17 @@ def test_ast_proves_lazy_import_one_compile_one_vjp_and_one_checked_execution():
     assert run_source.count("_device_put_inputs(") == 1
     assert run_source.count("_device_get_candidate(") == 1
     assert "if counters != _completed_counters():" in run_source
+    diagnostic_source = inspect.getsource(_PROBE._run_compile_diagnostic)
+    for forbidden in (
+        "_wrap_checked",
+        "_CheckedVjpExecutable",
+        "_release_checked_vjp",
+        "_construct_host_case",
+        "_device_put_inputs",
+        "_dispatch_candidate",
+        "_device_get_candidate",
+    ):
+        assert forbidden not in diagnostic_source
     execute_source = inspect.getsource(_PROBE._execute)
     assert execute_source.index("_load_safety_helpers") < execute_source.index(
         "_configure_rocm_environment"

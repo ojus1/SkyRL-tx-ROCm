@@ -11,6 +11,11 @@ ROCm Triton call, canonical query metadata, no extra custom call, callable
 container, or outer while, and exact compiled-memory bounds.  The capability
 is consumed by one invocation only.
 
+``--compile-diagnostic`` is a separate compile-only authorization.  It emits
+sanitized structural graphs and always destroys the unreleased compiled handle
+before postflight.  That path cannot construct a host reference or device
+inputs, create a checked capability, invoke the executable, or retrieve output.
+
 Q/K/V and the output cotangent are independent deterministic nonzero BF16
 PCG64 grids.  Validation uses an independent host NumPy FP32 causal-GQA
 forward/backward oracle.  It streams over 32-query/32-key tiles and recomputes
@@ -117,7 +122,7 @@ _JOURNAL_STAGES = frozenset(
 _COMPILE_GPU_WORK_CAVEAT = (
     "lowered.compile may dispatch bounded GPU autotuning/profiling work; the "
     "compiled VJP executable remains inaccessible until exact structural and "
-    "compiled-memory gates pass"
+    "compiled-memory gates pass, and compile-diagnostic mode never releases it"
 )
 
 
@@ -310,6 +315,10 @@ def _zero_counters() -> dict[str, int]:
         "device_get_completions": 0,
         "lowered_callable_invocations": 0,
         "checked_executable_invocations": 0,
+        "checked_capability_release_attempts": 0,
+        "checked_capability_release_completions": 0,
+        "host_reference_construction_attempts": 0,
+        "host_reference_construction_completions": 0,
     }
 
 
@@ -327,6 +336,22 @@ def _completed_counters() -> dict[str, int]:
         "device_get_attempts",
         "device_get_completions",
         "checked_executable_invocations",
+        "checked_capability_release_attempts",
+        "checked_capability_release_completions",
+        "host_reference_construction_attempts",
+        "host_reference_construction_completions",
+    ):
+        result[name] = 1
+    return result
+
+
+def _compile_diagnostic_completed_counters() -> dict[str, int]:
+    result = _zero_counters()
+    for name in (
+        "lower_attempts",
+        "lower_completions",
+        "compile_attempts",
+        "compile_completions",
     ):
         result[name] = 1
     return result
@@ -376,7 +401,10 @@ def _exact_contract() -> dict[str, Any]:
             "required_dialects": ["stablehlo", "optimized_hlo"],
             "exact_custom_calls": dict.fromkeys(_EXPECTED_MARKERS, 1),
             "exact_total_custom_calls": 3,
-            "sole_target": _EXACT_TARGET,
+            "sole_target_is_exact_rocm_triton": True,
+            "sole_target_sha256": hashlib.sha256(
+                _EXACT_TARGET.encode("utf-8")
+            ).hexdigest(),
             "exact_query_start_metadata_per_call": 0,
             "exact_query_size_metadata_per_call": 512,
             "all_calls_directly_owned_by_sole_entry_computation": True,
@@ -441,6 +469,29 @@ def _abstract_contract() -> dict[str, Any]:
     }
 
 
+def _compile_diagnostic_contract() -> dict[str, Any]:
+    exact = _exact_contract()
+    return {
+        "operation": "query_bounded_gqa_t512_full_vjp_compile_diagnostic",
+        "model_family": exact["model_family"],
+        "gpu_architecture": exact["gpu_architecture"],
+        "gpu_pci_device_id": exact["gpu_pci_device_id"],
+        "inputs": exact["inputs"],
+        "outputs": exact["outputs"],
+        "scale": exact["scale"],
+        "scale_exact_fraction": exact["scale_exact_fraction"],
+        "tiles": exact["tiles"],
+        "compile_gate": exact["compile_gate"],
+        "checked_capability_creation_or_release_authorized": False,
+        "host_reference_construction_authorized": False,
+        "host_or_device_input_construction_authorized": False,
+        "executable_invocation_authorized": False,
+        "device_get_authorized": False,
+        "always_stop_after_compile_and_postflight": True,
+        "raw_ir_emitted": False,
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -452,7 +503,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-gpu",
         action="store_true",
-        help="acknowledge one guarded compile and one checked full-VJP invocation",
+        help=(
+            "acknowledge one guarded compile and, unless --compile-diagnostic is "
+            "set, one checked full-VJP invocation"
+        ),
+    )
+    parser.add_argument(
+        "--compile-diagnostic",
+        action="store_true",
+        help=(
+            "compile and emit sanitized structural evidence only; never release "
+            "or invoke the executable"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -466,6 +528,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.platform == "abstract" and args.allow_gpu:
         parser.error("--allow-gpu is only valid with --platform rocm")
+    if args.platform != "rocm" and args.compile_diagnostic:
+        parser.error("--compile-diagnostic is only valid with --platform rocm")
     if args.platform == "rocm" and args.output is None:
         parser.error("--platform rocm requires --output for a private JSONL artifact")
     if args.output is not None and args.output.exists():
@@ -540,25 +604,256 @@ def _decode_ir(text: str) -> str:
     return _nonzero_probe()._decode_local_mlir_hex_escapes(text)
 
 
-def _mask_ir_quoted_content(text: str) -> str:
-    """Mask quoted payloads while retaining offsets, braces, and newlines."""
+def _raw_ir_quote_scan(text: str) -> dict[str, Any]:
+    """Mask raw quoted payloads without decoding their escape syntax."""
     result = list(text)
     quoted = False
-    escaped = False
-    for index, character in enumerate(text):
+    quote_delimiters = 0
+    escape_count = 0
+    invalid_escape_count = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
         if quoted:
             if character != "\n":
                 result[index] = " "
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
+            if character == "\\":
+                escape_count += 1
+                if index + 2 < len(text) and re.fullmatch(
+                    r"[0-9A-Fa-f]{2}", text[index + 1 : index + 3]
+                ):
+                    result[index + 1] = " "
+                    result[index + 2] = " "
+                    index += 2
+                elif index + 1 < len(text) and text[index + 1] in (
+                    '"\\/abfnrtv?01234567xXuU'
+                ):
+                    if text[index + 1] != "\n":
+                        result[index + 1] = " "
+                    index += 1
+                else:
+                    invalid_escape_count += 1
             elif character == '"':
                 quoted = False
+                quote_delimiters += 1
         elif character == '"':
             quoted = True
+            quote_delimiters += 1
             result[index] = " "
-    return "".join(result)
+        index += 1
+    return {
+        "masked": "".join(result),
+        "quote_delimiter_count": quote_delimiters,
+        "escape_count": escape_count,
+        "invalid_escape_count": invalid_escape_count,
+        "unterminated_quote": quoted,
+        "passed": not quoted and invalid_escape_count == 0,
+    }
+
+
+def _mask_ir_quoted_content(text: str) -> str:
+    return str(_raw_ir_quote_scan(text)["masked"])
+
+
+def _symbol_sha256(symbol: str) -> str:
+    return hashlib.sha256(symbol.encode("utf-8")).hexdigest()
+
+
+def _saturated_entry_multiplicity(
+    nodes: set[str],
+    entry: str | None,
+    raw_edges: list[tuple[str, str, str]],
+) -> dict[str, Any]:
+    edges = [
+        (caller, callee, factor)
+        for caller, callee, factor in raw_edges
+        if caller in nodes and callee in nodes and factor in {"one", "unknown"}
+    ]
+    adjacency = {node: [] for node in nodes}
+    indegree = dict.fromkeys(nodes, 0)
+    for caller, callee, factor in edges:
+        adjacency[caller].append((callee, factor))
+        indegree[callee] += 1
+    queue = sorted(node for node, degree in indegree.items() if degree == 0)
+    order: list[str] = []
+    while queue:
+        node = queue.pop(0)
+        order.append(node)
+        for callee, _factor in adjacency[node]:
+            indegree[callee] -= 1
+            if indegree[callee] == 0:
+                queue.append(callee)
+                queue.sort()
+    cycle = len(order) != len(nodes)
+    reachable: set[str] = set()
+    if entry in nodes:
+        pending = [entry]
+        while pending:
+            node = pending.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            pending.extend(callee for callee, _factor in adjacency[node])
+    multiplicity = dict.fromkeys(nodes, 0)
+    unknown_multiplicity = dict.fromkeys(nodes, False)
+    if entry in nodes:
+        multiplicity[entry] = 1
+    if not cycle:
+        for node in order:
+            for callee, factor in adjacency[node]:
+                if unknown_multiplicity[node] or (
+                    factor == "unknown" and multiplicity[node] > 0
+                ):
+                    unknown_multiplicity[callee] = True
+                elif factor == "one":
+                    multiplicity[callee] = min(
+                        2, multiplicity[callee] + multiplicity[node]
+                    )
+    return {
+        "cycle_detected": cycle,
+        "unknown_edge_count": len(raw_edges) - len(edges),
+        "unknown_factor_edge_count": sum(
+            factor == "unknown" for _caller, _callee, factor in edges
+        ),
+        "nodes": {
+            node: {
+                "reachable_from_entry": node in reachable,
+                "saturated_entry_multiplicity": (
+                    "unknown"
+                    if (cycle and node in reachable) or unknown_multiplicity[node]
+                    else ">1"
+                    if multiplicity[node] > 1
+                    else multiplicity[node]
+                ),
+            }
+            for node in sorted(nodes)
+        },
+    }
+
+
+def _raw_custom_call_blocks(text: str, dialect: str) -> list[str]:
+    """Extract only unquoted custom-call instructions while preserving raw text."""
+    masked = _mask_ir_quoted_content(text)
+    raw_lines = text.splitlines()
+    masked_lines = masked.splitlines()
+    if len(raw_lines) != len(masked_lines):
+        raise RuntimeError("raw IR quote masking changed the line count")
+    if dialect == "stablehlo":
+        start_pattern = re.compile(
+            r"^(?P<indent>\s*)%[^=]+?=\s*stablehlo\.custom_call\b"
+        )
+        boundary_pattern = re.compile(
+            r"^\s*(?:%[^=]+?=|#[A-Za-z_][\w.-]*\s*=|"
+            r"(?:stablehlo\.|func\.)?return\b|}\s*$)"
+        )
+    elif dialect == "optimized_hlo":
+        start_pattern = re.compile(
+            r"^(?P<indent>\s*)(?:ROOT\s+)?[^=]+?=\s*.*\bcustom-call\("
+        )
+        boundary_pattern = re.compile(r"^\s*(?:(?:ROOT\s+)?[^=]+?=|}\s*$)")
+    else:
+        raise ValueError("unsupported VJP IR dialect")
+    blocks: list[str] = []
+    index = 0
+    while index < len(masked_lines):
+        start = start_pattern.search(masked_lines[index])
+        if start is None:
+            index += 1
+            continue
+        base_indent = len(start.group("indent").expandtabs())
+        block_lines = [raw_lines[index]]
+        index += 1
+        while index < len(masked_lines):
+            candidate = masked_lines[index]
+            candidate_indent = len(candidate) - len(candidate.lstrip(" \t"))
+            if (
+                candidate.strip()
+                and candidate_indent <= base_indent
+                and boundary_pattern.match(candidate)
+            ):
+                break
+            block_lines.append(raw_lines[index])
+            index += 1
+        blocks.append("\n".join(block_lines))
+    return blocks
+
+
+def _isolated_custom_call_target_occurrences(block: str, dialect: str) -> list[str]:
+    if dialect == "stablehlo":
+        return [
+            match.group(1) or match.group(2)
+            for match in re.finditer(
+                r'\bstablehlo\.custom_call\s+@(?:"([^"]+)"|([A-Za-z0-9_.$-]+))',
+                block,
+            )
+        ]
+    if dialect == "optimized_hlo":
+        masked = _mask_ir_quoted_content(block)
+        opcode = re.search(r"\bcustom-call\s*\(", masked)
+        if opcode is None:
+            return []
+        opening = masked.find("(", opcode.start(), opcode.end())
+        depth = 0
+        closing = None
+        for index in range(opening, len(masked)):
+            if masked[index] == "(":
+                depth += 1
+            elif masked[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    closing = index
+                    break
+                if depth < 0:
+                    return []
+        if closing is None:
+            return []
+        key = re.compile(r"\bcustom_call_target\s*=")
+        nesting = {"(": 0, "[": 0, "{": 0}
+        pairs = {")": "(", "]": "[", "}": "{"}
+        occurrences: list[str] = []
+        index = closing + 1
+        while index < len(masked):
+            character = masked[index]
+            if character in nesting:
+                nesting[character] += 1
+            elif character in pairs:
+                opening_character = pairs[character]
+                nesting[opening_character] -= 1
+                if nesting[opening_character] < 0:
+                    return ["<malformed-target-structure>"]
+            elif all(value == 0 for value in nesting.values()):
+                match = key.match(masked, index)
+                if match is not None:
+                    value_start = match.end()
+                    while value_start < len(block) and block[value_start].isspace():
+                        value_start += 1
+                    if value_start >= len(block) or block[value_start] != '"':
+                        occurrences.append("<malformed-target-value>")
+                        index = match.end()
+                        continue
+                    value_stop = value_start + 1
+                    escaped = False
+                    while value_stop < len(block):
+                        value_character = block[value_stop]
+                        if escaped:
+                            escaped = False
+                        elif value_character == "\\":
+                            escaped = True
+                        elif value_character == '"':
+                            break
+                        value_stop += 1
+                    if value_stop >= len(block):
+                        occurrences.append("<malformed-target-value>")
+                    else:
+                        occurrences.append(
+                            _decode_ir(block[value_start + 1 : value_stop])
+                        )
+                    index = value_stop
+            index += 1
+        if any(nesting.values()):
+            return ["<malformed-target-structure>"]
+        return occurrences
+    raise ValueError("unsupported VJP IR dialect")
 
 
 def _matching_closing_brace(masked_text: str, opening: int) -> int | None:
@@ -578,61 +873,662 @@ def _matching_closing_brace(masked_text: str, opening: int) -> int | None:
     return None
 
 
-def _entry_call_ownership(text: str, dialect: str) -> dict[str, Any]:
-    """Require every logical custom call directly in the sole entry body."""
-    decoded = _decode_ir(text)
-    masked = _mask_ir_quoted_content(decoded)
-    if dialect == "stablehlo":
-        entry_pattern = re.compile(r"(?m)^[^\n]*\bfunc\.func\s+public\s+@main\b[^\n]*$")
-        call_pattern = re.compile(r"\bstablehlo\.custom_call\b")
-        forbidden_pattern = re.compile(
-            r"\b(?:func\.call|stablehlo\.(?:case|if|map|while))\b"
+def _stablehlo_entry_call_ownership(text: str) -> dict[str, Any]:
+    """Parse StableHLO with registered MLIR dialects and sanitize the graph."""
+    try:
+        from jax._src.interpreters import mlir
+        from jaxlib.mlir import ir
+
+        with mlir.make_ir_context() as context:
+            module = ir.Module.parse(text, context)
+            if module.operation.verify() is not True:
+                raise RuntimeError("registered StableHLO module verification failed")
+            functions = [
+                operation
+                for operation in module.body.operations
+                if operation.operation.name == "func.func"
+            ]
+            symbols = {
+                str(function.attributes["sym_name"]).strip('"'): function
+                for function in functions
+            }
+            duplicate_computation_count = len(functions) - len(symbols)
+            unexpected_top_level_operation_count = sum(
+                operation.operation.name != "func.func"
+                for operation in module.body.operations
+            )
+            entries = [
+                name
+                for name, function in symbols.items()
+                if name == "main"
+                and str(function.attributes.get("sym_visibility", '"public"')).strip(
+                    '"'
+                )
+                == "public"
+            ]
+            calls: list[dict[str, Any]] = []
+            edges: list[dict[str, Any]] = []
+            forbidden: list[dict[str, Any]] = []
+            instruction_counts = dict.fromkeys(symbols, 0)
+            call_index = 0
+
+            def visit_block(
+                block: Any,
+                owner: str,
+                region_depth: int,
+                ancestors: tuple[str, ...],
+            ) -> None:
+                nonlocal call_index
+                for operation in block.operations:
+                    opcode = operation.operation.name
+                    instruction_counts[owner] += 1
+                    if opcode == "stablehlo.custom_call":
+                        called_attribute = operation.attributes.get(
+                            "called_computations"
+                        )
+                        called_text = (
+                            str(called_attribute)
+                            if called_attribute is not None
+                            else "[]"
+                        )
+                        called_symbols = re.findall(
+                            r"@([A-Za-z_][A-Za-z0-9_.$-]*)", called_text
+                        )
+                        called_is_empty = called_text.strip() in {
+                            "[]",
+                            "array<flat_symbol_ref>",
+                        }
+                        if called_attribute is not None and not called_is_empty:
+                            forbidden.append(
+                                {
+                                    "opcode": "stablehlo.custom_call_called_computations",
+                                    "owner_computation_sha256": _symbol_sha256(owner),
+                                    "region_depth": region_depth,
+                                }
+                            )
+                            if not called_symbols:
+                                edges.append(
+                                    {
+                                        "caller": owner,
+                                        "callee": "unresolved_called_computation",
+                                        "region_depth": region_depth,
+                                        "ancestor_opcodes": list(ancestors),
+                                        "ordinary_direct_call": False,
+                                        "factor": "unknown",
+                                        "opcode": "stablehlo.custom_call",
+                                    }
+                                )
+                            for callee in called_symbols:
+                                edges.append(
+                                    {
+                                        "caller": owner,
+                                        "callee": callee,
+                                        "region_depth": region_depth,
+                                        "ancestor_opcodes": list(ancestors),
+                                        "ordinary_direct_call": False,
+                                        "factor": "unknown",
+                                        "opcode": "stablehlo.custom_call",
+                                    }
+                                )
+                        calls.append(
+                            {
+                                "index": call_index,
+                                "owner_computation_sha256": _symbol_sha256(owner),
+                                "owner_is_entry": owner in entries,
+                                "region_depth": region_depth,
+                                "ancestor_opcodes": list(ancestors),
+                                "direct_entry_owned": owner in entries
+                                and region_depth == 0,
+                                "has_nonempty_or_malformed_called_computations": (
+                                    called_attribute is not None and not called_is_empty
+                                ),
+                            }
+                        )
+                        call_index += 1
+                    elif opcode == "func.call":
+                        callee = str(operation.attributes["callee"]).removeprefix("@")
+                        edges.append(
+                            {
+                                "caller": owner,
+                                "callee": callee,
+                                "region_depth": region_depth,
+                                "ancestor_opcodes": list(ancestors),
+                                "ordinary_direct_call": region_depth == 0,
+                                "factor": "one",
+                                "opcode": "func.call",
+                            }
+                        )
+                    elif opcode in {
+                        "func.call_indirect",
+                        "stablehlo.case",
+                        "stablehlo.if",
+                        "stablehlo.map",
+                        "stablehlo.reduce",
+                        "stablehlo.reduce_window",
+                        "stablehlo.scatter",
+                        "stablehlo.select_and_scatter",
+                        "stablehlo.sort",
+                        "stablehlo.while",
+                    }:
+                        forbidden.append(
+                            {
+                                "opcode": opcode,
+                                "owner_computation_sha256": _symbol_sha256(owner),
+                                "region_depth": region_depth,
+                            }
+                        )
+                    for region in operation.regions:
+                        for nested_block in region.blocks:
+                            visit_block(
+                                nested_block,
+                                owner,
+                                region_depth + 1,
+                                (*ancestors, opcode),
+                            )
+
+            for symbol, function in symbols.items():
+                for region in function.regions:
+                    for block in region.blocks:
+                        visit_block(block, symbol, 0, ())
+
+            node_ids = {_symbol_sha256(symbol) for symbol in symbols}
+            entry_id = _symbol_sha256(entries[0]) if len(entries) == 1 else None
+            raw_edges = [
+                (
+                    _symbol_sha256(edge["caller"]),
+                    _symbol_sha256(edge["callee"]),
+                    edge["factor"],
+                )
+                for edge in edges
+            ]
+            graph = _saturated_entry_multiplicity(node_ids, entry_id, raw_edges)
+            sanitized_edges = [
+                {
+                    "caller_computation_sha256": _symbol_sha256(edge["caller"]),
+                    "callee_computation_sha256": _symbol_sha256(edge["callee"]),
+                    "callee_resolved": edge["callee"] in symbols,
+                    "region_depth": edge["region_depth"],
+                    "ancestor_opcodes": edge["ancestor_opcodes"],
+                    "ordinary_direct_call": edge["ordinary_direct_call"],
+                    "factor": edge["factor"],
+                    "opcode": edge["opcode"],
+                }
+                for edge in edges
+            ]
+            computations = [
+                {
+                    "computation_sha256": _symbol_sha256(symbol),
+                    "is_entry": symbol in entries,
+                    **graph["nodes"][_symbol_sha256(symbol)],
+                    "custom_call_count": sum(
+                        call["owner_computation_sha256"] == _symbol_sha256(symbol)
+                        for call in calls
+                    ),
+                    "instruction_count": instruction_counts[symbol],
+                }
+                for symbol in sorted(symbols)
+            ]
+            graph_safe = (
+                not graph["cycle_detected"]
+                and graph["unknown_edge_count"] == 0
+                and graph["unknown_factor_edge_count"] == 0
+                and all(edge["ordinary_direct_call"] for edge in sanitized_edges)
+            )
+            checks = {
+                "registered_mlir_parse_succeeded": True,
+                "exactly_one_entry_computation": len(entries) == 1,
+                "computation_symbols_are_unique": duplicate_computation_count == 0,
+                "only_function_operations_are_top_level": (
+                    unexpected_top_level_operation_count == 0
+                ),
+                "all_custom_calls_directly_owned_by_entry": len(calls) == 3
+                and all(call["direct_entry_owned"] for call in calls),
+                "no_callable_or_control_flow_container": not edges and not forbidden,
+                "call_graph_is_acyclic_resolved_and_direct": graph_safe,
+            }
+            return {
+                "parser": "registered_jax_mlir_context",
+                "parse_succeeded": True,
+                "entry_count": len(entries),
+                "computation_count": len(computations),
+                "custom_call_count": len(calls),
+                "direct_entry_custom_call_count": sum(
+                    call["direct_entry_owned"] for call in calls
+                ),
+                "forbidden_container_count": len(forbidden),
+                "duplicate_computation_count": duplicate_computation_count,
+                "unexpected_top_level_operation_count": (
+                    unexpected_top_level_operation_count
+                ),
+                "calls": calls,
+                "computations": computations,
+                "call_edges": sanitized_edges,
+                "forbidden_containers": forbidden,
+                "entry_multiplicity": graph,
+                "checks": checks,
+                "passed": all(checks.values()),
+                "raw_ir_emitted": False,
+                "raw_symbols_emitted": False,
+            }
+    except Exception as error:
+        checks = {
+            "registered_mlir_parse_succeeded": False,
+            "exactly_one_entry_computation": False,
+            "computation_symbols_are_unique": False,
+            "only_function_operations_are_top_level": False,
+            "all_custom_calls_directly_owned_by_entry": False,
+            "no_callable_or_control_flow_container": False,
+            "call_graph_is_acyclic_resolved_and_direct": False,
+        }
+        return {
+            "parser": "registered_jax_mlir_context",
+            "parse_succeeded": False,
+            "entry_count": 0,
+            "computation_count": 0,
+            "custom_call_count": 0,
+            "direct_entry_custom_call_count": 0,
+            "forbidden_container_count": 0,
+            "duplicate_computation_count": 0,
+            "unexpected_top_level_operation_count": 0,
+            "calls": [],
+            "computations": [],
+            "call_edges": [],
+            "forbidden_containers": [],
+            "entry_multiplicity": {
+                "cycle_detected": False,
+                "unknown_edge_count": 0,
+                "nodes": {},
+            },
+            "checks": checks,
+            "passed": False,
+            "parse_error_type": type(error).__name__,
+            **_redacted_message_summary(error),
+            "raw_ir_emitted": False,
+            "raw_symbols_emitted": False,
+        }
+
+
+def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
+    """Build a fail-closed sanitized graph from raw quote-masked HLO text."""
+    quote_scan = _raw_ir_quote_scan(text)
+    masked = str(quote_scan["masked"])
+    raw_lines = text.splitlines()
+    masked_lines = masked.splitlines()
+    if len(raw_lines) != len(masked_lines):
+        raise RuntimeError("optimized HLO quote masking changed line count")
+    computation_symbol = r"%?[A-Za-z_][A-Za-z0-9_.-]*"
+    instruction_symbol = r"%?(?:[A-Za-z_][A-Za-z0-9_.-]*|[0-9]+)"
+    entry_header = re.compile(rf"^\s*ENTRY\s+(?P<name>{computation_symbol})\b")
+    helper_header = re.compile(rf"^\s*(?P<name>{computation_symbol})(?:\s|\(|\{{)")
+    assignment = re.compile(
+        rf"^\s*(?:ROOT\s+)?(?P<name>{instruction_symbol})\s*=\s*(?P<definition>.*)$"
+    )
+    opcode_pattern = re.compile(r"(?P<opcode>[A-Za-z_][A-Za-z0-9_.-]*)\s*\(")
+    target_pattern = re.compile(rf"\bto_apply\s*=\s*(?P<target>{computation_symbol})")
+    single_reference_pattern = re.compile(
+        rf"\b(?:to_apply|condition|body|calls|called_computations|"
+        rf"branch_computations)\s*=\s*(?P<target>{computation_symbol})"
+    )
+    collection_reference_pattern = re.compile(
+        r"\b(?:branch_computations|calls|called_computations)\s*=\s*"
+        r"\{(?P<targets>[^}]*)\}"
+    )
+    computation_symbol_pattern = re.compile(computation_symbol)
+    custom_reference_assignment_pattern = re.compile(
+        r"\b(?:calls|called_computations)\s*="
+    )
+    custom_single_reference_pattern = re.compile(
+        rf"\b(?:calls|called_computations)\s*=\s*"
+        rf"(?P<target>{computation_symbol})"
+    )
+    custom_collection_reference_pattern = re.compile(
+        r"\b(?:calls|called_computations)\s*=\s*"
+        r"\{(?P<targets>[^}]*)\}"
+    )
+    custom_empty_reference_pattern = re.compile(
+        r"\b(?:calls|called_computations)\s*=\s*\[\s*\]"
+    )
+    forbidden_opcodes = {
+        "async-start",
+        "call-done",
+        "call-start",
+        "conditional",
+        "fusion",
+        "map",
+        "reduce",
+        "reduce-window",
+        "scatter",
+        "select-and-scatter",
+        "sort",
+        "while",
+    }
+    computations: dict[str, dict[str, Any]] = {}
+    entries: list[str] = []
+    calls: list[dict[str, Any]] = []
+    call_owners: list[str] = []
+    edges: list[dict[str, Any]] = []
+    forbidden: list[dict[str, Any]] = []
+    unknown_callable = 0
+    unknown_instruction_count = 0
+    duplicate_computation_count = 0
+    depth = 0
+    owner: str | None = None
+    call_index = 0
+    balanced = quote_scan["passed"] is True
+
+    def normalized_symbol(value: str) -> str:
+        return value.removeprefix("%")
+
+    for raw_line, masked_line in zip(raw_lines, masked_lines, strict=True):
+        line_depth = depth
+        stripped = masked_line.rstrip()
+        if line_depth == 0 and stripped.endswith("{"):
+            header = entry_header.match(masked_line)
+            is_entry = header is not None
+            if header is None:
+                header = helper_header.match(masked_line)
+            if header is not None and "=" not in masked_line:
+                owner = normalized_symbol(header.group("name"))
+                if owner in computations:
+                    duplicate_computation_count += 1
+                computations.setdefault(
+                    owner,
+                    {
+                        "header_sha256": hashlib.sha256(
+                            raw_line.encode("utf-8")
+                        ).hexdigest(),
+                        "is_entry": is_entry,
+                        "custom_call_count": 0,
+                        "instruction_count": 0,
+                    },
+                )
+                if is_entry:
+                    entries.append(owner)
+        if owner is not None and line_depth >= 1:
+            match = assignment.match(masked_line)
+            if match is not None:
+                computations[owner]["instruction_count"] += 1
+                opcode_match = opcode_pattern.search(match.group("definition"))
+                opcode = opcode_match.group("opcode") if opcode_match else None
+                region_depth = line_depth - 1
+                instruction_hash = hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
+                if opcode == "custom-call":
+                    call_owners.append(owner)
+                    calls.append(
+                        {
+                            "index": call_index,
+                            "owner_computation_sha256": _symbol_sha256(owner),
+                            "owner_is_entry": owner in entries,
+                            "region_depth": region_depth,
+                            "ancestor_opcodes": (
+                                [] if region_depth == 0 else ["unknown_braced_region"]
+                            ),
+                            "direct_entry_owned": owner in entries
+                            and region_depth == 0,
+                            "instruction_sha256": instruction_hash,
+                            "has_nonempty_or_malformed_called_computations": False,
+                        }
+                    )
+                    computations[owner]["custom_call_count"] += 1
+                    call_index += 1
+                elif opcode == "call":
+                    target = target_pattern.search(masked_line)
+                    if target is None:
+                        unknown_callable += 1
+                    else:
+                        edges.append(
+                            {
+                                "caller": owner,
+                                "callee": normalized_symbol(target.group("target")),
+                                "region_depth": region_depth,
+                                "ancestor_opcodes": (
+                                    []
+                                    if region_depth == 0
+                                    else ["unknown_braced_region"]
+                                ),
+                                "ordinary_direct_call": region_depth == 0,
+                                "factor": "one",
+                                "opcode": "call",
+                                "instruction_sha256": instruction_hash,
+                            }
+                        )
+                elif opcode in forbidden_opcodes:
+                    referenced = [
+                        normalized_symbol(item.group("target"))
+                        for item in single_reference_pattern.finditer(masked_line)
+                    ]
+                    for collection in collection_reference_pattern.finditer(
+                        masked_line
+                    ):
+                        referenced.extend(
+                            normalized_symbol(item.group(0))
+                            for item in computation_symbol_pattern.finditer(
+                                collection.group("targets")
+                            )
+                        )
+                    for callee in referenced:
+                        edges.append(
+                            {
+                                "caller": owner,
+                                "callee": callee,
+                                "region_depth": region_depth,
+                                "ancestor_opcodes": (
+                                    []
+                                    if region_depth == 0
+                                    else ["unknown_braced_region"]
+                                ),
+                                "ordinary_direct_call": False,
+                                "factor": "unknown",
+                                "opcode": opcode,
+                                "instruction_sha256": instruction_hash,
+                            }
+                        )
+                    forbidden.append(
+                        {
+                            "opcode": opcode,
+                            "owner_computation_sha256": _symbol_sha256(owner),
+                            "region_depth": region_depth,
+                            "ancestor_opcodes": (
+                                [] if region_depth == 0 else ["unknown_braced_region"]
+                            ),
+                            "instruction_sha256": instruction_hash,
+                        }
+                    )
+                elif "to_apply" in masked_line:
+                    unknown_callable += 1
+                    target = target_pattern.search(masked_line)
+                    if target is not None:
+                        edges.append(
+                            {
+                                "caller": owner,
+                                "callee": normalized_symbol(target.group("target")),
+                                "region_depth": region_depth,
+                                "ancestor_opcodes": (
+                                    []
+                                    if region_depth == 0
+                                    else ["unknown_braced_region"]
+                                ),
+                                "ordinary_direct_call": False,
+                                "factor": "unknown",
+                                "opcode": "unknown_to_apply_instruction",
+                                "instruction_sha256": instruction_hash,
+                            }
+                        )
+                    forbidden.append(
+                        {
+                            "opcode": "unknown_to_apply_instruction",
+                            "owner_computation_sha256": _symbol_sha256(owner),
+                            "region_depth": region_depth,
+                            "ancestor_opcodes": (
+                                [] if region_depth == 0 else ["unknown_braced_region"]
+                            ),
+                            "instruction_sha256": instruction_hash,
+                        }
+                    )
+                elif opcode is None:
+                    unknown_instruction_count += 1
+        for character in masked_line:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth < 0:
+                    balanced = False
+        if owner is not None and depth == 0:
+            owner = None
+    if depth != 0:
+        balanced = False
+
+    custom_blocks = _raw_custom_call_blocks(text, "optimized_hlo")
+    custom_call_block_count_matches_graph = len(custom_blocks) == len(calls)
+    for index, (owner_name, block) in enumerate(
+        zip(call_owners, custom_blocks, strict=False)
+    ):
+        masked_block = _mask_ir_quoted_content(block)
+        assignments = list(custom_reference_assignment_pattern.finditer(masked_block))
+        singles = list(custom_single_reference_pattern.finditer(masked_block))
+        collections = list(custom_collection_reference_pattern.finditer(masked_block))
+        empty_lists = list(custom_empty_reference_pattern.finditer(masked_block))
+        referenced = [normalized_symbol(item.group("target")) for item in singles]
+        for collection in collections:
+            referenced.extend(
+                normalized_symbol(item.group(0))
+                for item in computation_symbol_pattern.finditer(
+                    collection.group("targets")
+                )
+            )
+        malformed = len(assignments) != (
+            len(singles) + len(collections) + len(empty_lists)
         )
-    elif dialect == "optimized_hlo":
-        entry_pattern = re.compile(r"(?m)^\s*ENTRY\b[^\n]*$")
-        call_pattern = re.compile(r"\bcustom-call\(")
-        forbidden_pattern = re.compile(
-            r"(?<!custom-)\b(?:async-start|call|conditional|map|while)\s*\("
+        nonempty_or_malformed = bool(referenced) or malformed
+        calls[index]["has_nonempty_or_malformed_called_computations"] = (
+            nonempty_or_malformed
         )
-    else:
-        raise ValueError("unsupported VJP IR dialect")
+        if nonempty_or_malformed:
+            forbidden.append(
+                {
+                    "opcode": "custom_call_called_computations",
+                    "owner_computation_sha256": _symbol_sha256(owner_name),
+                    "region_depth": calls[index]["region_depth"],
+                    "ancestor_opcodes": calls[index]["ancestor_opcodes"],
+                    "instruction_sha256": calls[index]["instruction_sha256"],
+                }
+            )
+            if malformed and not referenced:
+                referenced.append("unresolved_called_computation")
+            for callee in referenced:
+                edges.append(
+                    {
+                        "caller": owner_name,
+                        "callee": callee,
+                        "region_depth": calls[index]["region_depth"],
+                        "ancestor_opcodes": calls[index]["ancestor_opcodes"],
+                        "ordinary_direct_call": False,
+                        "factor": "unknown",
+                        "opcode": "custom-call",
+                        "instruction_sha256": calls[index]["instruction_sha256"],
+                    }
+                )
 
-    entries = list(entry_pattern.finditer(masked))
-    calls = list(call_pattern.finditer(masked))
-    forbidden = list(forbidden_pattern.finditer(masked))
-    opening: int | None = None
-    closing: int | None = None
-    if len(entries) == 1:
-        opening = masked.rfind("{", entries[0].start(), entries[0].end())
-        if opening >= 0:
-            closing = _matching_closing_brace(masked, opening)
-        else:
-            opening = None
-
-    direct: list[bool] = []
-    if opening is not None and closing is not None:
-        for call in calls:
-            owned = opening < call.start() < closing
-            relative = masked[opening + 1 : call.start()]
-            depth = relative.count("{") - relative.count("}")
-            direct.append(owned and depth == 0)
-    else:
-        direct = [False] * len(calls)
-
+    node_ids = {_symbol_sha256(name) for name in computations}
+    entry_id = _symbol_sha256(entries[0]) if len(entries) == 1 else None
+    raw_edges = [
+        (
+            _symbol_sha256(edge["caller"]),
+            _symbol_sha256(edge["callee"]),
+            edge["factor"],
+        )
+        for edge in edges
+    ]
+    graph = _saturated_entry_multiplicity(node_ids, entry_id, raw_edges)
+    sanitized_edges = [
+        {
+            "caller_computation_sha256": _symbol_sha256(edge["caller"]),
+            "callee_computation_sha256": _symbol_sha256(edge["callee"]),
+            "callee_resolved": edge["callee"] in computations,
+            "region_depth": edge["region_depth"],
+            "ancestor_opcodes": edge["ancestor_opcodes"],
+            "ordinary_direct_call": edge["ordinary_direct_call"],
+            "factor": edge["factor"],
+            "opcode": edge["opcode"],
+            "instruction_sha256": edge["instruction_sha256"],
+        }
+        for edge in edges
+    ]
+    sanitized_computations = [
+        {
+            "computation_sha256": _symbol_sha256(name),
+            "header_sha256": value["header_sha256"],
+            "is_entry": name in entries,
+            **graph["nodes"][_symbol_sha256(name)],
+            "custom_call_count": value["custom_call_count"],
+            "instruction_count": value["instruction_count"],
+        }
+        for name, value in sorted(computations.items())
+    ]
+    graph_safe = (
+        not graph["cycle_detected"]
+        and graph["unknown_edge_count"] == 0
+        and graph["unknown_factor_edge_count"] == 0
+        and unknown_callable == 0
+        and duplicate_computation_count == 0
+        and unknown_instruction_count == 0
+        and custom_call_block_count_matches_graph
+        and all(edge["ordinary_direct_call"] for edge in sanitized_edges)
+    )
     checks = {
+        "raw_quote_aware_parse_balanced": balanced,
+        "raw_quote_escapes_are_well_formed": quote_scan["passed"] is True,
         "exactly_one_entry_computation": len(entries) == 1,
-        "entry_region_is_balanced": opening is not None and closing is not None,
-        "all_custom_calls_directly_owned_by_entry": len(direct) == 3 and all(direct),
-        "no_callable_or_control_flow_container": len(forbidden) == 0,
+        "computation_symbols_are_unique": duplicate_computation_count == 0,
+        "every_instruction_opcode_was_parsed": unknown_instruction_count == 0,
+        "custom_call_blocks_match_instruction_graph": (
+            custom_call_block_count_matches_graph
+        ),
+        "all_custom_calls_directly_owned_by_entry": len(calls) == 3
+        and all(call["direct_entry_owned"] for call in calls),
+        "no_callable_or_control_flow_container": not edges
+        and not forbidden
+        and unknown_callable == 0,
+        "call_graph_is_acyclic_resolved_and_direct": graph_safe,
     }
     return {
+        "parser": "raw_quote_aware_hlo_computation_graph",
+        "parse_succeeded": balanced,
         "entry_count": len(entries),
+        "computation_count": len(sanitized_computations),
         "custom_call_count": len(calls),
-        "direct_entry_custom_call_count": sum(direct),
-        "forbidden_container_count": len(forbidden),
+        "direct_entry_custom_call_count": sum(
+            call["direct_entry_owned"] for call in calls
+        ),
+        "forbidden_container_count": len(forbidden) + unknown_callable,
+        "calls": calls,
+        "computations": sanitized_computations,
+        "call_edges": sanitized_edges,
+        "forbidden_containers": forbidden,
+        "unknown_callable_count": unknown_callable,
+        "unknown_instruction_count": unknown_instruction_count,
+        "duplicate_computation_count": duplicate_computation_count,
+        "custom_call_block_count_matches_graph": (
+            custom_call_block_count_matches_graph
+        ),
+        "entry_multiplicity": graph,
+        "raw_quote_scan": {
+            key: value for key, value in quote_scan.items() if key != "masked"
+        },
         "checks": checks,
         "passed": all(checks.values()),
+        "raw_ir_emitted": False,
+        "raw_symbols_emitted": False,
     }
+
+
+def _entry_call_ownership(text: str, dialect: str) -> dict[str, Any]:
+    if dialect == "stablehlo":
+        return _stablehlo_entry_call_ownership(text)
+    if dialect == "optimized_hlo":
+        return _optimized_hlo_entry_call_ownership(text)
+    raise ValueError("unsupported VJP IR dialect")
 
 
 def _is_bounded_marker_like(token: str) -> bool:
@@ -650,7 +1546,7 @@ def _is_bounded_marker_like(token: str) -> bool:
 def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
     compile_probe = _compile_probe()
     definitions = compile_probe._metadata_definitions(text)
-    raw_blocks = compile_probe._custom_call_blocks(text, dialect)
+    raw_blocks = _raw_custom_call_blocks(text, dialect)
     blocks = [
         compile_probe._resolved_block_metadata(block, definitions)
         for block in raw_blocks
@@ -662,20 +1558,28 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
     unexpected = [
         token for token in bounded_tokens if token not in _EXPECTED_MARKERS.values()
     ]
+    masked_text = _mask_ir_quoted_content(text)
     if dialect == "stablehlo":
-        textual_count = len(re.findall(r"\bstablehlo\.custom_call\b", text))
-        while_count = len(re.findall(r"\bstablehlo\.while\b", text))
+        textual_count = len(re.findall(r"\bstablehlo\.custom_call\b", masked_text))
+        while_count = len(re.findall(r"\bstablehlo\.while\b", masked_text))
     elif dialect == "optimized_hlo":
-        textual_count = len(re.findall(r"\bcustom-call\(", text))
-        while_count = len(re.findall(r"\bwhile\s*\(", text))
+        textual_count = len(re.findall(r"\bcustom-call\(", masked_text))
+        while_count = len(re.findall(r"\bwhile\s*\(", masked_text))
     else:
         raise ValueError("unsupported VJP IR dialect")
+    decoded_masked = _mask_ir_quoted_content(decoded_text)
+    decoded_masked_call_count = (
+        len(re.findall(r"\bstablehlo\.custom_call\b", decoded_masked))
+        if dialect == "stablehlo"
+        else len(re.findall(r"\bcustom-call\(", decoded_masked))
+    )
+    raw_quote_scan = _raw_ir_quote_scan(text)
 
     calls: list[dict[str, Any]] = []
     marker_counts = dict.fromkeys(_EXPECTED_MARKERS, 0)
     all_call_checks: list[bool] = []
     for index, block in enumerate(blocks):
-        targets = compile_probe._custom_call_targets(block, dialect)
+        target_occurrences = _isolated_custom_call_target_occurrences(block, dialect)
         tokens = _IR_NAME_TOKEN_PATTERN.findall(_decode_ir(block))
         kinds = [kind for kind, marker in _EXPECTED_MARKERS.items() if marker in tokens]
         for kind in kinds:
@@ -687,7 +1591,7 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
             _decode_ir(block), "query_size", _SEQUENCE_LENGTH
         )
         checks = {
-            "sole_exact_target": targets == {_EXACT_TARGET},
+            "sole_exact_target": target_occurrences == [_EXACT_TARGET],
             "exactly_one_expected_marker": len(kinds) == 1,
             "query_start_is_exact_canonical_zero": query_start["passed"],
             "query_size_is_exact_canonical_512": query_size["passed"],
@@ -697,7 +1601,13 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
             {
                 "index": index,
                 "kind": kinds[0] if len(kinds) == 1 else None,
-                "targets": sorted(targets),
+                "target_count": len(target_occurrences),
+                "sole_target_matches_expected": target_occurrences == [_EXACT_TARGET],
+                "sole_target_sha256": (
+                    hashlib.sha256(target_occurrences[0].encode("utf-8")).hexdigest()
+                    if len(target_occurrences) == 1
+                    else None
+                ),
                 "query_start": query_start,
                 "query_size": query_size,
                 "checks": checks,
@@ -730,6 +1640,23 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
         "while_count": while_count,
         "calls": calls,
         "entry_call_ownership": ownership,
+        "quote_lexing_diagnostic": {
+            "syntax_was_lexed_before_local_escape_decoding": True,
+            "raw_unquoted_custom_call_count": textual_count,
+            "decoded_then_masked_custom_call_count_diagnostic_only": (
+                decoded_masked_call_count
+            ),
+            "raw_mlir_hex_quote_escape_count": len(
+                re.findall(r"\\22", text, flags=re.IGNORECASE)
+            ),
+            "raw_backslash_quote_escape_count": len(re.findall(r'\\"', text)),
+            "raw_quote_delimiter_count": raw_quote_scan["quote_delimiter_count"],
+            "raw_escape_count": raw_quote_scan["escape_count"],
+            "raw_invalid_escape_count": raw_quote_scan["invalid_escape_count"],
+            "raw_unterminated_quote": raw_quote_scan["unterminated_quote"],
+            "raw_quote_scan_passed": raw_quote_scan["passed"],
+            "raw_payload_emitted": False,
+        },
         "checks": checks,
         "raw_ir_emitted": False,
         "passed": all(checks.values()),
@@ -841,14 +1768,14 @@ def _shape_signature(jax: Any, jnp: Any) -> tuple[Any, ...]:
     )
 
 
-def _compile_checked_vjp(
+def _compile_vjp_artifact(
     jax: Any,
     jnp: Any,
     query_bounded_gqa: Any,
     require_clean_boot: Callable[[], dict[str, Any]],
     counters: dict[str, int],
     output: TextIO,
-) -> tuple[_CheckedVjpExecutable, dict[str, Any]]:
+) -> tuple[Any, dict[str, Any]]:
     def forward_and_vjp(
         q_arg: Any, k_arg: Any, v_arg: Any, mask_arg: Any, dout_arg: Any
     ) -> tuple[Any, Any, Any, Any]:
@@ -919,7 +1846,7 @@ def _compile_checked_vjp(
     )
     counters["compile_attempts"] += 1
     compiled = None
-    release = False
+    retain_compiled_artifact = False
     compile_start = time.perf_counter()
     try:
         compiled = lowered.compile()
@@ -954,20 +1881,71 @@ def _compile_checked_vjp(
             "counters": dict(counters),
         }
         _emit(report, output)
-        if not proof["passed"]:
-            raise RuntimeError(
-                "VJP executable failed structural or memory release gate"
-            )
-        checked = _wrap_checked(compiled, proof, counters)
-        release = True
+        retain_compiled_artifact = True
     finally:
-        if compiled is not None and not release:
+        if compiled is not None and not retain_compiled_artifact:
             del compiled
         _journal_checkpoint(
             require_clean_boot, output, "after_vjp_compile_attempt", counters
         )
     del lowered
-    return checked, report
+    return compiled, report
+
+
+def _release_checked_vjp(
+    compiled: Any, report: dict[str, Any], counters: dict[str, int]
+) -> _CheckedVjpExecutable:
+    counters["checked_capability_release_attempts"] += 1
+    proof = report.get("release_gate")
+    if not isinstance(proof, dict) or proof.get("passed") is not True:
+        raise RuntimeError("VJP executable failed structural or memory release gate")
+    checked = _wrap_checked(compiled, proof, counters)
+    counters["checked_capability_release_completions"] += 1
+    return checked
+
+
+def _run_compile_diagnostic(
+    jax: Any,
+    jnp: Any,
+    query_bounded_gqa: Any,
+    require_clean_boot: Callable[[], dict[str, Any]],
+    counters: dict[str, int],
+    output: TextIO,
+) -> int:
+    compiled = None
+    try:
+        compiled, report = _compile_vjp_artifact(
+            jax, jnp, query_bounded_gqa, require_clean_boot, counters, output
+        )
+    finally:
+        if compiled is not None:
+            del compiled
+    expected = _compile_diagnostic_completed_counters()
+    if counters != expected:
+        raise RuntimeError("compile diagnostic counter contract was not exact")
+    _emit(
+        {
+            "record_type": "compile_diagnostic_completed",
+            "timestamp": _utc_now(),
+            "status": (
+                "structure_and_memory_passed_no_release"
+                if report["release_gate"]["passed"]
+                else "structure_or_memory_failed_no_release"
+            ),
+            "structural_gate": report["structural_gate"],
+            "compiled_memory_gate": report["compiled_memory_gate"],
+            "release_gate_observed_but_not_authorized": report["release_gate"],
+            "checked_capability_created_or_released": False,
+            "host_reference_constructed": False,
+            "host_or_device_inputs_constructed": False,
+            "executable_invoked": False,
+            "device_output_retrieved": False,
+            "raw_ir_emitted": False,
+            "counters": dict(counters),
+        },
+        output,
+    )
+    return 0
 
 
 def _iid_nonzero_grid(
@@ -1524,6 +2502,7 @@ def _run_rocm(
     counters: dict[str, int],
     *,
     environment: dict[str, str | None],
+    compile_diagnostic: bool = False,
     _dependencies: tuple[Any, Any, Any, Any, Any, Any, Any] | None = None,
 ) -> int:
     proof = _prove_command_buffers_disabled(environment)
@@ -1572,13 +2551,27 @@ def _run_rocm(
             require_clean_boot, output, "after_backend_initialization_attempt", counters
         )
 
-    executable, compile_report = _compile_checked_vjp(
+    if compile_diagnostic:
+        return _run_compile_diagnostic(
+            jax,
+            jnp,
+            query_bounded_gqa,
+            require_clean_boot,
+            counters,
+            output,
+        )
+
+    compiled, compile_report = _compile_vjp_artifact(
         jax, jnp, query_bounded_gqa, require_clean_boot, counters, output
     )
+    executable = _release_checked_vjp(compiled, compile_report, counters)
+    del compiled
+    counters["host_reference_construction_attempts"] += 1
     try:
         host_inputs, input_manifests, expected_host, reference_manifest = (
             _construct_host_case(np, ml_dtypes)
         )
+        counters["host_reference_construction_completions"] += 1
         _emit(
             {
                 "record_type": "host_t512_full_vjp_reference",
@@ -1652,20 +2645,26 @@ def _run_rocm(
 
 def _execute(args: argparse.Namespace, output: TextIO) -> int:
     counters = _zero_counters()
+    compile_diagnostic = getattr(args, "compile_diagnostic", False)
     _emit(
         {
             "record_type": "manifest",
             "timestamp": _utc_now(),
             "platform_requested": args.platform,
             "allow_gpu": args.allow_gpu,
+            "compile_diagnostic": compile_diagnostic,
             "scope": (
                 "abstract_refusal"
                 if args.platform == "abstract"
+                else "guarded_exact_t512_full_vjp_compile_diagnostic"
+                if compile_diagnostic
                 else "guarded_exact_t512_full_vjp"
             ),
             "contract": (
                 _abstract_contract()
                 if args.platform == "abstract"
+                else _compile_diagnostic_contract()
+                if compile_diagnostic
                 else _exact_contract()
             ),
             "compile_may_dispatch_gpu_work": args.platform == "rocm",
@@ -1673,6 +2672,8 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             "fresh_process_required": True,
             "prior_compile_artifact_used": False,
             "raw_ir_emitted": False,
+            "runtime_execution_authorized": args.platform == "rocm"
+            and not compile_diagnostic,
             "outer_profile_rocm_supervision_required": True,
             "outer_profile_rocm_supervision_operational_not_internally_proven": True,
             "counters": dict(counters),
@@ -1752,13 +2753,14 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 },
                 output,
             )
-            stage = "runtime"
+            stage = "compile_diagnostic" if compile_diagnostic else "runtime"
             try:
                 result = _run_rocm(
                     output,
                     require_clean_boot,
                     counters,
                     environment=environment,
+                    compile_diagnostic=compile_diagnostic,
                 )
             finally:
                 try:
@@ -1782,7 +2784,11 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             {
                 "record_type": "completed",
                 "timestamp": _utc_now(),
-                "status": "passed",
+                "status": (
+                    "compile_diagnostic_completed_no_runtime_release"
+                    if compile_diagnostic
+                    else "passed"
+                ),
                 "counters": dict(counters),
             },
             output,
