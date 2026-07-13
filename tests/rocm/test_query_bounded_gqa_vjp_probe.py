@@ -1120,6 +1120,130 @@ def test_t1024_stablehlo_accepts_exact_bare_target_with_balanced_operands():
     ] == [4, 4, 7, 7, 9, 9]
 
 
+def _t1024_stablehlo_actual_layout_attribute_form() -> str:
+    def layout(rank: int) -> str:
+        minor_to_major = ", ".join(str(index) for index in reversed(range(rank)))
+        return f"dense<[{minor_to_major}]> : tensor<{rank}xindex>"
+
+    call_ranks = {
+        "fw": ([4, 4, 4, 2], [4, 3]),
+        "dq": ([4, 4, 4, 2, 4, 4, 3], [4]),
+        "dk": ([4, 4, 4, 2, 4, 4, 3, 4, 4], [4, 4]),
+    }
+    lines = _t1024_two_chunk_ir("stablehlo").splitlines()
+    for index, line in enumerate(lines):
+        if "stablehlo.custom_call" not in line:
+            continue
+        lhs = line.split("=", 1)[0]
+        kind = next(kind for kind in call_ranks if f"%{kind}" in lhs)
+        operand_ranks, result_ranks = call_ranks[kind]
+        layouts = (
+            "operand_layouts = ["
+            + ", ".join(layout(rank) for rank in operand_ranks)
+            + "], result_layouts = ["
+            + ", ".join(layout(rank) for rank in result_ranks)
+            + "]"
+        )
+        if "{output_operand_aliases" in line:
+            lines[index] = line.replace(
+                "{output_operand_aliases",
+                f"{{{layouts}, output_operand_aliases",
+                1,
+            )
+        else:
+            lines[index] = line.replace(") : (", f") {{{layouts}}} : (", 1)
+    return "\n".join(lines)
+
+
+def test_t1024_stablehlo_actual_layout_attributes_bind_only_final_signature():
+    text = _t1024_stablehlo_actual_layout_attribute_form()
+    summary = _PROBE._strict_vjp_ir_summary(text, "stablehlo", "all_valid_t1024")
+    assert summary["passed"] is True
+    classifications = [call["signature_classification"] for call in summary["calls"]]
+    assert [item["operand_count"] for item in classifications] == [4, 4, 7, 7, 9, 9]
+    assert [item["result_count"] for item in classifications] == [2, 2, 1, 1, 2, 2]
+    assert all(None not in item["operand_shapes"] for item in classifications)
+    assert all(None not in item["result_shapes"] for item in classifications)
+    for classification in classifications:
+        final_type = classification["parse_diagnostics"]["final_function_type"]
+        assert final_type["top_level_colon_count_before_arrow"] == 1
+        assert final_type["top_level_arrow_count"] == 1
+        assert final_type["passed"] is True
+        assert final_type["raw_type_text_emitted"] is False
+
+
+def test_stablehlo_final_function_type_ignores_nested_attribute_type_spoofs():
+    tail = (
+        "{operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xi64>], "
+        "nested = {spoof = (tensor<4xi64>) -> tensor<4xi64>}} : "
+        "(tensor<1x512x16x256xbf16>, tensor<1x1024xi32>) -> "
+        "tensor<1x512x16x256xbf16> loc(#loc0)"
+    )
+    parsed = _PROBE._stablehlo_final_function_type(tail)
+    assert parsed["passed"] is True
+    assert parsed["input_type_count"] == 2
+    assert parsed["result_type_count"] == 1
+    assert parsed["input_shapes"] == ["bf16[1,512,16,256]", "i32[1,1024]"]
+    assert parsed["result_shapes"] == ["bf16[1,512,16,256]"]
+
+
+@pytest.mark.parametrize(
+    ("tail", "failed_check"),
+    (
+        (
+            ": (tensor<1xbf16>) -> tensor<1xbf16> : (tensor<1xbf16>) -> tensor<1xbf16>",
+            "exactly_one_top_level_function_arrow",
+        ),
+        (
+            ": spoof : (tensor<1xbf16>) -> tensor<1xbf16>",
+            "exactly_one_top_level_signature_colon_before_arrow",
+        ),
+        (
+            ": (tensor<1xbf16>]) -> tensor<1xbf16>",
+            "all_mixed_delimiters_balanced",
+        ),
+        (
+            ": (tensor<1xbf16> -> tensor<1xbf16>",
+            "all_mixed_delimiters_balanced",
+        ),
+        (
+            ": (tensor<1xbf16>) -> tensor<1xbf16> tensor<4xi64>",
+            "no_additional_arrow_or_tensor_type_after_result",
+        ),
+        (
+            ": (tensor<1xbf16>) -> tensor<1xbf16> balanced_junk",
+            "suffix_is_empty_or_one_exact_location",
+        ),
+        (
+            ": (tensor<1xbf16>) -> tensor<1xbf16> loc(#loc0) trailing_junk",
+            "suffix_is_empty_or_one_exact_location",
+        ),
+        (
+            ": (tensor<1xbf16>) -> tensor<1xbf16> loc(#loc0) loc(#loc1)",
+            "suffix_is_empty_or_one_exact_location",
+        ),
+        (
+            ": (tensor<1xbf16>) -> tensor<1xbf16> loc(#loc0",
+            "suffix_delimiters_balanced",
+        ),
+    ),
+)
+def test_stablehlo_final_function_type_adversaries_fail_closed(tail, failed_check):
+    parsed = _PROBE._stablehlo_final_function_type(tail)
+    assert parsed["passed"] is False
+    assert parsed["checks"][failed_check] is False
+    assert parsed["raw_type_text_emitted"] is False
+
+
+def test_stablehlo_final_function_type_never_filters_unrecognized_types():
+    parsed = _PROBE._stablehlo_final_function_type(
+        ": (tensor<4xi64>, tensor<1xbf16>) -> tensor<1xbf16>"
+    )
+    assert parsed["passed"] is False
+    assert parsed["input_type_count"] == 2
+    assert parsed["input_shapes"] == [None, "bf16[1]"]
+
+
 def _t1024_optimized_actual_annotation_form() -> str:
     text = _t1024_two_chunk_ir("optimized_hlo")
     lines = text.splitlines()

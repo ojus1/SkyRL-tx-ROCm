@@ -2305,6 +2305,156 @@ def _internal_alias_pairs(block: str, dialect: str) -> dict[str, Any]:
     }
 
 
+def _stablehlo_final_function_type(type_tail: str) -> dict[str, Any]:
+    stack: list[str] = []
+    closing_to_opening = {")": "(", "]": "[", "}": "{", ">": "<"}
+    colons: list[int] = []
+    arrows: list[int] = []
+    malformed_delimiter_count = 0
+    index = 0
+    while index < len(type_tail):
+        if type_tail.startswith("->", index):
+            if not stack:
+                arrows.append(index)
+            index += 2
+            continue
+        character = type_tail[index]
+        if character in "([{<":
+            stack.append(character)
+        elif character in closing_to_opening:
+            expected = closing_to_opening[character]
+            if not stack or stack[-1] != expected:
+                malformed_delimiter_count += 1
+            else:
+                stack.pop()
+        elif character == ":" and not stack:
+            colons.append(index)
+        index += 1
+    malformed_delimiter_count += len(stack)
+    arrow = arrows[0] if len(arrows) == 1 else None
+    signature_colons = [item for item in colons if arrow is not None and item < arrow]
+    colon = signature_colons[-1] if len(signature_colons) == 1 else None
+
+    def parse_type_list(text: str, *, tuple_required: bool) -> dict[str, Any]:
+        stripped = text.strip()
+        parenthesized = stripped.startswith("(")
+        if parenthesized:
+            closing = _balanced_closing_delimiter(stripped, 0, "(", ")")
+            exact_parenthesized = closing == len(stripped) - 1
+            body = stripped[1:closing] if exact_parenthesized and closing else ""
+            segments = body.split(",") if body else []
+        else:
+            exact_parenthesized = False
+            segments = [stripped] if stripped else []
+        canonical = [_canonical_stablehlo_tensor_type(item) for item in segments]
+        passed = bool(segments) and all(item is not None for item in canonical)
+        if tuple_required:
+            passed = passed and exact_parenthesized
+        else:
+            passed = passed and (exact_parenthesized or len(segments) == 1)
+        return {
+            "shapes": canonical,
+            "type_count": len(segments),
+            "parenthesized": parenthesized,
+            "exact_grammar": passed,
+        }
+
+    inputs = {"shapes": [], "type_count": 0, "exact_grammar": False}
+    results = {"shapes": [], "type_count": 0, "exact_grammar": False}
+    suffix_checks = {
+        "no_additional_top_level_colon_after_result": False,
+        "no_additional_arrow_or_tensor_type_after_result": False,
+        "suffix_delimiters_balanced": False,
+        "suffix_is_empty_or_one_exact_location": False,
+    }
+    output_end = None
+    if colon is not None and arrow is not None:
+        inputs = parse_type_list(type_tail[colon + 1 : arrow], tuple_required=True)
+        output_start = arrow + 2
+        while output_start < len(type_tail) and type_tail[output_start].isspace():
+            output_start += 1
+        if output_start < len(type_tail) and type_tail[output_start] == "(":
+            output_end = _balanced_closing_delimiter(type_tail, output_start, "(", ")")
+        else:
+            tensor = re.match(r"tensor<[^>]+>", type_tail[output_start:])
+            output_end = output_start + tensor.end() - 1 if tensor is not None else None
+        if output_end is not None:
+            results = parse_type_list(
+                type_tail[output_start : output_end + 1], tuple_required=False
+            )
+            suffix = type_tail[output_end + 1 :]
+            suffix_scan = _stablehlo_final_function_type_suffix_scan(suffix)
+            suffix_checks = suffix_scan["checks"]
+    checks = {
+        "all_mixed_delimiters_balanced": malformed_delimiter_count == 0,
+        "exactly_one_top_level_function_arrow": len(arrows) == 1,
+        "exactly_one_top_level_signature_colon_before_arrow": (
+            len(signature_colons) == 1
+        ),
+        "input_tuple_grammar_exact": inputs["exact_grammar"],
+        "result_grammar_exact": results["exact_grammar"],
+        "output_type_was_bounded": output_end is not None,
+        **suffix_checks,
+    }
+    return {
+        "input_shapes": inputs["shapes"],
+        "result_shapes": results["shapes"],
+        "input_type_count": inputs["type_count"],
+        "result_type_count": results["type_count"],
+        "top_level_colon_count_before_arrow": len(signature_colons),
+        "top_level_arrow_count": len(arrows),
+        "malformed_delimiter_count": malformed_delimiter_count,
+        "checks": checks,
+        "passed": all(checks.values()),
+        "raw_type_text_emitted": False,
+    }
+
+
+def _stablehlo_final_function_type_suffix_scan(suffix: str) -> dict[str, Any]:
+    stack: list[str] = []
+    closing_to_opening = {")": "(", "]": "[", "}": "{", ">": "<"}
+    top_level_colons = 0
+    top_level_arrows = 0
+    malformed = 0
+    index = 0
+    while index < len(suffix):
+        if suffix.startswith("->", index):
+            if not stack:
+                top_level_arrows += 1
+            index += 2
+            continue
+        character = suffix[index]
+        if character in "([{<":
+            stack.append(character)
+        elif character in closing_to_opening:
+            expected = closing_to_opening[character]
+            if not stack or stack[-1] != expected:
+                malformed += 1
+            else:
+                stack.pop()
+        elif character == ":" and not stack:
+            top_level_colons += 1
+        index += 1
+    malformed += len(stack)
+    stripped = suffix.strip()
+    exact_location_suffix = not stripped
+    if stripped:
+        location = re.match(r"loc\s*\(", stripped)
+        if location is not None:
+            opening = stripped.find("(", location.start(), location.end())
+            closing = _balanced_closing_delimiter(stripped, opening, "(", ")")
+            exact_location_suffix = closing == len(stripped) - 1
+    checks = {
+        "no_additional_top_level_colon_after_result": top_level_colons == 0,
+        "no_additional_arrow_or_tensor_type_after_result": (
+            top_level_arrows == 0 and "tensor<" not in suffix
+        ),
+        "suffix_delimiters_balanced": malformed == 0,
+        "suffix_is_empty_or_one_exact_location": exact_location_suffix,
+    }
+    return {"checks": checks, "passed": all(checks.values())}
+
+
 def _stablehlo_call_signature(block: str) -> dict[str, Any]:
     masked = _mask_ir_quoted_content(block)
     operation = re.search(r"\bstablehlo\.custom_call\b", masked)
@@ -2361,19 +2511,15 @@ def _stablehlo_call_signature(block: str) -> dict[str, Any]:
         operand_segments
     )
     type_tail = masked[closing + 1 :]
-    arrow = type_tail.find("->")
-    input_types = re.findall(r"tensor<[^>]+>", type_tail[:arrow]) if arrow >= 0 else []
-    result_types = (
-        re.findall(r"tensor<[^>]+>", type_tail[arrow + 2 :]) if arrow >= 0 else []
-    )
-    operand_shapes = [_canonical_stablehlo_tensor_type(item) for item in input_types]
-    result_shapes = [_canonical_stablehlo_tensor_type(item) for item in result_types]
+    function_type = _stablehlo_final_function_type(type_tail)
+    operand_shapes = function_type["input_shapes"]
+    result_shapes = function_type["result_shapes"]
     passed = (
-        arrow >= 0
+        function_type["passed"]
         and target_syntax_passed
         and operands_exact
-        and len(operands) == len(input_types)
-        and len(results) == len(result_types)
+        and len(operands) == function_type["input_type_count"]
+        and len(results) == function_type["result_type_count"]
         and all(item is not None for item in (*operand_shapes, *result_shapes))
     )
     return {
@@ -2382,8 +2528,8 @@ def _stablehlo_call_signature(block: str) -> dict[str, Any]:
         "operands": operands,
         "operand_shapes": operand_shapes,
         "result_shapes": result_shapes,
-        "input_type_count": len(input_types),
-        "result_type_count": len(result_types),
+        "input_type_count": function_type["input_type_count"],
+        "result_type_count": function_type["result_type_count"],
         "parse_diagnostics": {
             "opcode_located": True,
             "target_syntax_passed": target_syntax_passed,
@@ -2392,6 +2538,11 @@ def _stablehlo_call_signature(block: str) -> dict[str, Any]:
                 len(operand_segments) if operand_segments is not None else None
             ),
             "all_operand_segments_are_exact_ssa_symbols": operands_exact,
+            "final_function_type": {
+                key: value
+                for key, value in function_type.items()
+                if key not in {"input_shapes", "result_shapes"}
+            },
             "raw_ir_emitted": False,
             "raw_symbols_emitted": False,
         },
@@ -3055,7 +3206,10 @@ def _strict_vjp_ir_summary(
         signature = None
         query_start_candidates = None
         if case == _ALL_VALID_T1024_CASE:
-            signature = _t1024_call_abi_signature(text, block, dialect, optimized_graph)
+            signature_block = raw_blocks[index] if dialect == "stablehlo" else block
+            signature = _t1024_call_abi_signature(
+                text, signature_block, dialect, optimized_graph
+            )
             kinds = signature["matching_kinds"]
             query_start_candidates = [
                 _nonzero_probe()._canonical_raw_metadata_field(
