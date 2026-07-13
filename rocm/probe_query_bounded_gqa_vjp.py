@@ -8,8 +8,10 @@ VJP are lowered and compiled once with explicit scale 3/32.  A private
 capability is released only after StableHLO and optimized HLO independently
 prove exactly one direct entry-level q0 forward, q0 dQ, and q0 dK/dV logical
 ROCm Triton call, canonical query metadata, no extra custom call, callable
-container, or outer while, and exact compiled-memory bounds.  The capability
-is consumed by one invocation only.
+container that can own or duplicate a custom call, or outer while, and exact
+compiled-memory bounds.  Unrelated direct-entry fusion helpers are permitted
+only when every nonentry computation contains zero custom calls.  The
+capability is consumed by one invocation only.
 
 ``--compile-diagnostic`` is a separate compile-only authorization.  It emits
 sanitized structural graphs and always destroys the unreleased compiled handle
@@ -408,7 +410,8 @@ def _exact_contract() -> dict[str, Any]:
             "exact_query_start_metadata_per_call": 0,
             "exact_query_size_metadata_per_call": 512,
             "all_calls_directly_owned_by_sole_entry_computation": True,
-            "no_callable_or_control_flow_container": True,
+            "no_container_can_own_or_duplicate_a_custom_call": True,
+            "independent_zero_custom_call_entry_fusions_allowed": True,
             "no_outer_while": True,
             "exact_argument_bytes": _EXPECTED_ARGUMENT_BYTES,
             "exact_output_bytes": _EXPECTED_OUTPUT_BYTES,
@@ -856,6 +859,121 @@ def _isolated_custom_call_target_occurrences(block: str, dialect: str) -> list[s
     raise ValueError("unsupported VJP IR dialect")
 
 
+def _top_level_hlo_computation_references(instruction: str) -> dict[str, Any]:
+    """Parse computation references only from an instruction's depth-zero tail."""
+    masked = _mask_ir_quoted_content(instruction)
+    assignment = masked.find("=")
+    if assignment < 0:
+        return {"attributes": [], "malformed_count": 1, "passed": False}
+    opcode = re.search(
+        r"(?P<opcode>[A-Za-z_][A-Za-z0-9_.-]*)\s*\(",
+        masked[assignment + 1 :],
+    )
+    if opcode is None:
+        return {"attributes": [], "malformed_count": 1, "passed": False}
+    opcode_start = assignment + 1 + opcode.start()
+    opening = masked.find("(", opcode_start, assignment + 1 + opcode.end())
+    depth = 0
+    closing = None
+    for index in range(opening, len(masked)):
+        if masked[index] == "(":
+            depth += 1
+        elif masked[index] == ")":
+            depth -= 1
+            if depth == 0:
+                closing = index
+                break
+            if depth < 0:
+                break
+    if closing is None:
+        return {"attributes": [], "malformed_count": 1, "passed": False}
+
+    key_pattern = re.compile(
+        r"\b(?P<key>to_apply|calls|called_computations|branch_computations|"
+        r"condition|body)\s*="
+    )
+    symbol_pattern = re.compile(r"%?[A-Za-z_][A-Za-z0-9_.-]*")
+    nesting = {"(": 0, "[": 0, "{": 0}
+    closing_to_opening = {")": "(", "]": "[", "}": "{"}
+    attributes: list[dict[str, Any]] = []
+    malformed_count = 0
+    index = closing + 1
+    while index < len(masked):
+        character = masked[index]
+        if character in nesting:
+            nesting[character] += 1
+        elif character in closing_to_opening:
+            opening_character = closing_to_opening[character]
+            nesting[opening_character] -= 1
+            if nesting[opening_character] < 0:
+                malformed_count += 1
+                nesting[opening_character] = 0
+        elif all(value == 0 for value in nesting.values()):
+            match = key_pattern.match(masked, index)
+            if match is not None:
+                value_start = match.end()
+                while value_start < len(masked) and masked[value_start].isspace():
+                    value_start += 1
+                targets: list[str] = []
+                form = "malformed"
+                value_stop = value_start
+                if value_start < len(masked) and masked[value_start] == "{":
+                    collection_depth = 0
+                    value_stop = value_start
+                    while value_stop < len(masked):
+                        if masked[value_stop] == "{":
+                            collection_depth += 1
+                        elif masked[value_stop] == "}":
+                            collection_depth -= 1
+                            if collection_depth == 0:
+                                break
+                        value_stop += 1
+                    if value_stop < len(masked):
+                        form = "collection"
+                        targets = [
+                            item.group(0).removeprefix("%")
+                            for item in symbol_pattern.finditer(
+                                masked[value_start + 1 : value_stop]
+                            )
+                        ]
+                    else:
+                        malformed_count += 1
+                elif value_start < len(masked) and masked[value_start] == "[":
+                    value_stop = masked.find("]", value_start + 1)
+                    if (
+                        value_stop >= 0
+                        and not masked[value_start + 1 : value_stop].strip()
+                    ):
+                        form = "empty"
+                    else:
+                        malformed_count += 1
+                        value_stop = max(value_stop, value_start)
+                else:
+                    target = symbol_pattern.match(masked, value_start)
+                    if target is not None:
+                        form = "single"
+                        targets = [target.group(0).removeprefix("%")]
+                        value_stop = target.end()
+                    else:
+                        malformed_count += 1
+                attributes.append(
+                    {
+                        "key": match.group("key"),
+                        "form": form,
+                        "targets": targets,
+                    }
+                )
+                index = value_stop
+        index += 1
+    if any(nesting.values()):
+        malformed_count += 1
+    return {
+        "attributes": attributes,
+        "malformed_count": malformed_count,
+        "passed": malformed_count == 0,
+    }
+
+
 def _matching_closing_brace(masked_text: str, opening: int) -> int | None:
     if opening < 0 or opening >= len(masked_text) or masked_text[opening] != "{":
         raise ValueError("entry-region opening must identify a brace")
@@ -1164,30 +1282,6 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         rf"^\s*(?:ROOT\s+)?(?P<name>{instruction_symbol})\s*=\s*(?P<definition>.*)$"
     )
     opcode_pattern = re.compile(r"(?P<opcode>[A-Za-z_][A-Za-z0-9_.-]*)\s*\(")
-    target_pattern = re.compile(rf"\bto_apply\s*=\s*(?P<target>{computation_symbol})")
-    single_reference_pattern = re.compile(
-        rf"\b(?:to_apply|condition|body|calls|called_computations|"
-        rf"branch_computations)\s*=\s*(?P<target>{computation_symbol})"
-    )
-    collection_reference_pattern = re.compile(
-        r"\b(?:branch_computations|calls|called_computations)\s*=\s*"
-        r"\{(?P<targets>[^}]*)\}"
-    )
-    computation_symbol_pattern = re.compile(computation_symbol)
-    custom_reference_assignment_pattern = re.compile(
-        r"\b(?:calls|called_computations)\s*="
-    )
-    custom_single_reference_pattern = re.compile(
-        rf"\b(?:calls|called_computations)\s*=\s*"
-        rf"(?P<target>{computation_symbol})"
-    )
-    custom_collection_reference_pattern = re.compile(
-        r"\b(?:calls|called_computations)\s*=\s*"
-        r"\{(?P<targets>[^}]*)\}"
-    )
-    custom_empty_reference_pattern = re.compile(
-        r"\b(?:calls|called_computations)\s*=\s*\[\s*\]"
-    )
     forbidden_opcodes = {
         "async-start",
         "call-done",
@@ -1252,6 +1346,21 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
                 opcode = opcode_match.group("opcode") if opcode_match else None
                 region_depth = line_depth - 1
                 instruction_hash = hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
+                reference_summary = _top_level_hlo_computation_references(raw_line)
+                reference_attributes = reference_summary["attributes"]
+                reference_schema = [
+                    {
+                        "key": item["key"],
+                        "form": item["form"],
+                        "target_count": len(item["targets"]),
+                    }
+                    for item in reference_attributes
+                ]
+                referenced = [
+                    target
+                    for item in reference_attributes
+                    for target in item["targets"]
+                ]
                 if opcode == "custom-call":
                     call_owners.append(owner)
                     calls.append(
@@ -1272,14 +1381,19 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
                     computations[owner]["custom_call_count"] += 1
                     call_index += 1
                 elif opcode == "call":
-                    target = target_pattern.search(masked_line)
-                    if target is None:
+                    valid_call_reference = reference_summary[
+                        "passed"
+                    ] is True and reference_schema == [
+                        {"key": "to_apply", "form": "single", "target_count": 1}
+                    ]
+                    if not valid_call_reference:
                         unknown_callable += 1
-                    else:
+                    callees = referenced or ["unresolved_called_computation"]
+                    for callee in callees:
                         edges.append(
                             {
                                 "caller": owner,
-                                "callee": normalized_symbol(target.group("target")),
+                                "callee": callee,
                                 "region_depth": region_depth,
                                 "ancestor_opcodes": (
                                     []
@@ -1287,26 +1401,16 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
                                     else ["unknown_braced_region"]
                                 ),
                                 "ordinary_direct_call": region_depth == 0,
-                                "factor": "one",
+                                "factor": "one" if valid_call_reference else "unknown",
                                 "opcode": "call",
                                 "instruction_sha256": instruction_hash,
                             }
                         )
                 elif opcode in forbidden_opcodes:
-                    referenced = [
-                        normalized_symbol(item.group("target"))
-                        for item in single_reference_pattern.finditer(masked_line)
-                    ]
-                    for collection in collection_reference_pattern.finditer(
-                        masked_line
-                    ):
-                        referenced.extend(
-                            normalized_symbol(item.group(0))
-                            for item in computation_symbol_pattern.finditer(
-                                collection.group("targets")
-                            )
-                        )
-                    for callee in referenced:
+                    callees = list(referenced)
+                    if reference_summary["passed"] is not True and not callees:
+                        callees.append("unresolved_called_computation")
+                    for callee in callees:
                         edges.append(
                             {
                                 "caller": owner,
@@ -1332,16 +1436,18 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
                                 [] if region_depth == 0 else ["unknown_braced_region"]
                             ),
                             "instruction_sha256": instruction_hash,
+                            "reference_schema": reference_schema,
+                            "reference_parse_passed": reference_summary["passed"],
                         }
                     )
-                elif "to_apply" in masked_line:
+                elif reference_attributes or reference_summary["passed"] is not True:
                     unknown_callable += 1
-                    target = target_pattern.search(masked_line)
-                    if target is not None:
+                    callees = list(referenced) or ["unresolved_called_computation"]
+                    for callee in callees:
                         edges.append(
                             {
                                 "caller": owner,
-                                "callee": normalized_symbol(target.group("target")),
+                                "callee": callee,
                                 "region_depth": region_depth,
                                 "ancestor_opcodes": (
                                     []
@@ -1363,6 +1469,8 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
                                 [] if region_depth == 0 else ["unknown_braced_region"]
                             ),
                             "instruction_sha256": instruction_hash,
+                            "reference_schema": reference_schema,
+                            "reference_parse_passed": reference_summary["passed"],
                         }
                     )
                 elif opcode is None:
@@ -1384,23 +1492,20 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
     for index, (owner_name, block) in enumerate(
         zip(call_owners, custom_blocks, strict=False)
     ):
-        masked_block = _mask_ir_quoted_content(block)
-        assignments = list(custom_reference_assignment_pattern.finditer(masked_block))
-        singles = list(custom_single_reference_pattern.finditer(masked_block))
-        collections = list(custom_collection_reference_pattern.finditer(masked_block))
-        empty_lists = list(custom_empty_reference_pattern.finditer(masked_block))
-        referenced = [normalized_symbol(item.group("target")) for item in singles]
-        for collection in collections:
-            referenced.extend(
-                normalized_symbol(item.group(0))
-                for item in computation_symbol_pattern.finditer(
-                    collection.group("targets")
-                )
-            )
-        malformed = len(assignments) != (
-            len(singles) + len(collections) + len(empty_lists)
+        reference_summary = _top_level_hlo_computation_references(block)
+        attributes = reference_summary["attributes"]
+        referenced = [target for item in attributes for target in item["targets"]]
+        only_empty_called_computation_attributes = all(
+            item["key"] in {"calls", "called_computations"}
+            and item["form"] in {"empty", "collection"}
+            and not item["targets"]
+            for item in attributes
         )
-        nonempty_or_malformed = bool(referenced) or malformed
+        nonempty_or_malformed = (
+            reference_summary["passed"] is not True
+            or bool(referenced)
+            or not only_empty_called_computation_attributes
+        )
         calls[index]["has_nonempty_or_malformed_called_computations"] = (
             nonempty_or_malformed
         )
@@ -1414,7 +1519,7 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
                     "instruction_sha256": calls[index]["instruction_sha256"],
                 }
             )
-            if malformed and not referenced:
+            if reference_summary["passed"] is not True and not referenced:
                 referenced.append("unresolved_called_computation")
             for callee in referenced:
                 edges.append(
@@ -1466,15 +1571,58 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         }
         for name, value in sorted(computations.items())
     ]
-    graph_safe = (
+    exactly_three_direct_entry_custom_calls = len(calls) == 3 and all(
+        call["direct_entry_owned"] for call in calls
+    )
+    nonentry_computations_have_zero_custom_calls = all(
+        item["is_entry"] or item["custom_call_count"] == 0
+        for item in sanitized_computations
+    )
+    custom_calls_have_no_called_computations = all(
+        not call["has_nonempty_or_malformed_called_computations"] for call in calls
+    )
+    entry_computation_sha256 = entry_id if len(entries) == 1 else None
+    fusion_edges_are_independent_entry_helpers = all(
+        edge["opcode"] == "fusion"
+        and edge["caller_computation_sha256"] == entry_computation_sha256
+        and edge["callee_resolved"]
+        and edge["callee_computation_sha256"] != entry_computation_sha256
+        and edge["region_depth"] == 0
+        and not edge["ancestor_opcodes"]
+        and edge["factor"] == "unknown"
+        for edge in sanitized_edges
+    )
+    fusion_containers_are_direct_entry_helpers = all(
+        item["opcode"] == "fusion"
+        and item["owner_computation_sha256"] == entry_computation_sha256
+        and item["region_depth"] == 0
+        and not item["ancestor_opcodes"]
+        and item.get("reference_parse_passed") is True
+        and item.get("reference_schema")
+        == [{"key": "calls", "form": "single", "target_count": 1}]
+        for item in forbidden
+    )
+    fusion_sites_are_one_to_one = len(sanitized_edges) == len(forbidden) and {
+        edge["instruction_sha256"] for edge in sanitized_edges
+    } == {item["instruction_sha256"] for item in forbidden}
+    independent_fusion_helpers_safe = (
+        fusion_edges_are_independent_entry_helpers
+        and fusion_containers_are_direct_entry_helpers
+        and fusion_sites_are_one_to_one
+    )
+    graph_is_custom_call_independent = (
         not graph["cycle_detected"]
         and graph["unknown_edge_count"] == 0
-        and graph["unknown_factor_edge_count"] == 0
+        and graph["unknown_factor_edge_count"] == len(sanitized_edges)
         and unknown_callable == 0
         and duplicate_computation_count == 0
         and unknown_instruction_count == 0
         and custom_call_block_count_matches_graph
-        and all(edge["ordinary_direct_call"] for edge in sanitized_edges)
+        and exactly_three_direct_entry_custom_calls
+        and sum(item["custom_call_count"] for item in sanitized_computations) == 3
+        and nonentry_computations_have_zero_custom_calls
+        and custom_calls_have_no_called_computations
+        and independent_fusion_helpers_safe
     )
     checks = {
         "raw_quote_aware_parse_balanced": balanced,
@@ -1485,12 +1633,24 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         "custom_call_blocks_match_instruction_graph": (
             custom_call_block_count_matches_graph
         ),
-        "all_custom_calls_directly_owned_by_entry": len(calls) == 3
-        and all(call["direct_entry_owned"] for call in calls),
-        "no_callable_or_control_flow_container": not edges
-        and not forbidden
-        and unknown_callable == 0,
-        "call_graph_is_acyclic_resolved_and_direct": graph_safe,
+        "exactly_three_custom_calls_all_directly_owned_by_entry": (
+            exactly_three_direct_entry_custom_calls
+        ),
+        "all_nonentry_computations_have_zero_custom_calls": (
+            nonentry_computations_have_zero_custom_calls
+        ),
+        "custom_calls_have_no_called_computations": (
+            custom_calls_have_no_called_computations
+        ),
+        "only_independent_direct_entry_fusion_helpers_are_present": (
+            independent_fusion_helpers_safe
+        ),
+        "no_container_can_own_or_duplicate_a_custom_call": (
+            graph_is_custom_call_independent
+        ),
+        "call_graph_is_acyclic_resolved_and_custom_call_independent": (
+            graph_is_custom_call_independent
+        ),
     }
     return {
         "parser": "raw_quote_aware_hlo_computation_graph",
@@ -1511,6 +1671,9 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         "duplicate_computation_count": duplicate_computation_count,
         "custom_call_block_count_matches_graph": (
             custom_call_block_count_matches_graph
+        ),
+        "allowed_independent_entry_fusion_helper_count": (
+            len(sanitized_edges) if independent_fusion_helpers_safe else 0
         ),
         "entry_multiplicity": graph,
         "raw_quote_scan": {
@@ -1623,9 +1786,7 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
             marker_counts[kind] == 1 for kind in _EXPECTED_MARKERS
         ),
         "no_unexpected_or_lookalike_bounded_markers": not unexpected,
-        "all_calls_directly_owned_by_sole_entry_without_callable_container": (
-            ownership["passed"]
-        ),
+        "all_calls_direct_entry_and_container_independent": (ownership["passed"]),
         "no_outer_while": while_count == 0,
     }
     return {

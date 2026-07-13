@@ -573,7 +573,7 @@ def test_helper_called_once_is_reported_once_but_runtime_direct_entry_gate_rejec
     assert ownership["direct_entry_custom_call_count"] == 0
     assert summary["passed"] is False
     serialized = json.dumps(summary)
-    assert "helper" not in serialized
+    assert '"helper"' not in serialized
     assert _TARGET not in serialized
 
 
@@ -644,6 +644,184 @@ def test_direct_custom_call_with_called_computation_is_unknown_and_rejected(dial
         item for item in ownership["computations"] if item["is_entry"] is False
     )
     assert helper["saturated_entry_multiplicity"] == "unknown"
+    assert summary["passed"] is False
+
+
+def _optimized_with_independent_entry_fusions(count: int) -> str:
+    helpers: list[str] = ["HloModule independent_fusions"]
+    for index in range(count):
+        helpers.extend(
+            [
+                f"helper_{index} {{",
+                f"  ROOT %helper_root_{index} = () tuple()",
+                "}",
+            ]
+        )
+    entry = _optimized_hlo_calls().splitlines()
+    entry[-1:-1] = [
+        f"  %fusion_{index} = () fusion(), calls=%helper_{index}"
+        for index in range(count)
+    ]
+    return "\n".join([*helpers, *entry])
+
+
+@pytest.mark.parametrize("fusion_count", (1, 3))
+def test_independent_entry_fusions_with_zero_custom_call_helpers_are_allowed(
+    fusion_count,
+):
+    summary = _PROBE._strict_vjp_ir_summary(
+        _optimized_with_independent_entry_fusions(fusion_count), "optimized_hlo"
+    )
+    ownership = summary["entry_call_ownership"]
+    assert summary["passed"] is True
+    assert ownership["direct_entry_custom_call_count"] == 3
+    assert all(
+        item["custom_call_count"] == 0
+        for item in ownership["computations"]
+        if item["is_entry"] is False
+    )
+    assert ownership["allowed_independent_entry_fusion_helper_count"] == fusion_count
+    assert (
+        ownership["checks"]["no_container_can_own_or_duplicate_a_custom_call"] is True
+    )
+
+
+@pytest.mark.parametrize(
+    "nested_reference",
+    (
+        "backend_config={calls=%helper_0}",
+        "metadata={called_computations={%helper_0}}",
+        "backend_config={condition=%helper_0}",
+    ),
+)
+def test_nested_metadata_cannot_impersonate_required_top_level_fusion_edge(
+    nested_reference,
+):
+    text = _optimized_with_independent_entry_fusions(1).replace(
+        "calls=%helper_0", nested_reference, 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["allowed_independent_entry_fusion_helper_count"] == 0
+    assert ownership["call_edges"] == []
+    assert (
+        ownership["checks"]["only_independent_direct_entry_fusion_helpers_are_present"]
+        is False
+    )
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "reference_schema",
+    (
+        "condition=%helper_0",
+        "to_apply=%helper_0",
+        "called_computations=%helper_0",
+        "branch_computations={%helper_0}",
+        "calls=%helper_0, condition=[]",
+    ),
+)
+def test_fusion_requires_exactly_one_singular_top_level_calls_attribute(
+    reference_schema,
+):
+    text = _optimized_with_independent_entry_fusions(1).replace(
+        "calls=%helper_0", reference_schema, 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["allowed_independent_entry_fusion_helper_count"] == 0
+    assert (
+        ownership["checks"]["only_independent_direct_entry_fusion_helpers_are_present"]
+        is False
+    )
+    assert summary["passed"] is False
+
+
+def test_fusion_helper_that_owns_custom_calls_remains_rejected():
+    text = _helper_owned_calls("optimized_hlo", main_invocations=0).replace(
+        "ENTRY main {",
+        "ENTRY main {\n  %fusion = () fusion(), calls=%helper",
+        1,
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["direct_entry_custom_call_count"] == 0
+    assert (
+        ownership["checks"]["all_nonentry_computations_have_zero_custom_calls"] is False
+    )
+    assert summary["passed"] is False
+
+
+def test_cycle_inside_otherwise_zero_custom_call_fusion_helper_remains_rejected():
+    text = _optimized_with_independent_entry_fusions(1).replace(
+        "helper_0 {",
+        "helper_0 {\n  %cycle = () fusion(), calls=%helper_0",
+        1,
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["entry_multiplicity"]["cycle_detected"] is True
+    assert (
+        ownership["checks"]["no_container_can_own_or_duplicate_a_custom_call"] is False
+    )
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "%wrapped = () call(), to_apply=%helper_0",
+        "%wrapped = () conditional(), branch_computations={%helper_0}",
+        "%wrapped = () while(), condition=%helper_0, body=%helper_0",
+        "%wrapped = () async-start(), calls=%helper_0",
+        "%wrapped = () mystery(), to_apply=%helper_0",
+        "%wrapped = () mystery(), calls=%helper_0",
+        "%wrapped = () mystery(), called_computations={%helper_0}",
+        "%wrapped = () mystery(), condition=%helper_0",
+    ),
+)
+def test_zero_custom_call_helpers_under_nonfusion_wrappers_remain_rejected(
+    replacement,
+):
+    text = _optimized_with_independent_entry_fusions(1).replace(
+        "%fusion_0 = () fusion(), calls=%helper_0", replacement, 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["direct_entry_custom_call_count"] == 3
+    assert all(
+        item["custom_call_count"] == 0
+        for item in ownership["computations"]
+        if item["is_entry"] is False
+    )
+    assert (
+        ownership["checks"]["only_independent_direct_entry_fusion_helpers_are_present"]
+        is False
+    )
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "calls=%helper_0",
+        "called_computations={%helper_0}",
+        "condition=%helper_0",
+    ),
+)
+def test_unknown_helper_self_references_are_cycle_unknown_and_rejected(reference):
+    text = _optimized_with_independent_entry_fusions(1).replace(
+        "helper_0 {",
+        f"helper_0 {{\n  %hidden = () mystery(), {reference}",
+        1,
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo")
+    ownership = summary["entry_call_ownership"]
+    assert ownership["entry_multiplicity"]["cycle_detected"] is True
+    assert ownership["unknown_callable_count"] > 0
+    assert (
+        ownership["checks"]["no_container_can_own_or_duplicate_a_custom_call"] is False
+    )
     assert summary["passed"] is False
 
 
