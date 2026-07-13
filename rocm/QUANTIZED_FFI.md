@@ -181,16 +181,16 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
     --platform rocm --phase compile --allow-gpu --run-dir "$run_dir"
 ```
 
-Controller completion still does not establish runtime correctness or native
-INT8 ISA. It establishes only an unpromoted compile diagnostic whose private
-probe, telemetry, compiler, handoff, and final-journal artifacts must be
-reviewed together. Optimized HLO proving one Triton custom call is not an INT8
-ISA proof, and surrounding optimized-HLO fusions may still launch separate
-kernels. The probe therefore persists raw StableHLO and optimized HLO and marks
-the result `passed_compile_diagnostic_unpromoted`. Promotion requires
-correlating an actual retained Pallas code object with the forward symbol,
-gfx1100 disassembly, resource use, and a later runtime trace that proves both
-the dispatched symbol and absence of graph/capture APIs. If that chain is not
+Controller completion by itself does not establish runtime correctness or
+native INT8 ISA. It establishes only an unpromoted compile diagnostic whose
+private probe, telemetry, compiler, handoff, and final-journal artifacts must
+be reviewed together. Optimized HLO proving one Triton custom call is not an
+INT8 ISA proof, and surrounding optimized-HLO fusions may still launch
+separate kernels. The probe therefore persists raw StableHLO and optimized HLO
+and marks the result `passed_compile_diagnostic_unpromoted`. A separate offline
+audit must correlate an actual retained code object with the forward symbol,
+gfx1100 disassembly, and resource use. Runtime promotion additionally requires
+a guarded dispatch trace and host numerical comparison. If that chain is not
 available, the result remains only a Pallas Triton custom-call compile proof.
 Version/origin checks and selected binary hashes do not constitute a complete
 hash closure over every JAX, NumPy, ML-dtypes, ROCm, and system runtime file;
@@ -205,9 +205,70 @@ call to the unique public entry, and require its SSA result to reach the entry
 return/ROOT through data operands. Metadata, nested-map, comment, payload,
 dead-helper, dead-result, and control-predecessor decoys all fail closed.
 
-Only after the tiny compile diagnostic is reviewed and a separate source
-revision safely enables the one-shot forward will the ladder change one risk
-dimension at a time: signed base-only semantics;
+### Qualified tiny compile and native ISA result
+
+Exact revision `da9bf1ee6195921fd7c8cf9055a3dc8d4a1ed704` completed the
+compile-only rung in `/tmp/skyrl-w8a8-compile-1783972228`. The controller
+returned `passed_compile_diagnostic_unpromoted`, the worktree remained clean,
+and the returned executable was invoked zero times. Lowering and compilation
+took 1.134153 and 0.719444 seconds. The compiler-reported argument, output, and
+temporary sizes were 2,806, 102, and 3,600 bytes. StableHLO and optimized HLO
+had SHA-256 values
+`0e57123dd6c1d4355b7ccbbf0f7908db686ceaafc6d26afbb237811f8861ecdf`
+and
+`7adf78dc72eebed7a4eaa0c1e88f7ba43ecea0199d54817fcaeb2fcc3b5aa0dc`.
+Both independently parse as one entry-owned Triton custom call whose result
+feeds the public output, with the exact forward name and no backward, outer
+loop, graph, capture, command-buffer, or replay marker.
+
+`rocm/inspect_w8a8_lora_isa.py` reproduces the retained-code audit without
+importing JAX or opening a GPU device. It binds the private cache entry by
+SHA-256, bounds zstd and Snappy output before accepting it, decodes the exact
+IFRT/Riegeli split record structure, inventories every embedded ELF, and uses
+hash-pinned ROCm LLVM tools. The decoded record sizes are
+`[56, 0, 1920, 0, 52425]`. The 1,920-byte wrapper record contains an empty
+1,904-byte ELF plus a 16-byte trailer; its `.text` is empty and it has no
+kernel, so it is explicitly rejected as ISA evidence. The final record
+contains five ELFs. Selection is by the unique exact function symbol rather
+than record position.
+
+The retained result can be rechecked offline with:
+
+```bash
+cache=/tmp/skyrl-w8a8-compile-1783972228/compiler-artifacts/jax-cache/\
+jit_candidate-1d44db98de8b8ab596105a0991d6a240efebc1d3d29ab28606b6365a828cb645-cache
+/usr/bin/python3 -I -S -B rocm/inspect_w8a8_lora_isa.py "$cache" \
+  --expected-cache-sha256 \
+  d00d54b9e684852a1d933eafb332e058c5b232d79f687dc936951887e3f646a2
+```
+
+The selected code object is exactly 8,440 bytes with SHA-256
+`606a80a508317af303966e5c2ca357d138d08828949c0dbfdcd73ccde1726389`.
+It binds `skyrl_qwen35_w8a8_lora_forward` to
+`amdgcn--amdhsa-amdgiz-gfx1100`, reports 34 SGPRs, 62 VGPRs, zero SGPR/VGPR
+spills, zero private segment, wave32, maximum workgroup size 128, and maximum
+grid `1x2x1`. Its disassembly contains exactly four
+`v_wmma_i32_16x16x16_iu8` instructions, all with signed-operand metadata
+`neg_lo:[1,1,0]`. Paired with the exact HLO/custom-call evidence, this proves
+native RDNA3 signed-INT8 WMMA code generation for the fixed tiny Pallas
+forward. It does **not** prove that the code was dispatched, that its result is
+correct, or that it is faster than BF16. The Riegeli internal checksum
+algorithm is not reimplemented; the retained artifact is instead anchored by
+the whole-cache SHA-256 plus exact boundaries and decompression return codes.
+
+The guarded compile consumed at most 867,360,768 bytes of physical VRAM,
+reached 51 C junction temperature and 113 W sampled average power, and used no
+additional swap. All 1,090 measured telemetry samples were within the fixed
+limits, with a maximum sample gap of 0.0899 seconds. The process returned to
+the exact 27,947,008-byte VRAM and 15,966,208-byte GTT baseline, remained
+headless and unowned, reached runtime suspend for three consecutive handoff
+samples, and left the whole-boot AMDGPU journal clean. These are compile and
+native-code-generation results, not performance measurements.
+
+The next separate rung is exactly one host-checked invocation of the same tiny
+forward. Only after that source and its fresh nested-ELF gate are independently
+reviewed will the ladder change one risk dimension at a time: signed base-only
+semantics;
 `K=128`; three row superblocks; small base/fused VJPs; K-scan lengths 8/40/144;
 N-scan lengths 8/32/128/288; then the first real `K=2560,N=18432` gate/up
 rectangle. The artificial `K=9216,N=18432` rectangle is not a model shape and
@@ -351,7 +412,9 @@ The compile proof is not a reason to enable either route. Required gates are:
    for each projection family before model-wide activation.
 
 The only current performance conclusion is feasibility: W8A8 and W4A4 can be
-compiled natively on this gfx1100 toolchain, and the compact formats offer
-large, already-calculated residency savings. Their speed advantage remains an
-experiment because input quantization, group rescaling, LoRA work, backward,
-and bounded-launch overhead are not represented by the fragment compile probe.
+compiled natively on this gfx1100 toolchain, the exact tiny Pallas W8A8 forward
+emits signed-IU8 WMMA, and the compact formats offer large, already-calculated
+residency savings. No Pallas W8 executable has run. Its speed advantage remains
+an experiment because runtime correctness, input quantization, group
+rescaling, LoRA work, backward, and bounded-launch overhead have not been
+benchmarked against the complete BF16 projection.

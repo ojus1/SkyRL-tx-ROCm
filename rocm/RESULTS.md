@@ -90,6 +90,40 @@ observed result was dK at `0.003628` (about 0.363%). The separate full-model and
 safety gates remain; neither compile success nor bounded autotuning qualifies
 the complete training path.
 
+### Exact W8A8 Pallas compile and ISA qualification
+
+Revision `da9bf1ee6195921fd7c8cf9055a3dc8d4a1ed704` completed the fixed
+`M=3,K=64,N=17`, group-64, rank-8 LoRA compile diagnostic with zero returned
+executable invocations. Lowering and compilation took 1.134153 and 0.719444
+seconds. StableHLO and optimized HLO each contain exactly one entry-owned
+Triton custom call with the exact forward name and live result. Their SHA-256
+values are
+`0e57123dd6c1d4355b7ccbbf0f7908db686ceaafc6d26afbb237811f8861ecdf`
+and
+`7adf78dc72eebed7a4eaa0c1e88f7ba43ecea0199d54817fcaeb2fcc3b5aa0dc`.
+The structured compiler memory report totals 6,508 bytes excluding generated
+code.
+
+An independent, CPU-only parse of the retained JAX cache
+`d00d54b9e684852a1d933eafb332e058c5b232d79f687dc936951887e3f646a2`
+distinguishes the empty top-level wrapper from the real nested Pallas object.
+The unique symbol-matched object is 8,440 bytes with SHA-256
+`606a80a508317af303966e5c2ca357d138d08828949c0dbfdcd73ccde1726389`.
+ROCm LLVM reports target `amdgcn--amdhsa-amdgiz-gfx1100`, 34 SGPRs, 62
+VGPRs, zero compiler-reported spills, and zero private segment. Disassembly
+contains exactly four signed `v_wmma_i32_16x16x16_iu8` instructions. Paired
+with the HLO call identity, this qualifies native gfx1100 signed-INT8 WMMA
+code generation for this exact Pallas microcase. It does not qualify runtime
+correctness or speed.
+
+Peak observed physical VRAM, junction temperature, and sampled average power
+were 867,360,768 bytes, 51 C, and 113 W. Swap did not grow, all monitored
+limits passed, no driver fault appeared, and the device returned to its exact
+suspended/unowned idle baseline. Artifacts are under
+`/tmp/skyrl-w8a8-compile-1783972228`. The next permitted risk rung remains one
+fresh-cache, fresh-ISA-qualified, host-checked forward invocation; no warmup,
+replay, backward, model integration, or throughput run is implied.
+
 ### Stable-source T1024 executable-cache qualification
 
 Exact commit `5fb2b220bfbf202ac2b9295efb9e9a072cc00135` completed one
