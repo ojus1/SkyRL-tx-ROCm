@@ -2103,8 +2103,90 @@ _T1024_CALL_ABI = {
 }
 _HLO_SHAPE_LEAF_PATTERN = re.compile(
     r"(?P<dtype>bf16|f32|s32)\[(?P<dims>\d+(?:,\d+)*)?\]"
-    r"(?:\{[^{}\r\n]*\})?"
 )
+_HLO_SYMBOL_PATTERN = re.compile(
+    r"(?:%[A-Za-z_0-9][A-Za-z0-9_.$-]*|[A-Za-z_][A-Za-z0-9_.$-]*)"
+)
+
+
+def _balanced_closing_delimiter(
+    text: str, opening: int, opening_character: str, closing_character: str
+) -> int | None:
+    if opening < 0 or opening >= len(text) or text[opening] != opening_character:
+        return None
+    depth = 0
+    for index in range(opening, len(text)):
+        character = text[index]
+        if character == opening_character:
+            depth += 1
+        elif character == closing_character:
+            depth -= 1
+            if depth == 0:
+                return index
+            if depth < 0:
+                return None
+    return None
+
+
+def _mask_hlo_operand_index_comments(text: str) -> dict[str, Any]:
+    """Mask only XLA's well-formed ``/*index=N*/`` operand annotations."""
+    masked = list(text)
+    annotation_count = 0
+    malformed_count = 0
+    index = 0
+    while index < len(text):
+        opening = text.find("/*", index)
+        orphan_closing = text.find("*/", index)
+        if orphan_closing >= 0 and (opening < 0 or orphan_closing < opening):
+            malformed_count += 1
+            index = orphan_closing + 2
+            continue
+        if opening < 0:
+            break
+        closing = text.find("*/", opening + 2)
+        nested = text.find("/*", opening + 2, closing if closing >= 0 else len(text))
+        if closing < 0 or nested >= 0:
+            malformed_count += 1
+            break
+        body = text[opening + 2 : closing]
+        if re.fullmatch(r"\s*index\s*=\s*\d+\s*", body) is None:
+            malformed_count += 1
+        else:
+            annotation_count += 1
+        for offset in range(opening, closing + 2):
+            if masked[offset] != "\n":
+                masked[offset] = " "
+        index = closing + 2
+    return {
+        "masked": "".join(masked),
+        "annotation_count": annotation_count,
+        "malformed_count": malformed_count,
+        "passed": malformed_count == 0,
+    }
+
+
+def _split_hlo_operand_segments(text: str) -> list[str] | None:
+    segments: list[str] = []
+    start = 0
+    depths = {"(": 0, "[": 0, "{": 0}
+    closing_to_opening = {")": "(", "]": "[", "}": "{"}
+    for index, character in enumerate(text):
+        if character in depths:
+            depths[character] += 1
+        elif character in closing_to_opening:
+            opening = closing_to_opening[character]
+            depths[opening] -= 1
+            if depths[opening] < 0:
+                return None
+        elif character == "," and all(depth == 0 for depth in depths.values()):
+            segments.append(text[start:index].strip())
+            start = index + 1
+    if any(depths.values()):
+        return None
+    tail = text[start:].strip()
+    if tail or segments:
+        segments.append(tail)
+    return segments
 
 
 def _canonical_stablehlo_tensor_type(token: str) -> str | None:
@@ -2119,19 +2201,53 @@ def _canonical_stablehlo_tensor_type(token: str) -> str | None:
 
 def _canonical_hlo_shape_leaves(shape_text: str) -> dict[str, Any]:
     matches = list(_HLO_SHAPE_LEAF_PATTERN.finditer(shape_text))
-    leaves = [
-        f"{'i32' if match.group('dtype') == 's32' else match.group('dtype')}"
-        f"[{match.group('dims') or ''}]"
-        for match in matches
-    ]
-    skeleton = _HLO_SHAPE_LEAF_PATTERN.sub("S", shape_text)
-    skeleton = re.sub(r"\s+", "", skeleton)
+    leaves: list[str] = []
+    skeleton_pieces: list[str] = []
+    layout_annotation_count = 0
+    malformed_layout_count = 0
+    cursor = 0
+    for match in matches:
+        if match.start() < cursor:
+            malformed_layout_count += 1
+            continue
+        skeleton_pieces.append(shape_text[cursor : match.start()])
+        leaves.append(
+            f"{'i32' if match.group('dtype') == 's32' else match.group('dtype')}"
+            f"[{match.group('dims') or ''}]"
+        )
+        cursor = match.end()
+        layout_start = cursor
+        while layout_start < len(shape_text) and shape_text[layout_start].isspace():
+            layout_start += 1
+        if layout_start < len(shape_text) and shape_text[layout_start] == "{":
+            layout_stop = _balanced_closing_delimiter(
+                shape_text, layout_start, "{", "}"
+            )
+            if layout_stop is None:
+                malformed_layout_count += 1
+            else:
+                layout_annotation_count += 1
+                cursor = layout_stop + 1
+        skeleton_pieces.append("S")
+    skeleton_pieces.append(shape_text[cursor:])
+    skeleton = re.sub(r"\s+", "", "".join(skeleton_pieces))
     expected_skeleton = (
         "S" if len(leaves) == 1 else f"({','.join(['S'] * len(leaves))})"
     )
+    checks = {
+        "at_least_one_shape_leaf": bool(leaves),
+        "layout_annotations_balanced": malformed_layout_count == 0,
+        "only_single_leaf_or_flat_tuple_shape_grammar_remains": (
+            skeleton == expected_skeleton
+        ),
+    }
     return {
         "leaves": leaves,
-        "passed": bool(leaves) and skeleton == expected_skeleton,
+        "layout_annotation_count": layout_annotation_count,
+        "malformed_layout_count": malformed_layout_count,
+        "residual_grammar_sha256": hashlib.sha256(skeleton.encode("utf-8")).hexdigest(),
+        "checks": checks,
+        "passed": all(checks.values()),
     }
 
 
@@ -2191,15 +2307,39 @@ def _internal_alias_pairs(block: str, dialect: str) -> dict[str, Any]:
 
 def _stablehlo_call_signature(block: str) -> dict[str, Any]:
     masked = _mask_ir_quoted_content(block)
-    operation = re.search(r"stablehlo\.custom_call\s+@\s*\(", masked)
+    operation = re.search(r"\bstablehlo\.custom_call\b", masked)
     assignment = masked.find("=")
-    if operation is None or assignment < 0 or assignment > operation.start():
+    opening = masked.find("(", operation.end()) if operation is not None else -1
+    closing = _balanced_closing_delimiter(masked, opening, "(", ")")
+    target_prefix = (
+        masked[operation.end() : opening]
+        if operation is not None and opening >= 0
+        else ""
+    )
+    target_syntax_passed = (
+        re.fullmatch(r"\s+@(?:\s+|[A-Za-z0-9_.$-]+)\s*", target_prefix) is not None
+    )
+    if (
+        operation is None
+        or assignment < 0
+        or assignment > operation.start()
+        or closing is None
+    ):
         return {
             "passed": False,
             "results": [],
             "operands": [],
             "operand_shapes": [],
             "result_shapes": [],
+            "input_type_count": 0,
+            "result_type_count": 0,
+            "parse_diagnostics": {
+                "opcode_located": operation is not None,
+                "target_syntax_passed": target_syntax_passed,
+                "balanced_operand_region": closing is not None,
+                "raw_ir_emitted": False,
+                "raw_symbols_emitted": False,
+            },
         }
     lhs = masked[:assignment]
     lhs_tokens = re.findall(r"%[A-Za-z_0-9][A-Za-z0-9_.$-]*", lhs)
@@ -2210,17 +2350,17 @@ def _stablehlo_call_signature(block: str) -> dict[str, Any]:
         ]
     else:
         results = lhs_tokens
-    opening = masked.find("(", operation.start())
-    closing = masked.find(")", opening + 1)
+    operand_segments = _split_hlo_operand_segments(masked[opening + 1 : closing])
+    operand_pattern = re.compile(r"%[A-Za-z_0-9][A-Za-z0-9_.$-]*(?:#\d+)?")
     operands = (
-        re.findall(
-            r"%[A-Za-z_0-9][A-Za-z0-9_.$-]*(?:#\d+)?",
-            masked[opening + 1 : closing],
-        )
-        if opening >= 0 and closing >= 0
+        [segment for segment in operand_segments if operand_pattern.fullmatch(segment)]
+        if operand_segments is not None
         else []
     )
-    type_tail = masked[closing + 1 :] if closing >= 0 else ""
+    operands_exact = operand_segments is not None and len(operands) == len(
+        operand_segments
+    )
+    type_tail = masked[closing + 1 :]
     arrow = type_tail.find("->")
     input_types = re.findall(r"tensor<[^>]+>", type_tail[:arrow]) if arrow >= 0 else []
     result_types = (
@@ -2230,6 +2370,8 @@ def _stablehlo_call_signature(block: str) -> dict[str, Any]:
     result_shapes = [_canonical_stablehlo_tensor_type(item) for item in result_types]
     passed = (
         arrow >= 0
+        and target_syntax_passed
+        and operands_exact
         and len(operands) == len(input_types)
         and len(results) == len(result_types)
         and all(item is not None for item in (*operand_shapes, *result_shapes))
@@ -2242,6 +2384,17 @@ def _stablehlo_call_signature(block: str) -> dict[str, Any]:
         "result_shapes": result_shapes,
         "input_type_count": len(input_types),
         "result_type_count": len(result_types),
+        "parse_diagnostics": {
+            "opcode_located": True,
+            "target_syntax_passed": target_syntax_passed,
+            "balanced_operand_region": True,
+            "operand_segment_count": (
+                len(operand_segments) if operand_segments is not None else None
+            ),
+            "all_operand_segments_are_exact_ssa_symbols": operands_exact,
+            "raw_ir_emitted": False,
+            "raw_symbols_emitted": False,
+        },
     }
 
 
@@ -2274,8 +2427,10 @@ def _optimized_hlo_instruction_graph(text: str) -> dict[str, Any]:
     owner_is_entry = False
     duplicate_entry_instruction_count = 0
     copy_instruction_count = 0
+    malformed_custom_call_operand_region_count = 0
     opcode_inventory: dict[str, int] = {}
-    for line in _mask_ir_quoted_content(text).splitlines():
+    comment_scan = _mask_hlo_operand_index_comments(_mask_ir_quoted_content(text))
+    for line in comment_scan["masked"].splitlines():
         line_depth = depth
         if line_depth == 0 and line.rstrip().endswith("{"):
             header = entry_header.match(line)
@@ -2297,13 +2452,21 @@ def _optimized_hlo_instruction_graph(text: str) -> dict[str, Any]:
                     opcode_inventory[opcode] = opcode_inventory.get(opcode, 0) + 1
                     copy_instruction_count += int(opcode == "copy")
                     opening = definition.find("(", opcode_match.start())
-                    closing = definition.find(")", opening + 1)
+                    closing = _balanced_closing_delimiter(definition, opening, "(", ")")
+                    operand_segments = (
+                        _split_hlo_operand_segments(definition[opening + 1 : closing])
+                        if closing is not None
+                        else None
+                    )
+                    exact_symbol_operands = operand_segments is not None and all(
+                        _HLO_SYMBOL_PATTERN.fullmatch(segment) is not None
+                        for segment in operand_segments
+                    )
+                    if opcode == "custom-call" and not exact_symbol_operands:
+                        malformed_custom_call_operand_region_count += 1
                     operands = (
-                        re.findall(
-                            r"%?[A-Za-z_0-9][A-Za-z0-9_.$-]*",
-                            definition[opening + 1 : closing],
-                        )
-                        if opening >= 0 and closing >= 0
+                        list(operand_segments)
+                        if exact_symbol_operands and operand_segments is not None
                         else []
                     )
                     tuple_index = re.search(r"\bindex\s*=\s*(\d+)", definition)
@@ -2320,6 +2483,11 @@ def _optimized_hlo_instruction_graph(text: str) -> dict[str, Any]:
                                 ],
                                 "tuple_index": (
                                     int(tuple_index.group(1)) if tuple_index else None
+                                ),
+                                "operand_parse_passed": (
+                                    exact_symbol_operands
+                                    if opcode == "custom-call"
+                                    else closing is not None
                                 ),
                             }
         for character in line:
@@ -2340,28 +2508,79 @@ def _optimized_hlo_instruction_graph(text: str) -> dict[str, Any]:
         "entry_instruction_count": len(instructions),
         "duplicate_entry_instruction_count": duplicate_entry_instruction_count,
         "copy_instruction_count": copy_instruction_count,
+        "operand_annotation_scan": {
+            key: value for key, value in comment_scan.items() if key != "masked"
+        },
+        "malformed_custom_call_operand_region_count": (
+            malformed_custom_call_operand_region_count
+        ),
         "opcode_inventory": dict(sorted(opcode_inventory.items())),
         "consumer_counts": consumer_counts,
     }
 
 
-def _optimized_hlo_call_name_and_operands(block: str) -> tuple[str | None, list[str]]:
-    masked = _mask_ir_quoted_content(block)
+def _optimized_hlo_call_parse(block: str) -> dict[str, Any]:
+    comment_scan = _mask_hlo_operand_index_comments(_mask_ir_quoted_content(block))
+    masked = comment_scan["masked"]
     match = re.search(
         r"^\s*(?:ROOT\s+)?(?P<name>%?[A-Za-z_0-9][A-Za-z0-9_.$-]*)\s*=.*?custom-call\s*\(",
         masked,
         flags=re.MULTILINE,
     )
     if match is None:
-        return None, []
+        return {
+            "name": None,
+            "operands": [],
+            "passed": False,
+            "diagnostics": {
+                "opcode_located": False,
+                "balanced_operand_region": False,
+                "operand_segment_count": 0,
+                "exact_ssa_operand_count": 0,
+                "operand_annotation_count": comment_scan["annotation_count"],
+                "malformed_operand_annotation_count": comment_scan["malformed_count"],
+                "raw_ir_emitted": False,
+                "raw_symbols_emitted": False,
+            },
+        }
     opening = match.end() - 1
-    closing = masked.find(")", opening + 1)
-    operands = re.findall(
-        r"%?[A-Za-z_0-9][A-Za-z0-9_.$-]*", masked[opening + 1 : closing]
+    closing = _balanced_closing_delimiter(masked, opening, "(", ")")
+    segments = (
+        _split_hlo_operand_segments(masked[opening + 1 : closing])
+        if closing is not None
+        else None
     )
-    return match.group("name").removeprefix("%"), [
-        item.removeprefix("%") for item in operands
-    ]
+    exact = segments is not None and all(
+        _HLO_SYMBOL_PATTERN.fullmatch(segment) for segment in segments
+    )
+    operands = (
+        [segment.removeprefix("%") for segment in segments]
+        if exact and segments is not None
+        else []
+    )
+    return {
+        "name": match.group("name").removeprefix("%"),
+        "operands": operands,
+        "passed": bool(
+            closing is not None and exact and comment_scan["passed"] is True
+        ),
+        "diagnostics": {
+            "opcode_located": True,
+            "balanced_operand_region": closing is not None,
+            "operand_segment_count": len(segments) if segments is not None else None,
+            "exact_ssa_operand_count": len(operands),
+            "all_operand_segments_are_exact_ssa_symbols": exact,
+            "operand_annotation_count": comment_scan["annotation_count"],
+            "malformed_operand_annotation_count": comment_scan["malformed_count"],
+            "raw_ir_emitted": False,
+            "raw_symbols_emitted": False,
+        },
+    }
+
+
+def _optimized_hlo_call_name_and_operands(block: str) -> tuple[str | None, list[str]]:
+    parsed = _optimized_hlo_call_parse(block)
+    return parsed["name"], parsed["operands"]
 
 
 def _t1024_call_abi_signature(
@@ -2376,11 +2595,16 @@ def _t1024_call_abi_signature(
         result_shapes = parsed["result_shapes"]
         parser_passed = parsed["passed"]
         parser = "stablehlo_exact_function_type"
+        parse_diagnostics = parsed["parse_diagnostics"]
+        operand_count = len(operand_shapes)
     elif dialect == "optimized_hlo":
         graph_summary = optimized_graph or _optimized_hlo_instruction_graph(text)
         graph = graph_summary["instructions"]
-        _call_name, operands = _optimized_hlo_call_name_and_operands(block)
-        masked = _mask_ir_quoted_content(block)
+        call_parse = _optimized_hlo_call_parse(block)
+        operands = call_parse["operands"]
+        masked = _mask_hlo_operand_index_comments(_mask_ir_quoted_content(block))[
+            "masked"
+        ]
         assignment = masked.find("=")
         opcode = re.search(r"\bcustom-call\s*\(", masked)
         result_parse = (
@@ -2394,19 +2618,46 @@ def _t1024_call_abi_signature(
         ]
         operand_shapes = [
             parsed["leaves"][0]
-            for parsed in operand_parses
             if parsed["passed"] and len(parsed["leaves"]) == 1
+            else None
+            for parsed in operand_parses
         ]
         result_shapes = result_parse["leaves"]
+        all_operands_resolve = all(name in graph for name in operands)
         parser_passed = (
-            result_parse["passed"]
-            and len(operand_shapes) == len(operands)
+            call_parse["passed"]
+            and graph_summary["operand_annotation_scan"]["passed"]
+            and graph_summary["malformed_custom_call_operand_region_count"] == 0
+            and all_operands_resolve
+            and result_parse["passed"]
             and all(
                 parsed["passed"] and len(parsed["leaves"]) == 1
                 for parsed in operand_parses
             )
         )
         parser = "optimized_hlo_entry_ssa_shapes_layout_agnostic"
+        operand_count = len(operands)
+        parse_diagnostics = {
+            "call_operand_parse": call_parse["diagnostics"],
+            "graph_operand_annotation_scan": graph_summary["operand_annotation_scan"],
+            "graph_malformed_custom_call_operand_region_count": graph_summary[
+                "malformed_custom_call_operand_region_count"
+            ],
+            "all_operands_resolve_to_entry_instructions": all_operands_resolve,
+            "resolved_operand_count": sum(name in graph for name in operands),
+            "unresolved_operand_symbol_sha256": [
+                _symbol_sha256(name) for name in operands if name not in graph
+            ],
+            "result_shape_parse": {
+                key: value for key, value in result_parse.items() if key != "leaves"
+            },
+            "operand_shape_parse": [
+                {key: value for key, value in item.items() if key != "leaves"}
+                for item in operand_parses
+            ],
+            "raw_ir_emitted": False,
+            "raw_symbols_emitted": False,
+        }
     else:
         raise ValueError("unsupported VJP IR dialect")
     matching_kinds = [
@@ -2421,11 +2672,12 @@ def _t1024_call_abi_signature(
     }
     return {
         "parser": parser,
-        "operand_count": len(operand_shapes),
+        "operand_count": operand_count,
         "result_count": len(result_shapes),
         "operand_shapes": operand_shapes,
         "result_shapes": result_shapes,
         "matching_kinds": matching_kinds,
+        "parse_diagnostics": parse_diagnostics,
         "checks": checks,
         "passed": all(checks.values()),
         "raw_ir_emitted": False,
@@ -2458,7 +2710,7 @@ def _t1024_accumulator_dataflow_summary(
     chain_dk = False
     chain_dv = False
     accumulator_projection_single_use = False
-    direct_accumulator_path_has_no_data_movement = False
+    accumulator_paths_exact = False
     accumulator_shapes_exact = False
     whole_program_data_movement_opcode_counts = dict.fromkeys(
         ("concatenate", "convert", "copy"), 0
@@ -2480,7 +2732,7 @@ def _t1024_accumulator_dataflow_summary(
             opcode: len(re.findall(rf"\bstablehlo\.{opcode}\b", masked_text))
             for opcode in whole_program_data_movement_opcode_counts
         }
-        direct_accumulator_path_has_no_data_movement = chain_dk and chain_dv
+        accumulator_paths_exact = chain_dk and chain_dv
         accumulator_shapes_exact = (
             q0_signature.get("accumulator_types_exact") is True
             and q512_signature.get("accumulator_types_exact") is True
@@ -2498,35 +2750,114 @@ def _t1024_accumulator_dataflow_summary(
     elif located and dialect == "optimized_hlo":
         graph_summary = _optimized_hlo_instruction_graph(text)
         graph = graph_summary["instructions"]
-        q0_name, _q0_operands = _optimized_hlo_call_name_and_operands(q0_block)
-        _q512_name, q512_operands = _optimized_hlo_call_name_and_operands(q512_block)
+        q0_call = _optimized_hlo_call_parse(q0_block)
+        q512_call = _optimized_hlo_call_parse(q512_block)
+        q0_name = q0_call["name"]
+        q512_operands = q512_call["operands"]
 
-        def is_exact_gte_chain(operand_index: int, tuple_index: int) -> bool:
-            if q0_name is None or len(q512_operands) <= operand_index:
+        def exact_accumulator_shape(node: dict[str, Any] | None) -> bool:
+            if not node:
                 return False
-            node = graph.get(q512_operands[operand_index])
-            return bool(
-                node
-                and node["opcode"] == "get-tuple-element"
-                and node["operands"] == [q0_name]
-                and node["tuple_index"] == tuple_index
-                and str(node["shape"]).startswith("f32[1,1024,4,256]")
-            )
+            parsed_shape = _canonical_hlo_shape_leaves(str(node.get("shape", "")))
+            return parsed_shape["passed"] and parsed_shape["leaves"] == [
+                "f32[1,1024,4,256]"
+            ]
 
-        chain_dk = is_exact_gte_chain(7, 0)
-        chain_dv = is_exact_gte_chain(8, 1)
+        def trace_accumulator_path(
+            operand_index: int, tuple_index: int
+        ) -> dict[str, Any]:
+            terminal = (
+                q512_operands[operand_index]
+                if len(q512_operands) > operand_index
+                else None
+            )
+            cursor = terminal
+            path_opcodes: list[str] = []
+            path_symbols: list[str] = []
+            copy_count = 0
+            copy_single_use = True
+            terminal_node = graph.get(cursor) if cursor is not None else None
+            if terminal_node and terminal_node["opcode"] == "copy":
+                copy_count = 1
+                path_opcodes.append("copy")
+                path_symbols.append(cursor)
+                copy_single_use = (
+                    exact_accumulator_shape(terminal_node)
+                    and len(terminal_node["operands"]) == 1
+                    and graph_summary["consumer_counts"].get(cursor) == 1
+                )
+                cursor = (
+                    terminal_node["operands"][0]
+                    if len(terminal_node["operands"]) == 1
+                    else None
+                )
+            gte_name = cursor
+            gte = graph.get(gte_name) if gte_name is not None else None
+            gte_exact = bool(
+                q0_name is not None
+                and gte
+                and gte["opcode"] == "get-tuple-element"
+                and gte["operands"] == [q0_name]
+                and gte["tuple_index"] == tuple_index
+                and exact_accumulator_shape(gte)
+            )
+            gte_single_use = bool(
+                gte_name is not None
+                and graph_summary["consumer_counts"].get(gte_name) == 1
+            )
+            if gte_name is not None:
+                path_opcodes.insert(0, "get-tuple-element" if gte_exact else "invalid")
+                path_symbols.insert(0, gte_name)
+            checks = {
+                "q512_operand_is_present": terminal is not None,
+                "only_zero_or_one_copy_after_gte": copy_count in (0, 1),
+                "optional_copy_is_same_shape_and_single_use": copy_single_use,
+                "gte_has_exact_q0_source_tuple_index_and_shape": gte_exact,
+                "gte_is_single_use": gte_single_use,
+                "path_opcodes_are_exact": path_opcodes
+                in (["get-tuple-element"], ["get-tuple-element", "copy"]),
+            }
+            return {
+                "operand_index": operand_index,
+                "expected_tuple_index": tuple_index,
+                "path_opcodes": path_opcodes,
+                "copy_count": copy_count,
+                "terminal_symbol_sha256": (
+                    _symbol_sha256(terminal) if terminal is not None else None
+                ),
+                "path_symbol_sha256": [_symbol_sha256(item) for item in path_symbols],
+                "path_symbols_internal": path_symbols,
+                "checks": checks,
+                "passed": all(checks.values()),
+            }
+
+        dk_path = trace_accumulator_path(7, 0)
+        dv_path = trace_accumulator_path(8, 1)
+        paths_are_distinct = bool(
+            dk_path["path_symbols_internal"]
+            and dv_path["path_symbols_internal"]
+            and set(dk_path["path_symbols_internal"]).isdisjoint(
+                dv_path["path_symbols_internal"]
+            )
+        )
+        chain_dk = dk_path["passed"] and paths_are_distinct
+        chain_dv = dv_path["passed"] and paths_are_distinct
         accumulator_operands = q512_operands[7:9]
         accumulator_projection_single_use = bool(
             q0_name
             and graph_summary["consumer_counts"].get(q0_name) == 2
             and len(accumulator_operands) == 2
-            and all(
-                graph_summary["consumer_counts"].get(operand) == 1
-                for operand in accumulator_operands
-            )
+            and dk_path["passed"]
+            and dv_path["passed"]
+            and paths_are_distinct
         )
-        direct_accumulator_path_has_no_data_movement = (
+        accumulator_paths_exact = (
             graph_summary["duplicate_entry_instruction_count"] == 0
+            and graph_summary["operand_annotation_scan"]["passed"]
+            and graph_summary["malformed_custom_call_operand_region_count"] == 0
+            and q0_call["passed"]
+            and q512_call["passed"]
+            and len(q512_operands) == 9
             and chain_dk
             and chain_dv
         )
@@ -2534,13 +2865,34 @@ def _t1024_accumulator_dataflow_summary(
             opcode: graph_summary["opcode_inventory"].get(opcode, 0)
             for opcode in whole_program_data_movement_opcode_counts
         }
-        q0_result_prefix = _mask_ir_quoted_content(q0_block).split("custom-call", 1)[0]
-        q512_result_prefix = _mask_ir_quoted_content(q512_block).split(
-            "custom-call", 1
-        )[0]
-        accumulator_shapes_exact = (
-            len(re.findall(r"f32\[1,1024,4,256\]", q0_result_prefix)) == 2
-            and len(re.findall(r"f32\[1,1024,4,256\]", q512_result_prefix)) == 2
+
+        def optimized_result_shape_prefix(block: str) -> str:
+            masked_block = _mask_hlo_operand_index_comments(
+                _mask_ir_quoted_content(block)
+            )["masked"]
+            assignment = masked_block.find("=")
+            custom_call = re.search(r"\bcustom-call\s*\(", masked_block)
+            return (
+                masked_block[assignment + 1 : custom_call.start()]
+                if assignment >= 0
+                and custom_call is not None
+                and assignment < custom_call.start()
+                else ""
+            )
+
+        q0_result_prefix = optimized_result_shape_prefix(q0_block)
+        q512_result_prefix = optimized_result_shape_prefix(q512_block)
+        q0_result_shape = _canonical_hlo_shape_leaves(q0_result_prefix)
+        q512_result_shape = _canonical_hlo_shape_leaves(q512_result_prefix)
+        exact_accumulator_results = [
+            "f32[1,1024,4,256]",
+            "f32[1,1024,4,256]",
+        ]
+        accumulator_shapes_exact = bool(
+            q0_result_shape["passed"]
+            and q512_result_shape["passed"]
+            and q0_result_shape["leaves"] == exact_accumulator_results
+            and q512_result_shape["leaves"] == exact_accumulator_results
         )
         sanitized = {
             "instruction_count": graph_summary["entry_instruction_count"],
@@ -2548,11 +2900,28 @@ def _t1024_accumulator_dataflow_summary(
                 "duplicate_entry_instruction_count"
             ],
             "opcode_inventory": graph_summary["opcode_inventory"],
+            "operand_annotation_scan": graph_summary["operand_annotation_scan"],
+            "malformed_custom_call_operand_region_count": graph_summary[
+                "malformed_custom_call_operand_region_count"
+            ],
             "q0_call_symbol_sha256": _symbol_sha256(q0_name) if q0_name else None,
             "q512_operand_count": len(q512_operands),
             "q512_accumulator_operand_symbol_sha256": [
                 _symbol_sha256(item) for item in q512_operands[7:9]
             ],
+            "accumulator_paths_are_distinct": paths_are_distinct,
+            "dk_accumulator_path": {
+                key: value
+                for key, value in dk_path.items()
+                if key != "path_symbols_internal"
+            },
+            "dv_accumulator_path": {
+                key: value
+                for key, value in dv_path.items()
+                if key != "path_symbols_internal"
+            },
+            "q0_call_operand_parse": q0_call["diagnostics"],
+            "q512_call_operand_parse": q512_call["diagnostics"],
         }
     accumulator_leaf_bytes = (
         _BATCH_SIZE
@@ -2590,8 +2959,8 @@ def _t1024_accumulator_dataflow_summary(
         "q0_accumulator_projections_are_single_use_by_q512": (
             accumulator_projection_single_use
         ),
-        "no_copy_convert_or_concatenate_on_direct_accumulator_path": (
-            direct_accumulator_path_has_no_data_movement
+        "only_exact_gte_with_optional_single_identity_copy_on_accumulator_paths": (
+            accumulator_paths_exact
         ),
     }
     return {
@@ -2768,8 +3137,8 @@ def _strict_vjp_ir_summary(
                     {
                         "query_start_candidate_parses": query_start_candidates,
                         "signature_classification": signature,
-                        "expected_marker_occurrence_count_diagnostic_only": len(
-                            matched_specs
+                        "expected_marker_resolved_reference_count_diagnostic_only": (
+                            len(matched_specs)
                         ),
                     }
                     if case == _ALL_VALID_T1024_CASE
@@ -2848,6 +3217,7 @@ def _strict_vjp_ir_summary(
         ],
         **(
             {
+                "marker_counts_are_resolved_reference_diagnostics_only": True,
                 "signature_call_counts": signature_counts,
                 "signature_query_start_counts": [
                     {"kind": kind, "query_start": query_start, "count": count}
@@ -4854,7 +5224,9 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                 "record_type": "completed",
                 "timestamp": _utc_now(),
                 "status": (
-                    "compile_diagnostic_completed_no_runtime_release"
+                    "compile_diagnostic_failed_no_runtime_release"
+                    if compile_diagnostic and result != 0
+                    else "compile_diagnostic_completed_no_runtime_release"
                     if compile_diagnostic
                     else "passed"
                 ),

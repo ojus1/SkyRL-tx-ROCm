@@ -1107,6 +1107,153 @@ def test_t1024_strict_ir_accepts_six_calls_aliases_and_accumulator_chain(dialect
     assert dataflow["raw_symbols_emitted"] is False
 
 
+def test_t1024_stablehlo_accepts_exact_bare_target_with_balanced_operands():
+    text = _t1024_two_chunk_ir("stablehlo").replace(f'@"{_TARGET}"', f"@{_TARGET}")
+    summary = _PROBE._strict_vjp_ir_summary(text, "stablehlo", "all_valid_t1024")
+    assert summary["passed"] is True
+    assert all(
+        call["signature_classification"]["parse_diagnostics"]["target_syntax_passed"]
+        for call in summary["calls"]
+    )
+    assert [
+        call["signature_classification"]["operand_count"] for call in summary["calls"]
+    ] == [4, 4, 7, 7, 9, 9]
+
+
+def _t1024_optimized_actual_annotation_form() -> str:
+    text = _t1024_two_chunk_ir("optimized_hlo")
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if "%dq0 =" in line:
+            lines[index] = line.replace("%dout0", "/*index=5*/ %dout0")
+        elif "%dq512 =" in line:
+            lines[index] = line.replace("%dout512", "/*index=5*/ %dout512")
+        elif "%dk0 =" in line:
+            lines[index] = line.replace("%acc_dk", "/*index=7*/ %acc_dk")
+        elif "%dk512 =" in line:
+            lines[index] = line.replace("%gte0", "/*index=7*/ %gte0")
+    text = "\n".join(lines)
+    for shape in (
+        "bf16[1,512,16,256]",
+        "bf16[1,1024,4,256]",
+        "s32[1,1024]",
+        "f32[1,16,512]",
+        "f32[1,1024,4,256]",
+    ):
+        text = text.replace(f"{shape}{{", f"{shape} {{")
+    return text
+
+
+def test_t1024_optimized_actual_annotations_and_spaced_layouts_pass_exactly():
+    summary = _PROBE._strict_vjp_ir_summary(
+        _t1024_optimized_actual_annotation_form(),
+        "optimized_hlo",
+        "all_valid_t1024",
+    )
+    assert summary["passed"] is True
+    assert summary["marker_counts_are_resolved_reference_diagnostics_only"] is True
+    assert summary["signature_call_counts"] == {
+        "forward": 2,
+        "dq": 2,
+        "dkdv": 2,
+    }
+    annotations = [
+        call["signature_classification"]["parse_diagnostics"]["call_operand_parse"][
+            "operand_annotation_count"
+        ]
+        for call in summary["calls"]
+    ]
+    assert annotations == [0, 0, 1, 1, 1, 1]
+    for call in summary["calls"]:
+        classification = call["signature_classification"]
+        assert classification["passed"] is True
+        assert (
+            classification["parse_diagnostics"][
+                "all_operands_resolve_to_entry_instructions"
+            ]
+            is True
+        )
+        assert (
+            classification["parse_diagnostics"]["unresolved_operand_symbol_sha256"]
+            == []
+        )
+    dataflow = summary["two_chunk_accumulator_dataflow"]
+    assert dataflow["sanitized_dataflow"]["q512_operand_count"] == 9
+    assert dataflow["sanitized_dataflow"]["operand_annotation_scan"] == {
+        "annotation_count": 4,
+        "malformed_count": 0,
+        "passed": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_annotation",
+    (
+        "/*index=7",
+        "/*index=7 /*index=8*/",
+        "/*not_an_index=7*/",
+    ),
+)
+def test_t1024_optimized_malformed_operand_annotations_fail_closed(
+    bad_annotation,
+):
+    text = _t1024_optimized_actual_annotation_form().replace(
+        "/*index=7*/", bad_annotation, 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo", "all_valid_t1024")
+    assert summary["passed"] is False
+    assert any(
+        call["signature_classification"]["parse_diagnostics"]["call_operand_parse"][
+            "malformed_operand_annotation_count"
+        ]
+        > 0
+        for call in summary["calls"]
+    )
+
+
+def test_t1024_optimized_annotations_cannot_hide_unresolved_or_junk_operands():
+    text = _t1024_optimized_actual_annotation_form().replace(
+        "/*index=7*/ %acc_dk", "/*index=7*/ %not_in_entry_graph", 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo", "all_valid_t1024")
+    assert summary["passed"] is False
+    dkdv = next(
+        call
+        for call in summary["calls"]
+        if call["query_start"]["expected"] == 0
+        and call["signature_classification"]["operand_count"] == 9
+    )
+    diagnostics = dkdv["signature_classification"]["parse_diagnostics"]
+    assert diagnostics["all_operands_resolve_to_entry_instructions"] is False
+    assert len(diagnostics["unresolved_operand_symbol_sha256"]) == 1
+
+    junk = _t1024_optimized_actual_annotation_form().replace(
+        "/*index=7*/ %acc_dk", "/*index=7*/ junk %acc_dk", 1
+    )
+    assert (
+        _PROBE._strict_vjp_ir_summary(junk, "optimized_hlo", "all_valid_t1024")[
+            "passed"
+        ]
+        is False
+    )
+
+
+def test_t1024_optimized_layout_stripping_rejects_residual_junk():
+    text = _t1024_optimized_actual_annotation_form().replace(
+        ") custom-call(%q0, %k, %v, %mask)",
+        ") residual_junk custom-call(%q0, %k, %v, %mask)",
+        1,
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo", "all_valid_t1024")
+    assert summary["passed"] is False
+    assert (
+        summary["calls"][0]["signature_classification"]["parse_diagnostics"][
+            "result_shape_parse"
+        ]["checks"]["only_single_leaf_or_flat_tuple_shape_grammar_remains"]
+        is False
+    )
+
+
 @pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
 def test_t1024_signature_pairing_is_independent_of_custom_call_order(dialect):
     lines = _t1024_two_chunk_ir(dialect).splitlines()
@@ -1262,19 +1409,23 @@ def test_t1024_quoted_alias_spoof_and_missing_real_alias_fail_closed(dialect):
     assert summary["passed"] is False
 
 
-def test_t1024_optimized_copy_or_duplicate_instruction_chain_fails_closed():
+def test_t1024_optimized_single_identity_copy_path_passes_but_duplicate_fails():
     text = _t1024_two_chunk_ir("optimized_hlo")
     copied = text.replace(
         "  %gte1 = f32[1,1024,4,256] get-tuple-element(%dk0), index=1",
         "  %gte1 = f32[1,1024,4,256] get-tuple-element(%dk0), index=1\n"
         "  %copied = f32[1,1024,4,256] copy(%gte0)",
     ).replace("%gte0, %gte1", "%copied, %gte1")
-    assert (
-        _PROBE._strict_vjp_ir_summary(copied, "optimized_hlo", "all_valid_t1024")[
-            "passed"
-        ]
-        is False
+    copied_summary = _PROBE._strict_vjp_ir_summary(
+        copied, "optimized_hlo", "all_valid_t1024"
     )
+    assert copied_summary["passed"] is True
+    dk_path = copied_summary["two_chunk_accumulator_dataflow"]["sanitized_dataflow"][
+        "dk_accumulator_path"
+    ]
+    assert dk_path["path_opcodes"] == ["get-tuple-element", "copy"]
+    assert dk_path["copy_count"] == 1
+    assert dk_path["passed"] is True
     duplicate = text.replace(
         "%gte1 = f32[1,1024,4,256] get-tuple-element",
         "%gte0 = f32[1,1024,4,256] get-tuple-element",
@@ -1285,6 +1436,38 @@ def test_t1024_optimized_copy_or_duplicate_instruction_chain_fails_closed():
         ]
         is False
     )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("crosswire", "multi_copy", "convert", "concatenate", "branch"),
+)
+def test_t1024_optimized_accumulator_path_adversaries_fail_closed(mutation):
+    text = _t1024_two_chunk_ir("optimized_hlo")
+    anchor = "  %gte1 = f32[1,1024,4,256] get-tuple-element(%dk0), index=1"
+    if mutation == "crosswire":
+        text = text.replace("%gte0, %gte1", "%gte1, %gte0")
+    elif mutation == "multi_copy":
+        text = text.replace(
+            anchor,
+            f"{anchor}\n"
+            "  %copy0 = f32[1,1024,4,256] copy(%gte0)\n"
+            "  %copy1 = f32[1,1024,4,256] copy(%copy0)",
+        ).replace("%gte0, %gte1", "%copy1, %gte1")
+    elif mutation in {"convert", "concatenate"}:
+        operands = "%gte0" if mutation == "convert" else "%gte0, %gte0"
+        text = text.replace(
+            anchor,
+            f"{anchor}\n  %moved = f32[1,1024,4,256] {mutation}({operands})",
+        ).replace("%gte0, %gte1", "%moved, %gte1")
+    else:
+        text = text.replace(
+            anchor,
+            f"{anchor}\n  %branch = f32[1,1024,4,256] copy(%gte0)",
+        )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo", "all_valid_t1024")
+    assert summary["two_chunk_accumulator_dataflow"]["passed"] is False
+    assert summary["passed"] is False
 
 
 @pytest.mark.parametrize("opcode", ("concatenate", "convert", "copy"))
@@ -2506,6 +2689,69 @@ def test_failed_compile_diagnostic_returns_nonzero_without_release_or_runtime(
     assert record["host_or_device_inputs_constructed"] is False
     assert record["executable_invoked"] is False
     assert record["device_output_retrieved"] is False
+
+
+def test_execute_emits_explicit_failed_compile_terminal_after_postflight(monkeypatch):
+    class Guard:
+        def __enter__(self):
+            return dict(_CLEAN)
+
+        def __exit__(self, _error_type, _error, _traceback):
+            return False
+
+    monkeypatch.setattr(_PROBE, "_assert_fresh_accelerator_process", lambda: None)
+    monkeypatch.setattr(
+        _PROBE, "_assert_static_source_bindings", lambda: {"passed": True}
+    )
+    monkeypatch.setattr(
+        _PROBE,
+        "_load_safety_helpers",
+        lambda: (lambda: Guard(), lambda: dict(_CLEAN)),
+    )
+    monkeypatch.setattr(
+        _PROBE, "_safety_binding_manifest", lambda _helpers: {"passed": True}
+    )
+    monkeypatch.setattr(_PROBE, "_configure_rocm_environment", lambda: {})
+    monkeypatch.setattr(_PROBE, "_environment_manifest", lambda _environment: {})
+    monkeypatch.setattr(_PROBE, "_public_safety_preflight", lambda safety: dict(safety))
+    monkeypatch.setattr(
+        _PROBE,
+        "_public_clean_safety",
+        lambda safety, stage: {**safety, "stage": stage},
+    )
+
+    def failed_run(
+        _output,
+        _require_clean_boot,
+        counters,
+        *,
+        environment,
+        compile_diagnostic,
+        case,
+    ):
+        assert environment == {}
+        assert compile_diagnostic is True
+        assert case == "all_valid_t1024"
+        assert counters == _PROBE._zero_counters()
+        return 2
+
+    monkeypatch.setattr(_PROBE, "_run_rocm", failed_run)
+    output = io.StringIO()
+    result = _PROBE._execute(
+        SimpleNamespace(
+            platform="rocm",
+            allow_gpu=True,
+            compile_diagnostic=True,
+            case="all_valid_t1024",
+        ),
+        output,
+    )
+    assert result == 2
+    records = _records(output)
+    assert records[-2]["record_type"] == "safety_postflight"
+    assert records[-1]["record_type"] == "completed"
+    assert records[-1]["status"] == "compile_diagnostic_failed_no_runtime_release"
+    assert records[-1]["counters"] == _PROBE._zero_counters()
 
 
 def test_t1024_compile_diagnostic_can_capture_evidence_but_never_release_runtime(
