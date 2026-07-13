@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import psutil
@@ -122,6 +122,22 @@ def _write_private_text(path: Path, value: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as output:
         output.write(value)
+
+
+def _validated_pass_fds(
+    values: list[int], *, fstat_fn: Callable[[int], os.stat_result] = os.fstat
+) -> tuple[int, ...]:
+    """Validate the narrow descriptor set inherited by a wrapped command."""
+    if len(set(values)) != len(values):
+        raise ValueError("duplicate --pass-fd values are not allowed")
+    if any(isinstance(value, bool) or value < 3 for value in values):
+        raise ValueError("--pass-fd values must be open descriptors of at least 3")
+    for descriptor in values:
+        try:
+            fstat_fn(descriptor)
+        except OSError as error:
+            raise ValueError(f"--pass-fd {descriptor} is not open") from error
+    return tuple(values)
 
 
 def _read_number(path: Path, scale: float = 1.0) -> float | None:
@@ -761,6 +777,14 @@ def main() -> int:
         action="store_true",
         help="record redacted command arguments; omit by default to avoid credential leakage",
     )
+    parser.add_argument(
+        "--pass-fd",
+        action="append",
+        default=[],
+        type=int,
+        metavar="FD",
+        help="preserve this already-open descriptor in the wrapped command; repeat as needed",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command and args.command[0] == "--":
@@ -798,6 +822,12 @@ def main() -> int:
         parser.error("--timeout requires a command")
     if not args.command and args.duration is None and not args.include_pid:
         parser.error("provide a command, --duration, or at least one --include-pid")
+    if args.pass_fd and not args.command:
+        parser.error("--pass-fd requires a wrapped command")
+    try:
+        pass_fds = _validated_pass_fds(args.pass_fd)
+    except ValueError as error:
+        parser.error(str(error))
 
     explicit_targets = dict(args.include_pid)
     if len(explicit_targets) != len(args.include_pid):
@@ -907,6 +937,7 @@ def main() -> int:
                 else ([_redact_argument(args.command[0]), "<arguments omitted>"] if args.command else [])
             ),
             "command_recorded": args.record_command,
+            "passed_file_descriptor_count": len(pass_fds),
         }
         output.write(_json_dumps(manifest, separators=(",", ":")) + "\n")
         output.flush()
@@ -948,7 +979,7 @@ def main() -> int:
                     stop_requested = True
 
             if args.command and not stop_requested:
-                process = subprocess.Popen(args.command, start_new_session=True)
+                process = subprocess.Popen(args.command, start_new_session=True, pass_fds=pass_fds)
                 targets["command"] = process.pid
 
             measured_start = time.monotonic()

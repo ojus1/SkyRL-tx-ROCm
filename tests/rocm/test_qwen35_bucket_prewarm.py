@@ -1403,10 +1403,11 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     assert "prewarm_status=$?" in source
     assert "final_journal_status=$?" in source
     assert source.index("prewarm_status=$?") < source.rindex(final_journal_gate)
-    assert source.rindex(final_journal_gate) < source.index(
-        "if ((prewarm_status != 0))"
+    prewarm_status_gate = source.index(
+        "if ((prewarm_status != 0))", source.rindex(final_journal_gate)
     )
-    assert source.index("if ((prewarm_status != 0))") < source.index(api_exec)
+    assert source.rindex(final_journal_gate) < prewarm_status_gate
+    assert prewarm_status_gate < source.index(api_exec)
     between_gate_and_api = source[
         source.rindex(final_journal_gate) + len(final_journal_gate) : source.index(
             api_exec

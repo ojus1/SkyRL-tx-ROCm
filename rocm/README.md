@@ -103,7 +103,7 @@ list runs one compile-only process before the API starts and records a private
 `prewarm.jsonl` in the new run directory:
 
 ```bash
-# Configuration syntax only; operational execution still requires supervision.
+# Default-off, launcher-supervised compile-only prewarm.
 SKYRL_QWEN35_PREWARM_BUCKETS=64,256 ./rocm/start_qwen35.sh prewarm-t64-t256
 
 # Also compile the one sequence-independent Adam update after both train buckets.
@@ -129,23 +129,34 @@ occurs.
 Backend/model construction, pinned-weight loading, LoRA parameter and Adam-state
 initialization, array placement, and the explicit `block_until_ready` may still
 perform ordinary setup array work. Compilation can initialize ROCm, allocate
-representative buffers, and run XLA autotuning kernels, so use the normal
-headless/exclusive-device and telemetry discipline and allow a much longer
-startup. Neither path enables command buffers, HIP Graphs, PGLE, executable
-export, an actual warmup/replay, or an in-engine prewarm. The launcher exports
-both `JAX_ENABLE_PGLE=false` and `JAX_COMPILATION_CACHE_EXPECT_PGLE=false`, and
-the direct prewarm tool requires those exact values. Running
+representative buffers, and run XLA autotuning kernels, so allow a much longer
+startup. The launcher now wraps this child in `profile_rocm.py`, with a default
+3600-second timeout configurable only from 600 through 14400 seconds, a 90 C
+junction limit, 315 W power limit, 24 GiB VRAM limit, no positive host-RAM
+floor, and an 8 GiB swap limit. It preserves only the already-held global lock
+descriptor, records `prewarm.telemetry.jsonl` plus its private summary, and
+captures an exact idle handoff baseline before the child. On success, failure,
+timeout, `INT`, or `TERM`, the launcher reaps the profiler, requires three
+consecutive one-second samples with the exact PCI/DRM/KFD identity unowned and
+VRAM/GTT no higher than baseline, and then performs the final boot-journal gate
+before it can start the API. Neither path enables command buffers, HIP Graphs,
+PGLE, executable export, an actual warmup/replay, or an in-engine prewarm. The
+launcher exports both `JAX_ENABLE_PGLE=false` and
+`JAX_COMPILATION_CACHE_EXPECT_PGLE=false`, and the direct prewarm tool requires
+those exact values. Running
 `python rocm/prewarm_qwen35_buckets.py` without ROCm acknowledgements is a
 CPU-only plan and never imports JAX.
 
 The exact cold T64-plus-Adam direct-tool population and one matched compile-only
 cache-hit process described below are now hardware-qualified. The multi-bucket
 path, launcher-to-API transition, additional/repeated hits, and actual warmup
-remain unqualified. Do not use the direct command above unsupervised. Every
-operational qualification must use the telemetry guard with an explicit finite
-timeout, a 90 C maximum junction temperature, and a 315 W maximum GPU power
-limit, while retaining the headless-display, exclusive-KFD, fatal-journal, and
-cleanup gates. Each
+remain unqualified. The launcher examples above provide the required telemetry,
+headless-display, exclusive-KFD, fatal-journal, and cleanup gates; any direct
+tool invocation still requires equivalent external supervision. The API's
+current health endpoint does not prove that the nested engine has finished
+loading, inherited the intended cache policy, or consumed a particular cached
+executable. Therefore prewarm remains default-off until an engine readiness and
+startup-attestation contract is added and separately qualified. Each
 train-bucket and optimizer compile has separate timing, compiled-memory,
 postflight, counter, and cache-evidence records. They report JAX 0.10.2's public
 process-level persistent-cache hit/miss events, numeric `compile_time_saved_sec`

@@ -17,6 +17,7 @@ model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 memory_mode="${SKYRL_QWEN35_MEMORY_MODE:-growth}"
 prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
 prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER:-0}"
+prewarm_timeout_seconds="${SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS:-3600}"
 backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64}'
 
 case "$prewarm_optimizer" in
@@ -28,6 +29,11 @@ case "$prewarm_optimizer" in
 esac
 if [[ "$prewarm_optimizer" == "1" && -z "$prewarm_buckets" ]]; then
   echo "SKYRL_QWEN35_PREWARM_OPTIMIZER=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
+  exit 2
+fi
+if [[ ! "$prewarm_timeout_seconds" =~ ^[0-9]{3,5}$ ]] \
+  || ((10#$prewarm_timeout_seconds < 600 || 10#$prewarm_timeout_seconds > 14400)); then
+  echo "SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS must be an integer in [600, 14400]." >&2
   exit 2
 fi
 
@@ -150,6 +156,7 @@ fi
 # Keep the desktop on the iGPU: a compute reset must not also take down the
 # active display. Ignore virtual writeback connectors, whose state is unknown.
 amd_cards=0
+amd_card_names=()
 amd_device_ids=()
 connected_amd_connectors=()
 for card_path in /sys/class/drm/card[0-9]*; do
@@ -157,6 +164,7 @@ for card_path in /sys/class/drm/card[0-9]*; do
   [[ -r "$card_path/device/vendor" ]] || continue
   [[ "$(<"$card_path/device/vendor")" == "0x1002" ]] || continue
   ((amd_cards += 1))
+  amd_card_names+=("${card_path##*/}")
   if [[ ! -r "$card_path/device/device" ]]; then
     echo "refusing to launch because the AMD PCI device ID is unreadable at $card_path" >&2
     exit 2
@@ -331,6 +339,101 @@ export XLA_FLAGS=--xla_gpu_enable_command_buffer=
 # persistent cache before the API starts, but never invokes a compiled model
 # pass or optimizer step. ROCm compilation may still run bounded autotuning.
 prewarm_status=0
+prewarm_handoff_status=0
+final_journal_status=0
+prewarm_termination_status=0
+prewarm_started=0
+prewarm_supervisor_pid=
+prewarm_supervisor_waited=1
+prewarm_cleanup_state=0
+
+record_prewarm_cleanup_signal() {
+  if ((prewarm_termination_status == 0)); then
+    prewarm_termination_status="$1"
+  fi
+}
+
+finish_prewarm_once() {
+  if ((prewarm_cleanup_state != 0)); then
+    return 0
+  fi
+  prewarm_cleanup_state=1
+
+  # A signal during cleanup must be remembered without recursing or skipping
+  # the bounded handoff and final-journal gates. The caller exits afterward.
+  trap 'record_prewarm_cleanup_signal 130' INT
+  trap 'record_prewarm_cleanup_signal 143' TERM
+
+  if ((prewarm_started != 0 && prewarm_supervisor_waited == 0)); then
+    if [[ -z "$prewarm_supervisor_pid" && -n "${!:-}" ]]; then
+      prewarm_supervisor_pid="$!"
+    fi
+    if [[ -n "$prewarm_supervisor_pid" ]]; then
+      kill -TERM "$prewarm_supervisor_pid" 2>/dev/null || true
+      if wait "$prewarm_supervisor_pid"; then
+        prewarm_status=0
+      else
+        prewarm_status=$?
+      fi
+    else
+      prewarm_status=143
+    fi
+    prewarm_supervisor_waited=1
+  fi
+
+  if ((prewarm_started != 0)); then
+    if python rocm/qwen35_prewarm_handoff.py settle \
+        --output "$prewarm_handoff_artifact" \
+        --timeout-seconds 120 \
+        --poll-interval-seconds 1; then
+      prewarm_handoff_status=0
+    else
+      prewarm_handoff_status=$?
+    fi
+  fi
+
+  if python3 -m rocm.amdgpu_safety >/dev/null; then
+    final_journal_status=0
+  else
+    final_journal_status=$?
+  fi
+
+  prewarm_cleanup_state=2
+  trap 'on_prewarm_signal 130' INT
+  trap 'on_prewarm_signal 143' TERM
+}
+
+select_prewarm_exit_status() {
+  local incoming_status="$1"
+  if ((final_journal_status != 0 || prewarm_handoff_status != 0)); then
+    selected_prewarm_exit_status=2
+  elif ((prewarm_termination_status != 0)); then
+    selected_prewarm_exit_status="$prewarm_termination_status"
+  elif ((prewarm_status != 0)); then
+    selected_prewarm_exit_status="$prewarm_status"
+  else
+    selected_prewarm_exit_status="$incoming_status"
+  fi
+}
+
+on_prewarm_signal() {
+  if ((prewarm_termination_status == 0)); then
+    prewarm_termination_status="$1"
+  fi
+  finish_prewarm_once
+  select_prewarm_exit_status "$prewarm_termination_status"
+  trap - EXIT INT TERM
+  exit "$selected_prewarm_exit_status"
+}
+
+on_prewarm_exit() {
+  local incoming_status="$1"
+  finish_prewarm_once
+  select_prewarm_exit_status "$incoming_status"
+  trap - EXIT INT TERM
+  exit "$selected_prewarm_exit_status"
+}
+
 if [[ -n "$prewarm_buckets" ]]; then
   prewarm_optimizer_args=()
   if [[ "$prewarm_optimizer" == "1" ]]; then
@@ -348,37 +451,76 @@ if [[ -n "$prewarm_buckets" ]]; then
       exit 2
       ;;
   esac
-  if python rocm/prewarm_qwen35_buckets.py \
-      --execute-rocm \
-      --allow-gpu \
-      "${prewarm_optimizer_args[@]}" \
-      --buckets "$prewarm_buckets" \
-      --model-path "$model_path" \
-      --construction "$prewarm_construction" \
-      --attention-backend "$prewarm_attention" \
-      --launcher-lock-fd "$launch_lock_fd" \
-      --output "$run_dir/prewarm.jsonl"; then
+  prewarm_handoff_artifact="$run_dir/prewarm-handoff.jsonl"
+  if ! python rocm/qwen35_prewarm_handoff.py capture \
+      --output "$prewarm_handoff_artifact"; then
+    echo "refusing startup prewarm because the idle AMDGPU baseline could not be captured" >&2
+    exit 2
+  fi
+  trap 'on_prewarm_signal 130' INT
+  trap 'on_prewarm_signal 143' TERM
+  trap 'on_prewarm_exit "$?"' EXIT
+  prewarm_started=1
+  prewarm_supervisor_waited=0
+  python rocm/profile_rocm.py \
+      --output "$run_dir/prewarm.telemetry.jsonl" \
+      --card "${amd_card_names[0]}" \
+      --interval 0.1 \
+      --baseline-seconds 2 \
+      --timeout "$prewarm_timeout_seconds" \
+      --sensor-grace-seconds 60 \
+      --max-junction-temp-c 90 \
+      --max-gpu-power-watts 315 \
+      --max-vram-gib 24 \
+      --min-host-available-gib 0 \
+      --max-swap-gib 8 \
+      --pass-fd "$launch_lock_fd" \
+      -- \
+      python rocm/prewarm_qwen35_buckets.py \
+        --execute-rocm \
+        --allow-gpu \
+        "${prewarm_optimizer_args[@]}" \
+        --buckets "$prewarm_buckets" \
+        --model-path "$model_path" \
+        --construction "$prewarm_construction" \
+        --attention-backend "$prewarm_attention" \
+        --launcher-lock-fd "$launch_lock_fd" \
+        --output "$run_dir/prewarm.jsonl" &
+  prewarm_supervisor_pid=$!
+  if wait "$prewarm_supervisor_pid"; then
     prewarm_status=0
   else
     prewarm_status=$?
   fi
+  prewarm_supervisor_waited=1
+  finish_prewarm_once
 fi
 
-final_journal_status=0
-if python3 -m rocm.amdgpu_safety >/dev/null; then
-  final_journal_status=0
-else
-  final_journal_status=$?
+if [[ -z "$prewarm_buckets" ]]; then
+  if python3 -m rocm.amdgpu_safety >/dev/null; then
+    final_journal_status=0
+  else
+    final_journal_status=$?
+  fi
 fi
 if ((final_journal_status != 0)); then
   echo "refusing API start because the final AMDGPU boot-journal postflight failed" >&2
   exit 2
+fi
+if ((prewarm_handoff_status != 0)); then
+  echo "refusing API start because the prewarm AMDGPU handoff failed with status $prewarm_handoff_status" >&2
+  exit 2
+fi
+if ((prewarm_termination_status != 0)); then
+  echo "refusing API start because startup prewarm was interrupted" >&2
+  exit "$prewarm_termination_status"
 fi
 if ((prewarm_status != 0)); then
   echo "refusing API start because startup prewarm failed with status $prewarm_status" >&2
   exit "$prewarm_status"
 fi
 
+trap - EXIT INT TERM
 exec uv run --active --no-sync -m skyrl.tinker.api \
   --base-model "$model_path" \
   --backend jax \
