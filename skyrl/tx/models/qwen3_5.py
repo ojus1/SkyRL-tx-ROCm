@@ -908,6 +908,12 @@ class Qwen3_5ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsPro
         """Return the lm_head callable for logits computation."""
         return self.lm_head or self.model.language_model.embed_tokens.T
 
+    def get_frozen_tied_embedding(self) -> jax.Array | None:
+        """Expose the exact tied weight only when no independent head exists."""
+        if self.lm_head is not None:
+            return None
+        return self.model.language_model.embed_tokens.embedding[...]
+
     def __call__(
         self,
         input_ids: jax.Array,

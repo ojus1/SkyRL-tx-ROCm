@@ -25,6 +25,16 @@ class LogitsProcessorMixin(ABC):
         """Return the lm_head callable for logits computation."""
         ...
 
+    def get_frozen_tied_embedding(self) -> jax.Array | None:
+        """Return the raw frozen tied embedding for the split head, if any.
+
+        Models keep this default unless their output projection is exactly the
+        transpose of a frozen input embedding. Returning the underlying array
+        explicitly avoids introspecting an arbitrary ``lm_head`` closure and
+        keeps the experimental path fail-closed.
+        """
+        return None
+
     def compute_logits(
         self,
         hidden_states: jax.Array,
@@ -57,7 +67,35 @@ class LogitsProcessorMixin(ABC):
         Returns:
             Log probabilities for target tokens [B, T].
         """
-        chunk_size = self.get_model_config().loss_chunk_size
+        config = self.get_model_config()
+        chunk_size = config.loss_chunk_size
+        vocab_superblock_size = int(getattr(config, "tied_logprob_vocab_superblock_size", 0))
+        if vocab_superblock_size < 0:
+            raise ValueError("tied_logprob_vocab_superblock_size must be nonnegative")
+        if vocab_superblock_size > 0:
+            from skyrl.tx.kernels.tied_logprob import (
+                SUPPORTED_TOKEN_CHUNK_SIZES,
+                split_vocab_tied_target_logprobs,
+            )
+
+            embedding = self.get_frozen_tied_embedding()
+            if embedding is None:
+                raise ValueError("split tied target-logprobs require an exact frozen tied embedding")
+            if chunk_size not in SUPPORTED_TOKEN_CHUNK_SIZES:
+                raise ValueError(
+                    "split tied target-logprobs require loss_chunk_size in "
+                    f"{SUPPORTED_TOKEN_CHUNK_SIZES}, got {chunk_size}"
+                )
+            # The tied projection ignores adapter_indices in the existing
+            # model path. Its custom VJP already recomputes bounded vocabulary
+            # tiles, so do not add the dense head's outer rematerialization.
+            return split_vocab_tied_target_logprobs(
+                hidden_states,
+                embedding,
+                target_ids,
+                token_chunk_size=chunk_size,
+                vocab_superblock_size=vocab_superblock_size,
+            )
         if chunk_size > 0:
             return self._compute_chunked_logprobs(hidden_states, target_ids, chunk_size, adapter_indices)
         else:

@@ -15,6 +15,8 @@ class ModelConfig(PretrainedConfig):
         max_lora_rank: Maximum rank for LoRA adapters
         shard_attention_heads: Whether to shard attention across tensor parallel devices
         loss_chunk_size: Chunk size for cross-entropy loss computation (0 = no chunking)
+        tied_logprob_vocab_superblock_size: Default-off vocabulary tile size for
+            the frozen tied-output target-logprob path (0 = use the dense head).
         gradient_checkpointing: Recompute activations during backward to save memory
         mhc_expansion_rate: mHC expansion rate. Connectors are trainable when this is > 1.
     """
@@ -24,6 +26,7 @@ class ModelConfig(PretrainedConfig):
     max_lora_rank: int
     shard_attention_heads: bool
     loss_chunk_size: int
+    tied_logprob_vocab_superblock_size: int
     gradient_checkpointing: bool
     mhc_expansion_rate: int
 
@@ -35,6 +38,7 @@ class ModelConfig(PretrainedConfig):
         max_lora_rank: int,
         shard_attention_heads: bool,
         loss_chunk_size: int = 0,
+        tied_logprob_vocab_superblock_size: int = 0,
         gradient_checkpointing: bool = False,
         mhc_expansion_rate: int = 1,
     ):
@@ -50,6 +54,7 @@ class ModelConfig(PretrainedConfig):
         self.max_lora_rank = max_lora_rank
         self.shard_attention_heads = shard_attention_heads
         self.loss_chunk_size = loss_chunk_size
+        self.tied_logprob_vocab_superblock_size = tied_logprob_vocab_superblock_size
         self.gradient_checkpointing = gradient_checkpointing
         self.mhc_expansion_rate = mhc_expansion_rate
 
@@ -91,6 +96,7 @@ class ModelConfig(PretrainedConfig):
             max_lora_rank=self.max_lora_rank,
             shard_attention_heads=self.shard_attention_heads,
             loss_chunk_size=self.loss_chunk_size,
+            tied_logprob_vocab_superblock_size=self.tied_logprob_vocab_superblock_size,
             gradient_checkpointing=self.gradient_checkpointing,
             mhc_expansion_rate=self.mhc_expansion_rate,
         )

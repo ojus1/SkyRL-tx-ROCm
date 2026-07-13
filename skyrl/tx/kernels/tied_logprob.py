@@ -1,8 +1,9 @@
 """Portable semantics for a split-vocabulary tied target-logprob stage.
 
-This module is deliberately an unwired JAX oracle, not an accelerated kernel.
-It specifies the operation that a future bounded ROCm HIP/Pallas stage should
-implement for a frozen tied embedding:
+This module is a portable, default-off JAX oracle, not an accelerated kernel.
+Qwen3.5 can select it only through the explicit experimental backend option;
+it also specifies the operation that a future bounded ROCm HIP/Pallas stage
+should implement for a frozen tied embedding:
 
 ``logits = hidden @ embedding.T``
 ``logprob = logits[target] - logsumexp(logits)``
@@ -514,8 +515,9 @@ def split_vocab_tied_target_logprobs(
         Target logprobs with shape ``hidden.shape[:-1]`` and hidden dtype.
 
     Notes:
-        The output embedding is frozen by the explicit custom VJP.  This API is
-        not wired into any model and makes no performance claim.
+        The output embedding is frozen by the explicit custom VJP. Qwen3.5's
+        experimental model wiring is default-off and makes no performance
+        claim.
     """
     if active_mask is None:
         active_mask = jnp.ones(target_ids.shape, dtype=jnp.bool_)

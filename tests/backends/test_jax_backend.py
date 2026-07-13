@@ -22,6 +22,21 @@ def test_abstract_model_load_is_explicitly_opt_in():
     assert JaxBackendConfig(abstract_model_load=True).abstract_model_load is True
 
 
+def test_split_tied_logprob_config_is_default_off_and_single_tp_only():
+    assert JaxBackendConfig().tied_logprob_vocab_superblock_size == 0
+    enabled = JaxBackendConfig(loss_chunk_size=64, tied_logprob_vocab_superblock_size=4096)
+    assert enabled.tied_logprob_vocab_superblock_size == 4096
+
+    with pytest.raises(ValueError, match="requires loss_chunk_size"):
+        JaxBackendConfig(loss_chunk_size=1024, tied_logprob_vocab_superblock_size=4096)
+    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
+        JaxBackendConfig(
+            loss_chunk_size=64,
+            tied_logprob_vocab_superblock_size=4096,
+            tensor_parallel_size=2,
+        )
+
+
 def create_backend(max_lora_adapters: int = MAX_LORA_ADAPTERS, **config_overrides):
     """Create a JaxBackend."""
     config = JaxBackendConfig(max_lora_adapters=max_lora_adapters, max_lora_rank=32, **config_overrides)

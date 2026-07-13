@@ -23,7 +23,11 @@ class DummyModel(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsProcessorMi
     """
 
     def __init__(self, vocab_size: int = 16, loss_chunk_size: int = 0):
-        self.config = MagicMock(loss_chunk_size=loss_chunk_size, gradient_checkpointing=False)
+        self.config = MagicMock(
+            loss_chunk_size=loss_chunk_size,
+            tied_logprob_vocab_superblock_size=0,
+            gradient_checkpointing=False,
+        )
         self.vocab_size = vocab_size
 
         def lm_head(hidden_states, adapter_indices=None):

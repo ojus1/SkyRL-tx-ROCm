@@ -34,7 +34,7 @@ from cloudpathlib import AnyPath
 from flax import nnx
 from flax.training import checkpoints
 from jax.experimental import multihost_utils
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
 from transformers import AutoConfig, AutoTokenizer
 
 from skyrl.backends.backend import AbstractBackend
@@ -112,6 +112,30 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         default=1024,
         description="Chunk size for cross-entropy loss computation. Reduces memory by avoiding full [B*T, V] logits materialization. Set to 0 to disable chunking.",
     )
+    tied_logprob_vocab_superblock_size: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "EXPERIMENTAL: vocabulary tile size for the frozen tied-output "
+            "target-logprob custom VJP. Zero keeps the existing dense chunked head."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_tied_logprob_geometry(self) -> "JaxBackendConfig":
+        if self.tied_logprob_vocab_superblock_size == 0:
+            return self
+        if self.loss_chunk_size not in (64, 128, 256):
+            raise ValueError(
+                "tied_logprob_vocab_superblock_size requires loss_chunk_size "
+                "in (64, 128, 256)"
+            )
+        if self.tensor_parallel_size != 1:
+            raise ValueError(
+                "the experimental split tied-logprob path is qualified only "
+                "for tensor_parallel_size=1"
+            )
+        return self
     # Multi-node configuration
     coordinator_address: str | None = Field(
         default=None,
@@ -235,6 +259,7 @@ class JaxBackendImpl(AbstractBackend):
             max_lora_rank=config.max_lora_rank,
             shard_attention_heads=config.shard_attention_heads,
             loss_chunk_size=config.loss_chunk_size,
+            tied_logprob_vocab_superblock_size=config.tied_logprob_vocab_superblock_size,
             gradient_checkpointing=config.gradient_checkpointing,
             mhc_expansion_rate=config.mhc_expansion_rate,
         )
