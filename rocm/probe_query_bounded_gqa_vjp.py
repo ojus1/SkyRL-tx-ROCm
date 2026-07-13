@@ -93,7 +93,8 @@ _T1024_EXPECTED_HOST_INPUT_BYTES = 20_975_616
 _T1024_EXPECTED_HOST_REFERENCE_BYTES = 41_943_040
 _T1024_EXPECTED_ACCUMULATOR_LEAF_BYTES = 4_194_304
 _T1024_EXPECTED_ACCUMULATOR_PAIR_BYTES = 8_388_608
-_T1024_MAX_TEMP_BYTES = 128 * 1024**2
+_T1024_EXPECTED_TEMP_BYTES = 25_232_640
+_T1024_EXPECTED_OPTIMIZED_FUSION_HELPERS = 9
 _MAX_RELATIVE_L2 = 0.01
 _MIN_COSINE = 0.9999
 _MAX_ABSOLUTE_ERROR = 0.02
@@ -561,7 +562,7 @@ def _case_memory_contract(case: str) -> dict[str, int]:
             "argument": _T1024_EXPECTED_ARGUMENT_BYTES,
             "output": _T1024_EXPECTED_OUTPUT_BYTES,
             "alias": _EXPECTED_ALIAS_BYTES,
-            "temporary": _T1024_MAX_TEMP_BYTES,
+            "temporary": _T1024_EXPECTED_TEMP_BYTES,
         }
     return {
         "argument": _EXPECTED_ARGUMENT_BYTES,
@@ -730,6 +731,20 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
             }
         )
     elif case == _ALL_VALID_T1024_CASE:
+        abi_query_start_pairs = contract["compile_gate"].pop(
+            "exact_marker_query_start_pairs"
+        )
+        contract["compile_gate"].update(
+            {
+                "exact_abi_query_start_pairs": abi_query_start_pairs,
+                "human_marker_evidence_is_diagnostic_only": True,
+                "exact_optimized_hlo_zero_custom_call_entry_fusion_helpers": (
+                    _T1024_EXPECTED_OPTIMIZED_FUSION_HELPERS
+                ),
+                "exact_temporary_bytes": memory["temporary"],
+                "maximum_temporary_bytes": None,
+            }
+        )
         contract.update(
             {
                 "case": case,
@@ -750,10 +765,8 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
                 "runtime_capability_release_authorized_in_this_source_revision": False,
                 "six_calls_are_bounded_attention_custom_calls_not_physical_launch_count": True,
                 "physical_launch_count_claimed": False,
-                "optimized_hlo_fusion_helper_inventory_pin": (
-                    "awaiting_first_final-source_compile_diagnostic"
-                ),
-                "temporary_memory_128_mib_is_diagnostic_safety_cap_not_runtime_pin": True,
+                "optimized_hlo_fusion_helper_inventory_pin": 9,
+                "first_capture_exact_temporary_bytes_pin": 25_232_640,
                 "required_internal_accumulator_proof": {
                     "q512_dkdv_operand_7_consumes_q0_dk_result_0": True,
                     "q512_dkdv_operand_8_consumes_q0_dv_result_1": True,
@@ -1949,6 +1962,8 @@ def _optimized_hlo_entry_call_ownership(
         and fusion_containers_are_direct_entry_helpers
         and fusion_sites_are_one_to_one
     )
+    allowed_fusion_helpers = forbidden if independent_fusion_helpers_safe else []
+    reported_forbidden = [] if independent_fusion_helpers_safe else forbidden
     graph_is_custom_call_independent = (
         not graph["cycle_detected"]
         and graph["unknown_edge_count"] == 0
@@ -2001,11 +2016,11 @@ def _optimized_hlo_entry_call_ownership(
         "direct_entry_custom_call_count": sum(
             call["direct_entry_owned"] for call in calls
         ),
-        "forbidden_container_count": len(forbidden) + unknown_callable,
+        "forbidden_container_count": len(reported_forbidden) + unknown_callable,
         "calls": calls,
         "computations": sanitized_computations,
         "call_edges": sanitized_edges,
-        "forbidden_containers": forbidden,
+        "forbidden_containers": reported_forbidden,
         "unknown_callable_count": unknown_callable,
         "unknown_instruction_count": unknown_instruction_count,
         "duplicate_computation_count": duplicate_computation_count,
@@ -2015,6 +2030,7 @@ def _optimized_hlo_entry_call_ownership(
         "allowed_independent_entry_fusion_helper_count": (
             len(sanitized_edges) if independent_fusion_helpers_safe else 0
         ),
+        "allowed_independent_entry_fusion_helpers": allowed_fusion_helpers,
         "entry_multiplicity": graph,
         "raw_quote_scan": {
             key: value for key, value in quote_scan.items() if key != "masked"
@@ -2046,6 +2062,77 @@ def _is_bounded_marker_like(token: str) -> bool:
             "query_bounded_gqa_dkdv_q",
         )
     )
+
+
+_T1024_CALL_ABI = {
+    "forward": {
+        "operands": [
+            "bf16[1,512,16,256]",
+            "bf16[1,1024,4,256]",
+            "bf16[1,1024,4,256]",
+            "i32[1,1024]",
+        ],
+        "results": ["bf16[1,512,16,256]", "f32[1,16,512]"],
+    },
+    "dq": {
+        "operands": [
+            "bf16[1,512,16,256]",
+            "bf16[1,1024,4,256]",
+            "bf16[1,1024,4,256]",
+            "i32[1,1024]",
+            "bf16[1,512,16,256]",
+            "bf16[1,512,16,256]",
+            "f32[1,16,512]",
+        ],
+        "results": ["bf16[1,512,16,256]"],
+    },
+    "dkdv": {
+        "operands": [
+            "bf16[1,512,16,256]",
+            "bf16[1,1024,4,256]",
+            "bf16[1,1024,4,256]",
+            "i32[1,1024]",
+            "bf16[1,512,16,256]",
+            "bf16[1,512,16,256]",
+            "f32[1,16,512]",
+            "f32[1,1024,4,256]",
+            "f32[1,1024,4,256]",
+        ],
+        "results": ["f32[1,1024,4,256]", "f32[1,1024,4,256]"],
+    },
+}
+_HLO_SHAPE_LEAF_PATTERN = re.compile(
+    r"(?P<dtype>bf16|f32|s32)\[(?P<dims>\d+(?:,\d+)*)?\]"
+    r"(?:\{[^{}\r\n]*\})?"
+)
+
+
+def _canonical_stablehlo_tensor_type(token: str) -> str | None:
+    match = re.fullmatch(r"tensor<(?P<body>(?:\d+x)*(?:bf16|f32|i32))>", token.strip())
+    if match is None:
+        return None
+    pieces = match.group("body").split("x")
+    dtype = pieces[-1]
+    dimensions = ",".join(pieces[:-1])
+    return f"{dtype}[{dimensions}]"
+
+
+def _canonical_hlo_shape_leaves(shape_text: str) -> dict[str, Any]:
+    matches = list(_HLO_SHAPE_LEAF_PATTERN.finditer(shape_text))
+    leaves = [
+        f"{'i32' if match.group('dtype') == 's32' else match.group('dtype')}"
+        f"[{match.group('dims') or ''}]"
+        for match in matches
+    ]
+    skeleton = _HLO_SHAPE_LEAF_PATTERN.sub("S", shape_text)
+    skeleton = re.sub(r"\s+", "", skeleton)
+    expected_skeleton = (
+        "S" if len(leaves) == 1 else f"({','.join(['S'] * len(leaves))})"
+    )
+    return {
+        "leaves": leaves,
+        "passed": bool(leaves) and skeleton == expected_skeleton,
+    }
 
 
 def _internal_alias_pairs(block: str, dialect: str) -> dict[str, Any]:
@@ -2102,12 +2189,18 @@ def _internal_alias_pairs(block: str, dialect: str) -> dict[str, Any]:
     }
 
 
-def _stablehlo_custom_call_signature(block: str) -> dict[str, Any]:
+def _stablehlo_call_signature(block: str) -> dict[str, Any]:
     masked = _mask_ir_quoted_content(block)
     operation = re.search(r"stablehlo\.custom_call\s+@\s*\(", masked)
     assignment = masked.find("=")
     if operation is None or assignment < 0 or assignment > operation.start():
-        return {"passed": False, "results": [], "operands": []}
+        return {
+            "passed": False,
+            "results": [],
+            "operands": [],
+            "operand_shapes": [],
+            "result_shapes": [],
+        }
     lhs = masked[:assignment]
     lhs_tokens = re.findall(r"%[A-Za-z_0-9][A-Za-z0-9_.$-]*", lhs)
     result_arity = re.search(r":\s*(\d+)\s*$", lhs)
@@ -2133,19 +2226,37 @@ def _stablehlo_custom_call_signature(block: str) -> dict[str, Any]:
     result_types = (
         re.findall(r"tensor<[^>]+>", type_tail[arrow + 2 :]) if arrow >= 0 else []
     )
-    accumulator_type = "tensor<1x1024x4x256xf32>"
-    types_exact = (
-        len(input_types) == 9
-        and len(result_types) == 2
-        and input_types[7:] == [accumulator_type, accumulator_type]
-        and result_types == [accumulator_type, accumulator_type]
+    operand_shapes = [_canonical_stablehlo_tensor_type(item) for item in input_types]
+    result_shapes = [_canonical_stablehlo_tensor_type(item) for item in result_types]
+    passed = (
+        arrow >= 0
+        and len(operands) == len(input_types)
+        and len(results) == len(result_types)
+        and all(item is not None for item in (*operand_shapes, *result_shapes))
     )
     return {
-        "passed": len(results) == 2 and len(operands) == 9 and types_exact,
+        "passed": passed,
         "results": results,
         "operands": operands,
+        "operand_shapes": operand_shapes,
+        "result_shapes": result_shapes,
         "input_type_count": len(input_types),
         "result_type_count": len(result_types),
+    }
+
+
+def _stablehlo_custom_call_signature(block: str) -> dict[str, Any]:
+    signature = _stablehlo_call_signature(block)
+    types_exact = (
+        signature["input_type_count"] == 9
+        and signature["result_type_count"] == 2
+        and signature["operand_shapes"][7:]
+        == ["f32[1,1024,4,256]", "f32[1,1024,4,256]"]
+        and signature["result_shapes"] == ["f32[1,1024,4,256]", "f32[1,1024,4,256]"]
+    )
+    return {
+        **signature,
+        "passed": signature["passed"] and types_exact,
         "accumulator_types_exact": types_exact,
     }
 
@@ -2251,6 +2362,75 @@ def _optimized_hlo_call_name_and_operands(block: str) -> tuple[str | None, list[
     return match.group("name").removeprefix("%"), [
         item.removeprefix("%") for item in operands
     ]
+
+
+def _t1024_call_abi_signature(
+    text: str,
+    block: str,
+    dialect: str,
+    optimized_graph: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if dialect == "stablehlo":
+        parsed = _stablehlo_call_signature(block)
+        operand_shapes = parsed["operand_shapes"]
+        result_shapes = parsed["result_shapes"]
+        parser_passed = parsed["passed"]
+        parser = "stablehlo_exact_function_type"
+    elif dialect == "optimized_hlo":
+        graph_summary = optimized_graph or _optimized_hlo_instruction_graph(text)
+        graph = graph_summary["instructions"]
+        _call_name, operands = _optimized_hlo_call_name_and_operands(block)
+        masked = _mask_ir_quoted_content(block)
+        assignment = masked.find("=")
+        opcode = re.search(r"\bcustom-call\s*\(", masked)
+        result_parse = (
+            _canonical_hlo_shape_leaves(masked[assignment + 1 : opcode.start()])
+            if assignment >= 0 and opcode is not None and assignment < opcode.start()
+            else {"leaves": [], "passed": False}
+        )
+        operand_parses = [
+            _canonical_hlo_shape_leaves(str(graph.get(name, {}).get("shape", "")))
+            for name in operands
+        ]
+        operand_shapes = [
+            parsed["leaves"][0]
+            for parsed in operand_parses
+            if parsed["passed"] and len(parsed["leaves"]) == 1
+        ]
+        result_shapes = result_parse["leaves"]
+        parser_passed = (
+            result_parse["passed"]
+            and len(operand_shapes) == len(operands)
+            and all(
+                parsed["passed"] and len(parsed["leaves"]) == 1
+                for parsed in operand_parses
+            )
+        )
+        parser = "optimized_hlo_entry_ssa_shapes_layout_agnostic"
+    else:
+        raise ValueError("unsupported VJP IR dialect")
+    matching_kinds = [
+        kind
+        for kind, expected in _T1024_CALL_ABI.items()
+        if operand_shapes == expected["operands"]
+        and result_shapes == expected["results"]
+    ]
+    checks = {
+        "signature_parse_succeeded": parser_passed,
+        "exactly_one_closed_abi_kind_matches": len(matching_kinds) == 1,
+    }
+    return {
+        "parser": parser,
+        "operand_count": len(operand_shapes),
+        "result_count": len(result_shapes),
+        "operand_shapes": operand_shapes,
+        "result_shapes": result_shapes,
+        "matching_kinds": matching_kinds,
+        "checks": checks,
+        "passed": all(checks.values()),
+        "raw_ir_emitted": False,
+        "raw_symbols_emitted": False,
+    }
 
 
 def _t1024_accumulator_dataflow_summary(
@@ -2477,6 +2657,15 @@ def _strict_vjp_ir_summary(
     marker_query_start_counts = {
         (item["kind"], item["query_start"]): 0 for item in expected_specs
     }
+    signature_counts = dict.fromkeys(_EXPECTED_MARKERS, 0)
+    signature_query_start_counts = {
+        (item["kind"], item["query_start"]): 0 for item in expected_specs
+    }
+    optimized_graph = (
+        _optimized_hlo_instruction_graph(text)
+        if case == _ALL_VALID_T1024_CASE and dialect == "optimized_hlo"
+        else None
+    )
     all_call_checks: list[bool] = []
     for index, block in enumerate(blocks):
         target_occurrences = _isolated_custom_call_target_occurrences(block, dialect)
@@ -2484,29 +2673,78 @@ def _strict_vjp_ir_summary(
         matched_specs = [
             marker_to_spec[token] for token in tokens if token in marker_to_spec
         ]
-        kinds = [item["kind"] for item in matched_specs]
-        if len(matched_specs) == 1:
-            matched = matched_specs[0]
+        matched = matched_specs[0] if len(matched_specs) == 1 else None
+        if case == _ALL_VALID_T1024_CASE:
+            for marker_match in matched_specs:
+                marker_counts[marker_match["kind"]] += 1
+                marker_query_start_counts[
+                    (marker_match["kind"], marker_match["query_start"])
+                ] += 1
+        elif matched is not None:
             marker_counts[matched["kind"]] += 1
             marker_query_start_counts[(matched["kind"], matched["query_start"])] += 1
-            expected_query_start = int(matched["query_start"])
+        signature = None
+        query_start_candidates = None
+        if case == _ALL_VALID_T1024_CASE:
+            signature = _t1024_call_abi_signature(text, block, dialect, optimized_graph)
+            kinds = signature["matching_kinds"]
+            query_start_candidates = [
+                _nonzero_probe()._canonical_raw_metadata_field(
+                    _decode_ir(block), "query_start", expected_start
+                )
+                for expected_start in (0, 512)
+            ]
+            passing_starts = [
+                candidate for candidate in query_start_candidates if candidate["passed"]
+            ]
+            query_start = (
+                passing_starts[0]
+                if len(passing_starts) == 1
+                else {
+                    "expected": None,
+                    "passed": False,
+                    "canonical_candidate_match_count": len(passing_starts),
+                    "raw_values_emitted": False,
+                }
+            )
+            if len(kinds) == 1:
+                signature_counts[kinds[0]] += 1
+                if query_start["passed"]:
+                    signature_query_start_counts[
+                        (kinds[0], int(query_start["expected"]))
+                    ] += 1
         else:
-            matched = None
-            expected_query_start = -1
-        query_start = _nonzero_probe()._canonical_raw_metadata_field(
-            _decode_ir(block), "query_start", expected_query_start
-        )
+            kinds = [item["kind"] for item in matched_specs]
+            expected_query_start = (
+                int(matched["query_start"]) if matched is not None else -1
+            )
+            query_start = _nonzero_probe()._canonical_raw_metadata_field(
+                _decode_ir(block), "query_start", expected_query_start
+            )
         query_size = _nonzero_probe()._canonical_raw_metadata_field(
             _decode_ir(block), "query_size", _QUERY_CHUNK_SIZE
         )
-        checks = {
-            "sole_exact_target": target_occurrences == [_EXACT_TARGET],
-            "exactly_one_expected_marker": len(matched_specs) == 1,
-            "query_start_is_exact_canonical_expected_chunk_start": query_start[
-                "passed"
-            ],
-            "query_size_is_exact_canonical_512": query_size["passed"],
-        }
+        checks = {"sole_exact_target": target_occurrences == [_EXACT_TARGET]}
+        if case == _ALL_VALID_T1024_CASE:
+            checks.update(
+                {
+                    "exactly_one_closed_abi_signature_kind": signature["passed"],
+                    "exactly_one_of_two_canonical_query_start_parses_passes": (
+                        query_start["passed"]
+                    ),
+                    "query_size_is_exact_canonical_512": query_size["passed"],
+                }
+            )
+        else:
+            checks.update(
+                {
+                    "exactly_one_expected_marker": len(matched_specs) == 1,
+                    "query_start_is_exact_canonical_expected_chunk_start": (
+                        query_start["passed"]
+                    ),
+                    "query_size_is_exact_canonical_512": query_size["passed"],
+                }
+            )
         all_call_checks.append(all(checks.values()))
         calls.append(
             {
@@ -2526,29 +2764,68 @@ def _strict_vjp_ir_summary(
                 ),
                 "query_start": query_start,
                 "query_size": query_size,
+                **(
+                    {
+                        "query_start_candidate_parses": query_start_candidates,
+                        "signature_classification": signature,
+                        "expected_marker_occurrence_count_diagnostic_only": len(
+                            matched_specs
+                        ),
+                    }
+                    if case == _ALL_VALID_T1024_CASE
+                    else {}
+                ),
                 "checks": checks,
                 "passed": all(checks.values()),
             }
         )
-    checks = {
+    checks: dict[str, bool] = {
         "parser_matches_textual_custom_call_count": len(raw_blocks) == textual_count,
         "exact_expected_custom_calls_total": (
             len(raw_blocks) == textual_count == expected_count
-        ),
-        "all_expected_calls_pass_target_marker_and_metadata": len(all_call_checks)
-        == expected_count
-        and all(all_call_checks),
-        "each_expected_kind_occurs_once_per_query_chunk": all(
-            marker_counts[kind] == _case_sequence_length(case) // _QUERY_CHUNK_SIZE
-            for kind in _EXPECTED_MARKERS
-        ),
-        "each_expected_marker_query_start_pair_occurs_once": all(
-            count == 1 for count in marker_query_start_counts.values()
         ),
         "no_unexpected_or_lookalike_bounded_markers": not unexpected,
         "all_calls_direct_entry_and_container_independent": (ownership["passed"]),
         "no_outer_while": while_count == 0,
     }
+    if case == _ALL_VALID_T1024_CASE:
+        checks.update(
+            {
+                "all_expected_calls_pass_target_abi_and_metadata": (
+                    len(all_call_checks) == expected_count and all(all_call_checks)
+                ),
+                "each_expected_abi_kind_occurs_once_per_query_chunk": all(
+                    signature_counts[kind]
+                    == _case_sequence_length(case) // _QUERY_CHUNK_SIZE
+                    for kind in _EXPECTED_MARKERS
+                ),
+                "each_expected_abi_kind_query_start_pair_occurs_once": all(
+                    count == 1 for count in signature_query_start_counts.values()
+                ),
+            }
+        )
+        if dialect == "optimized_hlo":
+            checks["exact_nine_independent_zero_custom_call_entry_fusion_helpers"] = (
+                ownership.get("allowed_independent_entry_fusion_helper_count")
+                == _T1024_EXPECTED_OPTIMIZED_FUSION_HELPERS
+                and ownership.get("forbidden_container_count") == 0
+            )
+    else:
+        checks.update(
+            {
+                "all_expected_calls_pass_target_marker_and_metadata": (
+                    len(all_call_checks) == expected_count and all(all_call_checks)
+                ),
+                "each_expected_kind_occurs_once_per_query_chunk": all(
+                    marker_counts[kind]
+                    == _case_sequence_length(case) // _QUERY_CHUNK_SIZE
+                    for kind in _EXPECTED_MARKERS
+                ),
+                "each_expected_marker_query_start_pair_occurs_once": all(
+                    count == 1 for count in marker_query_start_counts.values()
+                ),
+            }
+        )
     accumulator_dataflow = None
     if case == _ALL_VALID_T1024_CASE:
         accumulator_dataflow = _t1024_accumulator_dataflow_summary(
@@ -2569,6 +2846,19 @@ def _strict_vjp_ir_summary(
             {"kind": kind, "query_start": query_start, "count": count}
             for (kind, query_start), count in sorted(marker_query_start_counts.items())
         ],
+        **(
+            {
+                "signature_call_counts": signature_counts,
+                "signature_query_start_counts": [
+                    {"kind": kind, "query_start": query_start, "count": count}
+                    for (kind, query_start), count in sorted(
+                        signature_query_start_counts.items()
+                    )
+                ],
+            }
+            if case == _ALL_VALID_T1024_CASE
+            else {}
+        ),
         "unexpected_bounded_marker_occurrences": len(unexpected),
         "while_count": while_count,
         "calls": calls,
@@ -2636,14 +2926,27 @@ def _compiled_memory_gate(
         == contract["argument"],
         "output_bytes_exact": values["output_size_in_bytes"] == contract["output"],
         "alias_bytes_exact": values["alias_size_in_bytes"] == contract["alias"],
-        "temporary_bytes_within_case_ceiling": available
-        and values["temp_size_in_bytes"] <= contract["temporary"],
     }
+    if _normalize_case(case) == _ALL_VALID_T1024_CASE:
+        checks["temporary_bytes_exact"] = (
+            available and values["temp_size_in_bytes"] == contract["temporary"]
+        )
+    else:
+        checks["temporary_bytes_within_case_ceiling"] = (
+            available and values["temp_size_in_bytes"] <= contract["temporary"]
+        )
     return {
         "expected_argument_bytes": contract["argument"],
         "expected_output_bytes": contract["output"],
         "expected_alias_bytes": contract["alias"],
-        "maximum_temporary_bytes": contract["temporary"],
+        **(
+            {
+                "expected_temporary_bytes": contract["temporary"],
+                "maximum_temporary_bytes": None,
+            }
+            if _normalize_case(case) == _ALL_VALID_T1024_CASE
+            else {"maximum_temporary_bytes": contract["temporary"]}
+        ),
         "checks": checks,
         "passed": all(checks.values()),
     }
@@ -2914,7 +3217,11 @@ def _run_compile_diagnostic(
         },
         output,
     )
-    return 0
+    diagnostic_evidence_passed = (
+        report.get("structural_gate", {}).get("passed") is True
+        and report.get("compiled_memory_gate", {}).get("passed") is True
+    )
+    return 0 if diagnostic_evidence_passed else 2
 
 
 def _iid_nonzero_grid(

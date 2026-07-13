@@ -299,10 +299,19 @@ def test_t1024_contract_fixes_two_chunks_memory_and_withholds_runtime():
     gate = contract["compile_gate"]
     assert gate["exact_custom_calls"] == {"forward": 2, "dq": 2, "dkdv": 2}
     assert gate["exact_total_custom_calls"] == 6
+    assert "exact_marker_query_start_pairs" not in gate
+    assert gate["exact_abi_query_start_pairs"] == [
+        {"kind": kind, "query_start": query_start, "query_size": 512}
+        for kind in ("forward", "dq", "dkdv")
+        for query_start in (0, 512)
+    ]
+    assert gate["human_marker_evidence_is_diagnostic_only"] is True
     assert gate["exact_argument_bytes"] == 20_975_616
     assert gate["exact_output_bytes"] == 20_971_552
     assert gate["exact_alias_bytes"] == 0
-    assert gate["maximum_temporary_bytes"] == 128 * 1024**2
+    assert gate["maximum_temporary_bytes"] is None
+    assert gate["exact_temporary_bytes"] == 25_232_640
+    assert gate["exact_optimized_hlo_zero_custom_call_entry_fusion_helpers"] == 9
     assert contract["output_tensor_leaf_bytes"] == 20_971_520
     assert contract["compiled_output_root_bytes"] == 32
     assert contract["host_input_bytes"] == 20_975_616
@@ -328,6 +337,8 @@ def test_t1024_contract_fixes_two_chunks_memory_and_withholds_runtime():
         is False
     )
     assert contract["physical_launch_count_claimed"] is False
+    assert contract["optimized_hlo_fusion_helper_inventory_pin"] == 9
+    assert contract["first_capture_exact_temporary_bytes_pin"] == 25_232_640
     assert (
         contract[
             "six_calls_are_bounded_attention_custom_calls_not_physical_launch_count"
@@ -355,14 +366,14 @@ def test_t1024_shape_and_external_memory_gates_are_exact():
         "argument_size_in_bytes": 20_975_616,
         "output_size_in_bytes": 20_971_552,
         "alias_size_in_bytes": 0,
-        "temp_size_in_bytes": 128 * 1024**2,
+        "temp_size_in_bytes": 25_232_640,
     }
     assert _PROBE._compiled_memory_gate(memory, "all_valid_t1024")["passed"] is True
     for name, value in (
         ("argument_size_in_bytes", 20_975_615),
         ("output_size_in_bytes", 20_971_520),
         ("alias_size_in_bytes", 1),
-        ("temp_size_in_bytes", 128 * 1024**2 + 1),
+        ("temp_size_in_bytes", 25_232_641),
     ):
         corrupt = dict(memory)
         corrupt[name] = value
@@ -918,14 +929,27 @@ def _optimized_hlo_calls(
 def _t1024_two_chunk_ir(dialect: str) -> str:
     specs = _PROBE._expected_call_specs("all_valid_t1024")
     if dialect == "stablehlo":
+        query = "tensor<1x512x16x256xbf16>"
+        key_value = "tensor<1x1024x4x256xbf16>"
+        mask = "tensor<1x1024xi32>"
+        lse = "tensor<1x16x512xf32>"
         accumulator = "tensor<1x1024x4x256xf32>"
         definitions = [
             f'#loc{index} = loc("{item["marker"]} query_start={item["query_start"]} query_size=512")'
             for index, item in enumerate(specs)
         ]
-        arguments = ", ".join(f"%a{index}: {accumulator}" for index in range(9))
-        operands = ", ".join(f"%a{index}" for index in range(9))
-        types = ", ".join([accumulator] * 9)
+        parameters = (
+            ("q0", query),
+            ("q512", query),
+            ("k", key_value),
+            ("v", key_value),
+            ("mask", mask),
+            ("dout0", query),
+            ("dout512", query),
+            ("acc_dk", accumulator),
+            ("acc_dv", accumulator),
+        )
+        arguments = ", ".join(f"%{name}: {shape}" for name, shape in parameters)
         aliases = (
             "#stablehlo.output_operand_alias<output_tuple_indices = [0], "
             "operand_index = 7, operand_tuple_indices = []>, "
@@ -933,37 +957,89 @@ def _t1024_two_chunk_ir(dialect: str) -> str:
             "operand_index = 8, operand_tuple_indices = []>"
         )
         lines = [*definitions, "module {", f"  func.func public @main({arguments}) {{"]
-        lines.extend(
-            f'    %x{index} = stablehlo.custom_call @"{_TARGET}"() : () -> tensor<1xbf16> loc(#loc{index})'
-            for index in range(4)
+        forward_types = f"({query}, {key_value}, {key_value}, {mask})"
+        backward_types = (
+            f"({query}, {key_value}, {key_value}, {mask}, {query}, {query}, {lse})"
         )
+        for index, start in enumerate((0, 512)):
+            lines.append(
+                f'    %fw{start}:2 = stablehlo.custom_call @"{_TARGET}"'
+                f"(%q{start}, %k, %v, %mask) : {forward_types} -> "
+                f"({query}, {lse}) loc(#loc{index})"
+            )
+        for index, start in enumerate((0, 512), start=2):
+            lines.append(
+                f'    %dq{start} = stablehlo.custom_call @"{_TARGET}"'
+                f"(%q{start}, %k, %v, %mask, %fw{start}#0, "
+                f"%dout{start}, %fw{start}#1) : {backward_types} -> {query} "
+                f"loc(#loc{index})"
+            )
+        dkdv_types = f"{backward_types[:-1]}, {accumulator}, {accumulator})"
         lines.append(
-            f'    %dk0:2 = stablehlo.custom_call @"{_TARGET}"({operands}) '
-            f"{{output_operand_aliases = [{aliases}]}} : ({types}) -> "
+            f'    %dk0:2 = stablehlo.custom_call @"{_TARGET}"'
+            f"(%q0, %k, %v, %mask, %fw0#0, %dout0, %fw0#1, "
+            f"%acc_dk, %acc_dv) "
+            f"{{output_operand_aliases = [{aliases}]}} : {dkdv_types} -> "
             f"({accumulator}, {accumulator}) loc(#loc4)"
         )
-        q512_operands = ", ".join(
-            [*(f"%a{index}" for index in range(7)), "%dk0#0", "%dk0#1"]
-        )
         lines.append(
-            f'    %dk512:2 = stablehlo.custom_call @"{_TARGET}"({q512_operands}) '
-            f"{{output_operand_aliases = [{aliases}]}} : ({types}) -> "
+            f'    %dk512:2 = stablehlo.custom_call @"{_TARGET}"'
+            f"(%q512, %k, %v, %mask, %fw512#0, %dout512, %fw512#1, "
+            f"%dk0#0, %dk0#1) "
+            f"{{output_operand_aliases = [{aliases}]}} : {dkdv_types} -> "
             f"({accumulator}, {accumulator}) loc(#loc5)"
         )
         return "\n".join([*lines, "    return", "  }", "}"])
     if dialect == "optimized_hlo":
+        query = "bf16[1,512,16,256]{3,2,1,0}"
+        key_value = "bf16[1,1024,4,256]{3,2,1,0}"
+        mask = "s32[1,1024]{1,0}"
+        lse = "f32[1,16,512]{2,1,0}"
         accumulator = "f32[1,1024,4,256]"
-        parameters = ", ".join(f"%p{index}: {accumulator}" for index in range(9))
-        operands = ", ".join(f"%p{index}" for index in range(9))
         aliases = "{{0}: (7, {}), {1}: (8, {})}"
-        lines = ["HloModule t1024", f"ENTRY main ({parameters}) -> () {{"]
+        lines = ["HloModule t1024"]
+        for index in range(9):
+            lines.extend(
+                [
+                    f"helper_{index} {{",
+                    f"  ROOT %helper_root_{index} = () tuple()",
+                    "}",
+                ]
+            )
         lines.extend(
-            f'  %x{index} = bf16[1] custom-call(), custom_call_target="{_TARGET}", '
-            f'op_name="{item["marker"]} query_start={item["query_start"]} query_size=512"'
-            for index, item in enumerate(specs[:4])
+            [
+                "ENTRY main () -> () {",
+                f"  %q0 = {query} parameter(0)",
+                f"  %q512 = {query} parameter(1)",
+                f"  %k = {key_value} parameter(2)",
+                f"  %v = {key_value} parameter(3)",
+                f"  %mask = {mask} parameter(4)",
+                f"  %dout0 = {query} parameter(5)",
+                f"  %dout512 = {query} parameter(6)",
+                f"  %acc_dk = {accumulator} parameter(7)",
+                f"  %acc_dv = {accumulator} parameter(8)",
+            ]
         )
+        for index, start in enumerate((0, 512)):
+            lines.extend(
+                [
+                    f"  %fw{start} = ({query}, {lse}) custom-call(%q{start}, %k, %v, %mask), "
+                    f'custom_call_target="{_TARGET}", op_name="{specs[index]["marker"]} '
+                    f'query_start={start} query_size=512"',
+                    f"  %fw{start}_out = {query} get-tuple-element(%fw{start}), index=0",
+                    f"  %fw{start}_lse = {lse} get-tuple-element(%fw{start}), index=1",
+                ]
+            )
+        for index, start in enumerate((0, 512), start=2):
+            lines.append(
+                f"  %dq{start} = {query} custom-call(%q{start}, %k, %v, %mask, "
+                f"%fw{start}_out, %dout{start}, %fw{start}_lse), "
+                f'custom_call_target="{_TARGET}", op_name="{specs[index]["marker"]} '
+                f'query_start={start} query_size=512"'
+            )
+        q0_operands = "%q0, %k, %v, %mask, %fw0_out, %dout0, %fw0_lse, %acc_dk, %acc_dv"
         lines.append(
-            f"  %dk0 = ({accumulator}, {accumulator}) custom-call({operands}), "
+            f"  %dk0 = ({accumulator}, {accumulator}) custom-call({q0_operands}), "
             f'custom_call_target="{_TARGET}", output_to_operand_aliasing={aliases}, '
             f'op_name="{specs[4]["marker"]} query_start=0 query_size=512"'
         )
@@ -973,13 +1049,17 @@ def _t1024_two_chunk_ir(dialect: str) -> str:
                 f"  %gte1 = {accumulator} get-tuple-element(%dk0), index=1",
             )
         )
-        q512_operands = ", ".join(
-            [*(f"%p{index}" for index in range(7)), "%gte0", "%gte1"]
+        q512_operands = (
+            "%q512, %k, %v, %mask, %fw512_out, %dout512, %fw512_lse, %gte0, %gte1"
         )
         lines.append(
             f"  %dk512 = ({accumulator}, {accumulator}) custom-call({q512_operands}), "
             f'custom_call_target="{_TARGET}", output_to_operand_aliasing={aliases}, '
             f'op_name="{specs[5]["marker"]} query_start=512 query_size=512"'
+        )
+        lines.extend(
+            f"  %fusion_{index} = () fusion(), calls=%helper_{index}"
+            for index in range(9)
         )
         return "\n".join([*lines, "  ROOT %root = () tuple()", "}"])
     raise ValueError("unsupported test dialect")
@@ -994,6 +1074,24 @@ def test_t1024_strict_ir_accepts_six_calls_aliases_and_accumulator_chain(dialect
     assert summary["custom_call_count"] == 6
     assert summary["marker_call_counts"] == {"forward": 2, "dq": 2, "dkdv": 2}
     assert all(item["count"] == 1 for item in summary["marker_query_start_counts"])
+    assert summary["signature_call_counts"] == {
+        "forward": 2,
+        "dq": 2,
+        "dkdv": 2,
+    }
+    assert all(item["count"] == 1 for item in summary["signature_query_start_counts"])
+    assert all(call["signature_classification"]["passed"] for call in summary["calls"])
+    assert all(
+        call["signature_classification"]["raw_ir_emitted"] is False
+        and call["signature_classification"]["raw_symbols_emitted"] is False
+        for call in summary["calls"]
+    )
+    if dialect == "optimized_hlo":
+        ownership = summary["entry_call_ownership"]
+        assert ownership["allowed_independent_entry_fusion_helper_count"] == 9
+        assert len(ownership["allowed_independent_entry_fusion_helpers"]) == 9
+        assert ownership["forbidden_container_count"] == 0
+        assert ownership["forbidden_containers"] == []
     dataflow = summary["two_chunk_accumulator_dataflow"]
     assert dataflow["passed"] is True
     assert all(dataflow["checks"].values())
@@ -1007,6 +1105,126 @@ def test_t1024_strict_ir_accepts_six_calls_aliases_and_accumulator_chain(dialect
     }
     assert dataflow["raw_ir_emitted"] is False
     assert dataflow["raw_symbols_emitted"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_signature_pairing_is_independent_of_custom_call_order(dialect):
+    lines = _t1024_two_chunk_ir(dialect).splitlines()
+    first = next(index for index, line in enumerate(lines) if "%dq0 =" in line)
+    second = next(index for index, line in enumerate(lines) if "%dq512 =" in line)
+    lines[first], lines[second] = lines[second], lines[first]
+    summary = _PROBE._strict_vjp_ir_summary(
+        "\n".join(lines), dialect, "all_valid_t1024"
+    )
+    assert summary["passed"] is True
+    assert summary["calls"][2]["kind"] == "dq"
+    assert summary["calls"][2]["query_start"]["expected"] == 512
+    assert summary["calls"][3]["kind"] == "dq"
+    assert summary["calls"][3]["query_start"]["expected"] == 0
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+@pytest.mark.parametrize("metadata_failure", ("missing", "ambiguous"))
+def test_t1024_query_start_requires_exactly_one_of_two_canonical_parses(
+    dialect, metadata_failure
+):
+    text = _t1024_two_chunk_ir(dialect)
+    replacement = (
+        "query_size=512"
+        if metadata_failure == "missing"
+        else "query_start=0 query_start=512 query_size=512"
+    )
+    text = text.replace("query_start=0 query_size=512", replacement, 1)
+    summary = _PROBE._strict_vjp_ir_summary(text, dialect, "all_valid_t1024")
+    assert summary["passed"] is False
+    call = summary["calls"][0]
+    assert call["query_start"]["passed"] is False
+    assert len(call["query_start_candidate_parses"]) == 2
+    assert not any(item["passed"] for item in call["query_start_candidate_parses"])
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_expected_markers_are_diagnostic_only_and_cannot_spoof_abi(dialect):
+    text = _t1024_two_chunk_ir(dialect).replace(
+        "query_bounded_gqa_dq_q0", "query_bounded_gqa_forward_q0", 1
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, dialect, "all_valid_t1024")
+    assert summary["passed"] is True
+    assert summary["signature_call_counts"] == {
+        "forward": 2,
+        "dq": 2,
+        "dkdv": 2,
+    }
+    dq0 = next(
+        call
+        for call in summary["calls"]
+        if call["kind"] == "dq" and call["query_start"]["expected"] == 0
+    )
+    assert dq0["signature_classification"]["matching_kinds"] == ["dq"]
+
+    if dialect == "stablehlo":
+        spoofed_wrong_abi = text.replace(
+            "-> tensor<1x512x16x256xbf16> loc(#loc2)",
+            "-> tensor<1x1024x4x256xbf16> loc(#loc2)",
+            1,
+        )
+    else:
+        spoofed_wrong_abi = text.replace(
+            "%dq0 = bf16[1,512,16,256]{3,2,1,0} custom-call",
+            "%dq0 = bf16[1,1024,4,256]{3,2,1,0} custom-call",
+            1,
+        )
+    assert (
+        _PROBE._strict_vjp_ir_summary(spoofed_wrong_abi, dialect, "all_valid_t1024")[
+            "passed"
+        ]
+        is False
+    )
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_missing_markers_pass_but_unexpected_lookalikes_fail(dialect):
+    marker_free = _t1024_two_chunk_ir(dialect)
+    for marker in (
+        "query_bounded_gqa_forward_q0",
+        "query_bounded_gqa_forward_q512",
+        "query_bounded_gqa_dq_q0",
+        "query_bounded_gqa_dq_q512",
+        "query_bounded_gqa_dkdv_q0",
+        "query_bounded_gqa_dkdv_q512",
+    ):
+        marker_free = marker_free.replace(marker, "source_name_not_preserved")
+    summary = _PROBE._strict_vjp_ir_summary(marker_free, dialect, "all_valid_t1024")
+    assert summary["passed"] is True
+    assert summary["marker_call_counts"] == {"forward": 0, "dq": 0, "dkdv": 0}
+
+    lookalike = marker_free.replace(
+        "source_name_not_preserved", "query_bounded_gqa_forward_q0_spoof", 1
+    )
+    rejected = _PROBE._strict_vjp_ir_summary(lookalike, dialect, "all_valid_t1024")
+    assert rejected["unexpected_bounded_marker_occurrences"] == 1
+    assert rejected["passed"] is False
+
+
+def test_t1024_optimized_helper_inventory_is_exactly_nine():
+    lines = _t1024_two_chunk_ir("optimized_hlo").splitlines()
+    helper = lines.index("helper_8 {")
+    del lines[helper : helper + 3]
+    lines.remove("  %fusion_8 = () fusion(), calls=%helper_8")
+    summary = _PROBE._strict_vjp_ir_summary(
+        "\n".join(lines), "optimized_hlo", "all_valid_t1024"
+    )
+    assert (
+        summary["entry_call_ownership"]["allowed_independent_entry_fusion_helper_count"]
+        == 8
+    )
+    assert (
+        summary["checks"][
+            "exact_nine_independent_zero_custom_call_entry_fusion_helpers"
+        ]
+        is False
+    )
+    assert summary["passed"] is False
 
 
 @pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
@@ -1091,12 +1309,12 @@ def test_t1024_unrelated_data_movement_is_diagnostic_only(opcode):
     (
         (
             "convert",
-            "    %unrelated = stablehlo.convert %a0 : "
+            "    %unrelated = stablehlo.convert %acc_dk : "
             "(tensor<1x1024x4x256xf32>) -> tensor<1x1024x4x256xbf16>",
         ),
         (
             "concatenate",
-            "    %unrelated = stablehlo.concatenate %a0, %a0, dim = 0 : "
+            "    %unrelated = stablehlo.concatenate %acc_dk, %acc_dk, dim = 0 : "
             "(tensor<1x1024x4x256xf32>, tensor<1x1024x4x256xf32>) -> "
             "tensor<2x1024x4x256xf32>",
         ),
@@ -2205,6 +2423,84 @@ def test_compile_diagnostic_destroys_unreleased_artifact_with_all_runtime_counte
     [record] = _records(output)
     assert record["record_type"] == "compile_diagnostic_completed"
     assert record["status"] == "structure_and_memory_passed_no_release"
+    assert record["checked_capability_created_or_released"] is False
+    assert record["host_reference_constructed"] is False
+    assert record["host_or_device_inputs_constructed"] is False
+    assert record["executable_invoked"] is False
+    assert record["device_output_retrieved"] is False
+
+
+def test_failed_compile_diagnostic_returns_nonzero_without_release_or_runtime(
+    monkeypatch,
+):
+    state = {"destroyed": 0}
+
+    class FailedArtifact:
+        def __del__(self):
+            state["destroyed"] += 1
+
+    def compile_artifact(_jax, _jnp, _api, _clean, counters, _output):
+        for name in (
+            "lower_attempts",
+            "lower_completions",
+            "compile_attempts",
+            "compile_completions",
+        ):
+            counters[name] += 1
+        return FailedArtifact(), {
+            "structural_gate": {"passed": False},
+            "compiled_memory_gate": {"passed": True},
+            "release_gate": {"passed": False},
+        }
+
+    monkeypatch.setattr(_PROBE, "_compile_vjp_artifact", compile_artifact)
+    for forbidden in (
+        "_release_checked_vjp",
+        "_construct_host_case",
+        "_device_put_inputs",
+        "_dispatch_candidate",
+        "_device_get_candidate",
+    ):
+        monkeypatch.setattr(
+            _PROBE,
+            forbidden,
+            lambda *_args, _name=forbidden, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"failed compile diagnostic reached {_name}")
+            ),
+        )
+    counters = _PROBE._zero_counters()
+    output = io.StringIO()
+    result = _PROBE._run_compile_diagnostic(
+        object(),
+        object(),
+        lambda *_args, **_kwargs: None,
+        lambda: dict(_CLEAN),
+        counters,
+        output,
+    )
+    gc.collect()
+    assert result == 2
+    assert state["destroyed"] == 1
+    assert counters == _PROBE._compile_diagnostic_completed_counters()
+    assert all(
+        counters[name] == 0
+        for name in (
+            "input_device_put_attempts",
+            "input_device_put_completions",
+            "candidate_attempts",
+            "candidate_completions",
+            "device_get_attempts",
+            "device_get_completions",
+            "lowered_callable_invocations",
+            "checked_executable_invocations",
+            "checked_capability_release_attempts",
+            "checked_capability_release_completions",
+            "host_reference_construction_attempts",
+            "host_reference_construction_completions",
+        )
+    )
+    [record] = _records(output)
+    assert record["status"] == "structure_or_memory_failed_no_release"
     assert record["checked_capability_created_or_released"] is False
     assert record["host_reference_constructed"] is False
     assert record["host_or_device_inputs_constructed"] is False
