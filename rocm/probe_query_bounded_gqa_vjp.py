@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guarded exact-T512 full GQA VJP gate.
+"""Guarded exact full GQA VJP gate for closed T512 and T1024 cases.
 
 The default ``abstract`` mode emits a refusal manifest without importing JAX.
 ROCm requires ``--platform rocm --allow-gpu --output`` in a fresh process under
@@ -11,7 +11,11 @@ ROCm Triton call, canonical query metadata, no extra custom call, callable
 container that can own or duplicate a custom call, or outer while, and exact
 compiled-memory bounds.  Unrelated direct-entry fusion helpers are permitted
 only when every nonentry computation contains zero custom calls.  The
-capability is consumed by one invocation only.
+capability is consumed by one invocation only.  ``all_valid_t1024`` is a
+compile-diagnostic-only BF16 B1/T1024/Hq16/Hkv4/D256 rung with two exact
+512-query chunks.  It additionally requires both dK/dV calls to alias FP32
+accumulators internally and proves the q0 accumulators flow directly into the
+q512 call; this source revision cannot release or invoke that executable.
 
 ``--compile-diagnostic`` is a separate compile-only authorization.  It emits
 sanitized structural graphs and always destroys the unreleased compiled handle
@@ -19,7 +23,7 @@ before postflight.  That path cannot construct a host reference or device
 inputs, create a checked capability, invoke the executable, or retrieve output.
 
 Q/K/V and the output cotangent are independent deterministic nonzero BF16
-PCG64 grids.  The default case remains all-valid.  The only padded case is
+PCG64 grids.  The default case remains all-valid T512.  The only padded case is
 ``--case valid385``: its int32 key mask is one through row 384 and zero after,
 and its independently generated cotangent is set to bitwise positive zero
 after row 384 to model loss masking.  Validation uses an independent host
@@ -65,11 +69,31 @@ _QKV_MAXIMUM_INTEGER_MAGNITUDE = 96
 _COTANGENT_MAXIMUM_INTEGER_MAGNITUDE = 48
 _ALL_VALID_CASE = "all_valid"
 _VALID385_CASE = "valid385"
-_CASE_VALID_TOKENS = {_ALL_VALID_CASE: 512, _VALID385_CASE: 385}
+_ALL_VALID_T1024_CASE = "all_valid_t1024"
+_CASE_SEQUENCE_LENGTH = {
+    _ALL_VALID_CASE: 512,
+    _VALID385_CASE: 512,
+    _ALL_VALID_T1024_CASE: 1024,
+}
+_CASE_VALID_TOKENS = {
+    _ALL_VALID_CASE: 512,
+    _VALID385_CASE: 385,
+    _ALL_VALID_T1024_CASE: 1024,
+}
+_T1024_INPUT_SEED = 20260715
+_T1024_COTANGENT_SEED = 20260716
 _EXPECTED_ARGUMENT_BYTES = 10_487_808
 _EXPECTED_OUTPUT_BYTES = 10_485_792
 _EXPECTED_ALIAS_BYTES = 0
 _MAX_TEMP_BYTES = 64 * 1024**2
+_T1024_EXPECTED_ARGUMENT_BYTES = 20_975_616
+_T1024_EXPECTED_OUTPUT_BYTES = 20_971_552
+_T1024_OUTPUT_TENSOR_LEAF_BYTES = 20_971_520
+_T1024_EXPECTED_HOST_INPUT_BYTES = 20_975_616
+_T1024_EXPECTED_HOST_REFERENCE_BYTES = 41_943_040
+_T1024_EXPECTED_ACCUMULATOR_LEAF_BYTES = 4_194_304
+_T1024_EXPECTED_ACCUMULATOR_PAIR_BYTES = 8_388_608
+_T1024_MAX_TEMP_BYTES = 128 * 1024**2
 _MAX_RELATIVE_L2 = 0.01
 _MIN_COSINE = 0.9999
 _MAX_ABSOLUTE_ERROR = 0.02
@@ -175,6 +199,78 @@ _EXPECTED_VALID385_SENSITIVITY_METRICS = {
         "relative_l2": 0.23070081049708538,
         "cosine": 0.9745800453229094,
         "max_abs": 0.05243309319484979,
+    },
+}
+_EXPECTED_T1024_INPUT_SHA256 = {
+    "q": "7f0b45ff60f4f83eb8c7270e3346d644d96f5af2e04d98485e0f60861c80ef3d",
+    "k": "493b4ad5cc5829934832fa0fba3489b3bb5efe7c9be12df027116d67a253c666",
+    "v": "e22acd19b08d701ed2200a559689e1f7a41a5474275ec590e9877f3644f3e4af",
+    "key_mask": "b33dd739a3b1d1e659a638b318bdcfbaed8eb8cca224dbf0a76e9e1a81db57bc",
+    "dout": "acd47ea67ba408623ead3efef1b662602ec5ed5b6d6f5061deeac29ea24c74f3",
+}
+_EXPECTED_T1024_REFERENCE_SHA256 = {
+    "output": "32aa7f56404b07a6b6b41dc326856464f42059853be49d9368f31344ab167255",
+    "dq": "85ff6450f8f5337e86bacf6533308aea81b693b1453293384ace91e8d2e19629",
+    "dk": "d318ee244888f2a5e35e784f100bcd82f260a95eb98914e02e2154cb2c1bb8b4",
+    "dv": "07e6dbda8683d89e8610ff88d4e26db6fa7cea71d4489b84b720fd0e2135eba1",
+}
+_EXPECTED_T1024_REFERENCE_NORMS = {
+    "output": 78.89605838607802,
+    "dq": 10.024294230013929,
+    "dk": 10.034410185312508,
+    "dv": 39.44324422318175,
+}
+_EXPECTED_T1024_MAXIMUM_ABSOLUTE_VALID_LOGIT = 1.580984115600586
+_EXPECTED_T1024_RESET_SENSITIVITY_SHA256 = {
+    "reset_before_q512_dk": "c4dee952fe765fd299b70d6e07f880d8901ffdaf133a65c2dcd411b1a737d0ea",
+    "reset_before_q512_dv": "9cd300ea417181f875adffc04bdd0e70c3a45deefb2fd0734bc83f744b5a73b0",
+}
+_EXPECTED_T1024_RESET_SENSITIVITY_METRICS = {
+    "dk_keys_0_512": {
+        "relative_l2": 0.9532886121167244,
+        "cosine": 0.3020656600015531,
+        "max_abs": 0.31560109183192253,
+    },
+    "dk_keys_512_1024": {
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "max_abs": 0.0,
+    },
+    "dv_keys_0_512": {
+        "relative_l2": 0.968611797037619,
+        "cosine": 0.24908097592135287,
+        "max_abs": 1.9542092098854482,
+    },
+    "dv_keys_512_1024": {
+        "relative_l2": 0.0,
+        "cosine": 0.9999999999999999,
+        "max_abs": 0.0,
+    },
+}
+_EXPECTED_T1024_OMIT_Q512_SENSITIVITY_SHA256 = {
+    "omit_q512_dk": "865760bd93cec7d1c6232f2dbf267ae9f480d22322c8527739c6ac4e4f72c557",
+    "omit_q512_dv": "c50b6f03d2753f1c7f5cba27e8e470953aefa584c0aaf3d9adc518fe995682cb",
+}
+_EXPECTED_T1024_OMIT_Q512_SENSITIVITY_METRICS = {
+    "dk_keys_0_512": {
+        "relative_l2": 0.30038015059039513,
+        "cosine": 0.9538197142022793,
+        "max_abs": 0.019737408962100744,
+    },
+    "dk_keys_512_1024": {
+        "relative_l2": 1.0,
+        "cosine": 0.0,
+        "max_abs": 0.017040351405739784,
+    },
+    "dv_keys_0_512": {
+        "relative_l2": 0.2648969778896508,
+        "cosine": 0.964286420084395,
+        "max_abs": 0.060299725737422705,
+    },
+    "dv_keys_512_1024": {
+        "relative_l2": 1.0,
+        "cosine": 0.0,
+        "max_abs": 0.054651398211717606,
     },
 }
 _EXPECTED_AMD_PCI_DEVICE_ID = "0x744c"
@@ -437,17 +533,61 @@ def _normalize_case(case: str) -> str:
     return case
 
 
+def _case_sequence_length(case: str) -> int:
+    return _CASE_SEQUENCE_LENGTH[_normalize_case(case)]
+
+
+def _expected_call_specs(case: str) -> list[dict[str, Any]]:
+    sequence = _case_sequence_length(case)
+    return [
+        {
+            "kind": kind,
+            "query_start": query_start,
+            "query_size": _QUERY_CHUNK_SIZE,
+            "marker": f"query_bounded_gqa_{marker_kind}_q{query_start}",
+        }
+        for kind, marker_kind in (
+            ("forward", "forward"),
+            ("dq", "dq"),
+            ("dkdv", "dkdv"),
+        )
+        for query_start in range(0, sequence, _QUERY_CHUNK_SIZE)
+    ]
+
+
+def _case_memory_contract(case: str) -> dict[str, int]:
+    if _normalize_case(case) == _ALL_VALID_T1024_CASE:
+        return {
+            "argument": _T1024_EXPECTED_ARGUMENT_BYTES,
+            "output": _T1024_EXPECTED_OUTPUT_BYTES,
+            "alias": _EXPECTED_ALIAS_BYTES,
+            "temporary": _T1024_MAX_TEMP_BYTES,
+        }
+    return {
+        "argument": _EXPECTED_ARGUMENT_BYTES,
+        "output": _EXPECTED_OUTPUT_BYTES,
+        "alias": _EXPECTED_ALIAS_BYTES,
+        "temporary": _MAX_TEMP_BYTES,
+    }
+
+
 def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
     case = _normalize_case(case)
+    sequence = _case_sequence_length(case)
     valid_tokens = _CASE_VALID_TOKENS[case]
-    q_shape = [_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM]
-    kv_shape = [_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM]
+    call_specs = _expected_call_specs(case)
+    memory = _case_memory_contract(case)
+    query_chunks = sequence // _QUERY_CHUNK_SIZE
+    q_shape = [_BATCH_SIZE, sequence, _QUERY_HEADS, _HEAD_DIM]
+    kv_shape = [_BATCH_SIZE, sequence, _KV_HEADS, _HEAD_DIM]
     contract = {
         "model_family": "Qwen/Qwen3.5-4B",
         "operation": (
             "query_bounded_gqa_t512_forward_and_full_vjp"
             if case == _ALL_VALID_CASE
             else "query_bounded_gqa_t512_valid385_loss_masked_forward_and_full_vjp"
+            if case == _VALID385_CASE
+            else "query_bounded_gqa_t1024_two_chunk_forward_and_full_vjp_compile_diagnostic"
         ),
         "gpu_architecture": _EXPECTED_GPU_ARCHITECTURE,
         "gpu_pci_device_id": _EXPECTED_AMD_PCI_DEVICE_ID,
@@ -457,11 +597,11 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
             {"name": "v", "shape": kv_shape, "dtype": "bfloat16"},
             {
                 "name": "key_mask",
-                "shape": [_BATCH_SIZE, _SEQUENCE_LENGTH],
+                "shape": [_BATCH_SIZE, sequence],
                 "dtype": "int32",
                 "value": (
                     "all_ones"
-                    if case == _ALL_VALID_CASE
+                    if case != _VALID385_CASE
                     else "ones_before_385_zeros_at_and_after_385"
                 ),
             },
@@ -471,7 +611,7 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
                 "dtype": "bfloat16",
                 "value": (
                     "independent_host_pcg64_nonzero_signed_grid"
-                    if case == _ALL_VALID_CASE
+                    if case != _VALID385_CASE
                     else (
                         "independent_host_pcg64_nonzero_signed_grid_then_"
                         "bitwise_positive_zero_at_and_after_row_385"
@@ -496,22 +636,32 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
         },
         "compile_gate": {
             "required_dialects": ["stablehlo", "optimized_hlo"],
-            "exact_custom_calls": dict.fromkeys(_EXPECTED_MARKERS, 1),
-            "exact_total_custom_calls": 3,
+            "exact_custom_calls": dict.fromkeys(_EXPECTED_MARKERS, query_chunks),
+            "exact_total_custom_calls": len(call_specs),
+            "exact_marker_query_start_pairs": [
+                {
+                    "kind": item["kind"],
+                    "query_start": item["query_start"],
+                    "query_size": item["query_size"],
+                }
+                for item in call_specs
+            ],
             "sole_target_is_exact_rocm_triton": True,
             "sole_target_sha256": hashlib.sha256(
                 _EXACT_TARGET.encode("utf-8")
             ).hexdigest(),
-            "exact_query_start_metadata_per_call": 0,
+            "exact_query_start_metadata_per_call": (
+                0 if query_chunks == 1 else [0, 512]
+            ),
             "exact_query_size_metadata_per_call": 512,
             "all_calls_directly_owned_by_sole_entry_computation": True,
             "no_container_can_own_or_duplicate_a_custom_call": True,
             "independent_zero_custom_call_entry_fusions_allowed": True,
             "no_outer_while": True,
-            "exact_argument_bytes": _EXPECTED_ARGUMENT_BYTES,
-            "exact_output_bytes": _EXPECTED_OUTPUT_BYTES,
-            "exact_alias_bytes": _EXPECTED_ALIAS_BYTES,
-            "maximum_temporary_bytes": _MAX_TEMP_BYTES,
+            "exact_argument_bytes": memory["argument"],
+            "exact_output_bytes": memory["output"],
+            "exact_alias_bytes": memory["alias"],
+            "maximum_temporary_bytes": memory["temporary"],
         },
         "execution_contract": {
             "lower_calls": 1,
@@ -520,10 +670,10 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
             "checked_executable_invocations": 1,
             "device_get_calls": 1,
             "logical_internal_dispatches": {
-                "forward": 1,
-                "dq": 1,
-                "dkdv": 1,
-                "total": 3,
+                "forward": query_chunks,
+                "dq": query_chunks,
+                "dkdv": query_chunks,
+                "total": len(call_specs),
             },
             "warmup_invocations": 0,
             "replay_invocations": 0,
@@ -579,6 +729,40 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
                 },
             }
         )
+    elif case == _ALL_VALID_T1024_CASE:
+        contract.update(
+            {
+                "case": case,
+                "sequence_length": sequence,
+                "query_chunks": 2,
+                "output_tensor_leaf_bytes": _T1024_OUTPUT_TENSOR_LEAF_BYTES,
+                "compiled_output_root_bytes": 32,
+                "host_input_bytes": _T1024_EXPECTED_HOST_INPUT_BYTES,
+                "host_fp32_reference_bytes": _T1024_EXPECTED_HOST_REFERENCE_BYTES,
+                "host_oracle_scratch_bytes": _EXPECTED_ORACLE_SCRATCH_BYTES,
+                "internal_accumulator_memory": {
+                    "shape": [1, 1024, 4, 256],
+                    "dtype": "float32",
+                    "leaf_bytes": _T1024_EXPECTED_ACCUMULATOR_LEAF_BYTES,
+                    "pair_bytes": _T1024_EXPECTED_ACCUMULATOR_PAIR_BYTES,
+                },
+                "compile_diagnostic_only": True,
+                "runtime_capability_release_authorized_in_this_source_revision": False,
+                "six_calls_are_bounded_attention_custom_calls_not_physical_launch_count": True,
+                "physical_launch_count_claimed": False,
+                "optimized_hlo_fusion_helper_inventory_pin": (
+                    "awaiting_first_final-source_compile_diagnostic"
+                ),
+                "temporary_memory_128_mib_is_diagnostic_safety_cap_not_runtime_pin": True,
+                "required_internal_accumulator_proof": {
+                    "q512_dkdv_operand_7_consumes_q0_dk_result_0": True,
+                    "q512_dkdv_operand_8_consumes_q0_dv_result_1": True,
+                    "both_dkdv_calls_preserve_internal_alias_7_to_0": True,
+                    "both_dkdv_calls_preserve_internal_alias_8_to_1": True,
+                    "call_counts_alone_are_insufficient": True,
+                },
+            }
+        )
     return contract
 
 
@@ -592,11 +776,13 @@ def _abstract_contract() -> dict[str, Any]:
 
 def _compile_diagnostic_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
     exact = _exact_contract(case)
-    return {
+    contract = {
         "operation": (
             "query_bounded_gqa_t512_full_vjp_compile_diagnostic"
             if case == _ALL_VALID_CASE
             else "query_bounded_gqa_t512_valid385_loss_masked_full_vjp_compile_diagnostic"
+            if case == _VALID385_CASE
+            else "query_bounded_gqa_t1024_two_chunk_full_vjp_compile_diagnostic"
         ),
         "model_family": exact["model_family"],
         "gpu_architecture": exact["gpu_architecture"],
@@ -616,6 +802,16 @@ def _compile_diagnostic_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
         "raw_ir_emitted": False,
         "case": case,
     }
+    if case == _ALL_VALID_T1024_CASE:
+        contract.update(
+            {
+                "host_input_bytes": exact["host_input_bytes"],
+                "host_fp32_reference_bytes": exact["host_fp32_reference_bytes"],
+                "host_oracle_scratch_bytes": exact["host_oracle_scratch_bytes"],
+                "internal_accumulator_memory": exact["internal_accumulator_memory"],
+            }
+        )
+    return contract
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -664,6 +860,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--compile-diagnostic is only valid with --platform rocm")
     if args.platform == "rocm" and args.output is None:
         parser.error("--platform rocm requires --output for a private JSONL artifact")
+    if (
+        args.platform == "rocm"
+        and args.case == _ALL_VALID_T1024_CASE
+        and not args.compile_diagnostic
+    ):
+        parser.error(
+            "all_valid_t1024 is compile-diagnostic-only until exact lowered "
+            "accumulator dataflow and internal alias evidence is qualified"
+        )
     if args.output is not None and args.output.exists():
         parser.error("refusing to overwrite existing output")
     return args
@@ -1120,7 +1325,9 @@ def _matching_closing_brace(masked_text: str, opening: int) -> int | None:
     return None
 
 
-def _stablehlo_entry_call_ownership(text: str) -> dict[str, Any]:
+def _stablehlo_entry_call_ownership(
+    text: str, expected_custom_calls: int = 3
+) -> dict[str, Any]:
     """Parse StableHLO with registered MLIR dialects and sanitize the graph."""
     try:
         from jax._src.interpreters import mlir
@@ -1328,7 +1535,8 @@ def _stablehlo_entry_call_ownership(text: str) -> dict[str, Any]:
                 "only_function_operations_are_top_level": (
                     unexpected_top_level_operation_count == 0
                 ),
-                "all_custom_calls_directly_owned_by_entry": len(calls) == 3
+                "all_custom_calls_directly_owned_by_entry": len(calls)
+                == expected_custom_calls
                 and all(call["direct_entry_owned"] for call in calls),
                 "no_callable_or_control_flow_container": not edges and not forbidden,
                 "call_graph_is_acyclic_resolved_and_direct": graph_safe,
@@ -1395,7 +1603,9 @@ def _stablehlo_entry_call_ownership(text: str) -> dict[str, Any]:
         }
 
 
-def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
+def _optimized_hlo_entry_call_ownership(
+    text: str, expected_custom_calls: int = 3
+) -> dict[str, Any]:
     """Build a fail-closed sanitized graph from raw quote-masked HLO text."""
     quote_scan = _raw_ir_quote_scan(text)
     masked = str(quote_scan["masked"])
@@ -1700,7 +1910,7 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         }
         for name, value in sorted(computations.items())
     ]
-    exactly_three_direct_entry_custom_calls = len(calls) == 3 and all(
+    exact_direct_entry_custom_calls = len(calls) == expected_custom_calls and all(
         call["direct_entry_owned"] for call in calls
     )
     nonentry_computations_have_zero_custom_calls = all(
@@ -1747,8 +1957,9 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         and duplicate_computation_count == 0
         and unknown_instruction_count == 0
         and custom_call_block_count_matches_graph
-        and exactly_three_direct_entry_custom_calls
-        and sum(item["custom_call_count"] for item in sanitized_computations) == 3
+        and exact_direct_entry_custom_calls
+        and sum(item["custom_call_count"] for item in sanitized_computations)
+        == expected_custom_calls
         and nonentry_computations_have_zero_custom_calls
         and custom_calls_have_no_called_computations
         and independent_fusion_helpers_safe
@@ -1762,8 +1973,8 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
         "custom_call_blocks_match_instruction_graph": (
             custom_call_block_count_matches_graph
         ),
-        "exactly_three_custom_calls_all_directly_owned_by_entry": (
-            exactly_three_direct_entry_custom_calls
+        "exact_expected_custom_calls_all_directly_owned_by_entry": (
+            exact_direct_entry_custom_calls
         ),
         "all_nonentry_computations_have_zero_custom_calls": (
             nonentry_computations_have_zero_custom_calls
@@ -1815,11 +2026,13 @@ def _optimized_hlo_entry_call_ownership(text: str) -> dict[str, Any]:
     }
 
 
-def _entry_call_ownership(text: str, dialect: str) -> dict[str, Any]:
+def _entry_call_ownership(
+    text: str, dialect: str, expected_custom_calls: int = 3
+) -> dict[str, Any]:
     if dialect == "stablehlo":
-        return _stablehlo_entry_call_ownership(text)
+        return _stablehlo_entry_call_ownership(text, expected_custom_calls)
     if dialect == "optimized_hlo":
-        return _optimized_hlo_entry_call_ownership(text)
+        return _optimized_hlo_entry_call_ownership(text, expected_custom_calls)
     raise ValueError("unsupported VJP IR dialect")
 
 
@@ -1835,7 +2048,401 @@ def _is_bounded_marker_like(token: str) -> bool:
     )
 
 
-def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
+def _internal_alias_pairs(block: str, dialect: str) -> dict[str, Any]:
+    masked = _mask_ir_quoted_content(block)
+    if dialect == "stablehlo":
+        declarations = re.findall(
+            r"#stablehlo\.output_operand_alias<(?P<body>[^>]*)>", masked
+        )
+        pairs: list[tuple[int, int]] = []
+        malformed = 0
+        for body in declarations:
+            output = re.search(r"output_tuple_indices\s*=\s*\[\s*(\d+)\s*\]", body)
+            operand = re.search(r"operand_index\s*=\s*(\d+)", body)
+            operand_tuple = re.search(r"operand_tuple_indices\s*=\s*\[\s*\]", body)
+            if output is None or operand is None or operand_tuple is None:
+                malformed += 1
+            else:
+                pairs.append((int(output.group(1)), int(operand.group(1))))
+    elif dialect == "optimized_hlo":
+        opcode = re.search(r"\bcustom-call\s*\(", masked)
+        closing = None
+        if opcode is not None:
+            opening = masked.find("(", opcode.start())
+            depth = 0
+            for index in range(opening, len(masked)):
+                if masked[index] == "(":
+                    depth += 1
+                elif masked[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        closing = index
+                        break
+        tail = masked[closing + 1 :] if closing is not None else ""
+        attribute_count = len(re.findall(r"output_to_operand_aliasing\s*=", tail))
+        pairs = [
+            (int(output), int(operand))
+            for output, operand in re.findall(
+                r"\{\s*(\d+)\s*\}\s*:\s*\(\s*(\d+)\s*,\s*\{\s*\}\s*\)",
+                tail,
+            )
+        ]
+        malformed = int(attribute_count != 1 or len(pairs) != 2)
+    else:
+        raise ValueError("unsupported VJP IR dialect")
+    return {
+        "declared_pairs": [
+            {"output_index": output, "operand_index": operand}
+            for output, operand in sorted(pairs)
+        ],
+        "malformed_declaration_count": malformed,
+        "exact_internal_aliases_7_to_0_and_8_to_1": (
+            malformed == 0 and sorted(pairs) == [(0, 7), (1, 8)]
+        ),
+    }
+
+
+def _stablehlo_custom_call_signature(block: str) -> dict[str, Any]:
+    masked = _mask_ir_quoted_content(block)
+    operation = re.search(r"stablehlo\.custom_call\s+@\s*\(", masked)
+    assignment = masked.find("=")
+    if operation is None or assignment < 0 or assignment > operation.start():
+        return {"passed": False, "results": [], "operands": []}
+    lhs = masked[:assignment]
+    lhs_tokens = re.findall(r"%[A-Za-z_0-9][A-Za-z0-9_.$-]*", lhs)
+    result_arity = re.search(r":\s*(\d+)\s*$", lhs)
+    if len(lhs_tokens) == 1 and result_arity is not None:
+        results = [
+            f"{lhs_tokens[0]}#{index}" for index in range(int(result_arity.group(1)))
+        ]
+    else:
+        results = lhs_tokens
+    opening = masked.find("(", operation.start())
+    closing = masked.find(")", opening + 1)
+    operands = (
+        re.findall(
+            r"%[A-Za-z_0-9][A-Za-z0-9_.$-]*(?:#\d+)?",
+            masked[opening + 1 : closing],
+        )
+        if opening >= 0 and closing >= 0
+        else []
+    )
+    type_tail = masked[closing + 1 :] if closing >= 0 else ""
+    arrow = type_tail.find("->")
+    input_types = re.findall(r"tensor<[^>]+>", type_tail[:arrow]) if arrow >= 0 else []
+    result_types = (
+        re.findall(r"tensor<[^>]+>", type_tail[arrow + 2 :]) if arrow >= 0 else []
+    )
+    accumulator_type = "tensor<1x1024x4x256xf32>"
+    types_exact = (
+        len(input_types) == 9
+        and len(result_types) == 2
+        and input_types[7:] == [accumulator_type, accumulator_type]
+        and result_types == [accumulator_type, accumulator_type]
+    )
+    return {
+        "passed": len(results) == 2 and len(operands) == 9 and types_exact,
+        "results": results,
+        "operands": operands,
+        "input_type_count": len(input_types),
+        "result_type_count": len(result_types),
+        "accumulator_types_exact": types_exact,
+    }
+
+
+def _optimized_hlo_instruction_graph(text: str) -> dict[str, Any]:
+    instructions: dict[str, dict[str, Any]] = {}
+    assignment = re.compile(
+        r"^\s*(?:ROOT\s+)?(?P<name>%?[A-Za-z_0-9][A-Za-z0-9_.$-]*)\s*=\s*(?P<definition>.*)$"
+    )
+    opcode_pattern = re.compile(r"(?P<opcode>[A-Za-z_][A-Za-z0-9_.-]*)\s*\(")
+    entry_header = re.compile(r"^\s*ENTRY\s+(?P<name>%?[A-Za-z_][A-Za-z0-9_.-]*)\b")
+    helper_header = re.compile(r"^\s*(?P<name>%?[A-Za-z_][A-Za-z0-9_.-]*)\b")
+    depth = 0
+    owner: str | None = None
+    owner_is_entry = False
+    duplicate_entry_instruction_count = 0
+    copy_instruction_count = 0
+    opcode_inventory: dict[str, int] = {}
+    for line in _mask_ir_quoted_content(text).splitlines():
+        line_depth = depth
+        if line_depth == 0 and line.rstrip().endswith("{"):
+            header = entry_header.match(line)
+            owner_is_entry = header is not None
+            if header is None:
+                header = helper_header.match(line)
+            owner = (
+                header.group("name").removeprefix("%")
+                if header is not None and "=" not in line
+                else None
+            )
+        if owner is not None and line_depth >= 1:
+            match = assignment.match(line)
+            if match is not None:
+                definition = match.group("definition")
+                opcode_match = opcode_pattern.search(definition)
+                if opcode_match is not None:
+                    opcode = opcode_match.group("opcode")
+                    opcode_inventory[opcode] = opcode_inventory.get(opcode, 0) + 1
+                    copy_instruction_count += int(opcode == "copy")
+                    opening = definition.find("(", opcode_match.start())
+                    closing = definition.find(")", opening + 1)
+                    operands = (
+                        re.findall(
+                            r"%?[A-Za-z_0-9][A-Za-z0-9_.$-]*",
+                            definition[opening + 1 : closing],
+                        )
+                        if opening >= 0 and closing >= 0
+                        else []
+                    )
+                    tuple_index = re.search(r"\bindex\s*=\s*(\d+)", definition)
+                    name = match.group("name").removeprefix("%")
+                    if owner_is_entry:
+                        if name in instructions:
+                            duplicate_entry_instruction_count += 1
+                        else:
+                            instructions[name] = {
+                                "opcode": opcode,
+                                "shape": definition[: opcode_match.start()].strip(),
+                                "operands": [
+                                    item.removeprefix("%") for item in operands
+                                ],
+                                "tuple_index": (
+                                    int(tuple_index.group(1)) if tuple_index else None
+                                ),
+                            }
+        for character in line:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+        if owner is not None and depth == 0:
+            owner = None
+            owner_is_entry = False
+    consumer_counts = dict.fromkeys(instructions, 0)
+    for instruction in instructions.values():
+        for operand in instruction["operands"]:
+            if operand in consumer_counts:
+                consumer_counts[operand] += 1
+    return {
+        "instructions": instructions,
+        "entry_instruction_count": len(instructions),
+        "duplicate_entry_instruction_count": duplicate_entry_instruction_count,
+        "copy_instruction_count": copy_instruction_count,
+        "opcode_inventory": dict(sorted(opcode_inventory.items())),
+        "consumer_counts": consumer_counts,
+    }
+
+
+def _optimized_hlo_call_name_and_operands(block: str) -> tuple[str | None, list[str]]:
+    masked = _mask_ir_quoted_content(block)
+    match = re.search(
+        r"^\s*(?:ROOT\s+)?(?P<name>%?[A-Za-z_0-9][A-Za-z0-9_.$-]*)\s*=.*?custom-call\s*\(",
+        masked,
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        return None, []
+    opening = match.end() - 1
+    closing = masked.find(")", opening + 1)
+    operands = re.findall(
+        r"%?[A-Za-z_0-9][A-Za-z0-9_.$-]*", masked[opening + 1 : closing]
+    )
+    return match.group("name").removeprefix("%"), [
+        item.removeprefix("%") for item in operands
+    ]
+
+
+def _t1024_accumulator_dataflow_summary(
+    text: str,
+    dialect: str,
+    calls: list[dict[str, Any]],
+    raw_blocks: list[str],
+) -> dict[str, Any]:
+    indexed = {
+        (call.get("kind"), call.get("query_start", {}).get("expected")): index
+        for index, call in enumerate(calls)
+    }
+    q0_index = indexed.get(("dkdv", 0))
+    q512_index = indexed.get(("dkdv", 512))
+    located = (
+        isinstance(q0_index, int)
+        and isinstance(q512_index, int)
+        and q0_index < len(raw_blocks)
+        and q512_index < len(raw_blocks)
+    )
+    q0_block = raw_blocks[q0_index] if located else ""
+    q512_block = raw_blocks[q512_index] if located else ""
+    q0_aliases = _internal_alias_pairs(q0_block, dialect) if located else {}
+    q512_aliases = _internal_alias_pairs(q512_block, dialect) if located else {}
+    chain_dk = False
+    chain_dv = False
+    accumulator_projection_single_use = False
+    direct_accumulator_path_has_no_data_movement = False
+    accumulator_shapes_exact = False
+    whole_program_data_movement_opcode_counts = dict.fromkeys(
+        ("concatenate", "convert", "copy"), 0
+    )
+    sanitized: dict[str, Any] = {}
+    if located and dialect == "stablehlo":
+        q0_signature = _stablehlo_custom_call_signature(q0_block)
+        q512_signature = _stablehlo_custom_call_signature(q512_block)
+        if q0_signature["passed"] and q512_signature["passed"]:
+            chain_dk = q512_signature["operands"][7] == q0_signature["results"][0]
+            chain_dv = q512_signature["operands"][8] == q0_signature["results"][1]
+            masked_text = _mask_ir_quoted_content(text)
+            accumulator_projection_single_use = all(
+                len(re.findall(re.escape(result), masked_text)) == 1
+                for result in q0_signature["results"][:2]
+            )
+        masked_text = _mask_ir_quoted_content(text)
+        whole_program_data_movement_opcode_counts = {
+            opcode: len(re.findall(rf"\bstablehlo\.{opcode}\b", masked_text))
+            for opcode in whole_program_data_movement_opcode_counts
+        }
+        direct_accumulator_path_has_no_data_movement = chain_dk and chain_dv
+        accumulator_shapes_exact = (
+            q0_signature.get("accumulator_types_exact") is True
+            and q512_signature.get("accumulator_types_exact") is True
+        )
+        sanitized = {
+            "q0_result_count": len(q0_signature["results"]),
+            "q512_operand_count": len(q512_signature["operands"]),
+            "q0_result_symbol_sha256": [
+                _symbol_sha256(item) for item in q0_signature["results"][:2]
+            ],
+            "q512_accumulator_operand_symbol_sha256": [
+                _symbol_sha256(item) for item in q512_signature["operands"][7:9]
+            ],
+        }
+    elif located and dialect == "optimized_hlo":
+        graph_summary = _optimized_hlo_instruction_graph(text)
+        graph = graph_summary["instructions"]
+        q0_name, _q0_operands = _optimized_hlo_call_name_and_operands(q0_block)
+        _q512_name, q512_operands = _optimized_hlo_call_name_and_operands(q512_block)
+
+        def is_exact_gte_chain(operand_index: int, tuple_index: int) -> bool:
+            if q0_name is None or len(q512_operands) <= operand_index:
+                return False
+            node = graph.get(q512_operands[operand_index])
+            return bool(
+                node
+                and node["opcode"] == "get-tuple-element"
+                and node["operands"] == [q0_name]
+                and node["tuple_index"] == tuple_index
+                and str(node["shape"]).startswith("f32[1,1024,4,256]")
+            )
+
+        chain_dk = is_exact_gte_chain(7, 0)
+        chain_dv = is_exact_gte_chain(8, 1)
+        accumulator_operands = q512_operands[7:9]
+        accumulator_projection_single_use = bool(
+            q0_name
+            and graph_summary["consumer_counts"].get(q0_name) == 2
+            and len(accumulator_operands) == 2
+            and all(
+                graph_summary["consumer_counts"].get(operand) == 1
+                for operand in accumulator_operands
+            )
+        )
+        direct_accumulator_path_has_no_data_movement = (
+            graph_summary["duplicate_entry_instruction_count"] == 0
+            and chain_dk
+            and chain_dv
+        )
+        whole_program_data_movement_opcode_counts = {
+            opcode: graph_summary["opcode_inventory"].get(opcode, 0)
+            for opcode in whole_program_data_movement_opcode_counts
+        }
+        q0_result_prefix = _mask_ir_quoted_content(q0_block).split("custom-call", 1)[0]
+        q512_result_prefix = _mask_ir_quoted_content(q512_block).split(
+            "custom-call", 1
+        )[0]
+        accumulator_shapes_exact = (
+            len(re.findall(r"f32\[1,1024,4,256\]", q0_result_prefix)) == 2
+            and len(re.findall(r"f32\[1,1024,4,256\]", q512_result_prefix)) == 2
+        )
+        sanitized = {
+            "instruction_count": graph_summary["entry_instruction_count"],
+            "duplicate_entry_instruction_count": graph_summary[
+                "duplicate_entry_instruction_count"
+            ],
+            "opcode_inventory": graph_summary["opcode_inventory"],
+            "q0_call_symbol_sha256": _symbol_sha256(q0_name) if q0_name else None,
+            "q512_operand_count": len(q512_operands),
+            "q512_accumulator_operand_symbol_sha256": [
+                _symbol_sha256(item) for item in q512_operands[7:9]
+            ],
+        }
+    accumulator_leaf_bytes = (
+        _BATCH_SIZE
+        * _CASE_SEQUENCE_LENGTH[_ALL_VALID_T1024_CASE]
+        * _KV_HEADS
+        * _HEAD_DIM
+        * 4
+        if accumulator_shapes_exact
+        else None
+    )
+    accumulator_pair_bytes = (
+        2 * accumulator_leaf_bytes if accumulator_leaf_bytes is not None else None
+    )
+    checks = {
+        "exact_q0_and_q512_dkdv_calls_located": located,
+        "q0_internal_aliases_exact": q0_aliases.get(
+            "exact_internal_aliases_7_to_0_and_8_to_1"
+        )
+        is True,
+        "q512_internal_aliases_exact": q512_aliases.get(
+            "exact_internal_aliases_7_to_0_and_8_to_1"
+        )
+        is True,
+        "q512_dk_operand_consumes_q0_dk_accumulator": chain_dk,
+        "q512_dv_operand_consumes_q0_dv_accumulator": chain_dv,
+        "accumulator_values_are_exact_f32_b1_t1024_hkv4_d256": (
+            accumulator_shapes_exact
+        ),
+        "accumulator_leaf_bytes_are_exact_4194304": (
+            accumulator_leaf_bytes == _T1024_EXPECTED_ACCUMULATOR_LEAF_BYTES
+        ),
+        "accumulator_pair_bytes_are_exact_8388608": (
+            accumulator_pair_bytes == _T1024_EXPECTED_ACCUMULATOR_PAIR_BYTES
+        ),
+        "q0_accumulator_projections_are_single_use_by_q512": (
+            accumulator_projection_single_use
+        ),
+        "no_copy_convert_or_concatenate_on_direct_accumulator_path": (
+            direct_accumulator_path_has_no_data_movement
+        ),
+    }
+    return {
+        "dialect": dialect,
+        "parser": "strict_two_chunk_dkdv_alias_and_ssa_chain",
+        "q0_aliases": q0_aliases,
+        "q512_aliases": q512_aliases,
+        "sanitized_dataflow": sanitized,
+        "accumulator_memory": {
+            "shape": [1, 1024, 4, 256],
+            "dtype": "float32",
+            "leaf_bytes": accumulator_leaf_bytes,
+            "pair_bytes": accumulator_pair_bytes,
+        },
+        "whole_program_data_movement_opcode_counts_diagnostic_only": (
+            whole_program_data_movement_opcode_counts
+        ),
+        "checks": checks,
+        "passed": all(checks.values()),
+        "raw_ir_emitted": False,
+        "raw_symbols_emitted": False,
+    }
+
+
+def _strict_vjp_ir_summary(
+    text: str, dialect: str, case: str = _ALL_VALID_CASE
+) -> dict[str, Any]:
+    case = _normalize_case(case)
+    expected_specs = _expected_call_specs(case)
+    expected_count = len(expected_specs)
+    marker_to_spec = {item["marker"]: item for item in expected_specs}
     compile_probe = _compile_probe()
     definitions = compile_probe._metadata_definitions(text)
     raw_blocks = _raw_custom_call_blocks(text, dialect)
@@ -1844,12 +2451,10 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
         for block in raw_blocks
     ]
     decoded_text = _decode_ir(text)
-    ownership = _entry_call_ownership(text, dialect)
+    ownership = _entry_call_ownership(text, dialect, expected_count)
     all_tokens = _IR_NAME_TOKEN_PATTERN.findall(decoded_text)
     bounded_tokens = [token for token in all_tokens if _is_bounded_marker_like(token)]
-    unexpected = [
-        token for token in bounded_tokens if token not in _EXPECTED_MARKERS.values()
-    ]
+    unexpected = [token for token in bounded_tokens if token not in marker_to_spec]
     masked_text = _mask_ir_quoted_content(text)
     if dialect == "stablehlo":
         textual_count = len(re.findall(r"\bstablehlo\.custom_call\b", masked_text))
@@ -1869,23 +2474,37 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
 
     calls: list[dict[str, Any]] = []
     marker_counts = dict.fromkeys(_EXPECTED_MARKERS, 0)
+    marker_query_start_counts = {
+        (item["kind"], item["query_start"]): 0 for item in expected_specs
+    }
     all_call_checks: list[bool] = []
     for index, block in enumerate(blocks):
         target_occurrences = _isolated_custom_call_target_occurrences(block, dialect)
         tokens = _IR_NAME_TOKEN_PATTERN.findall(_decode_ir(block))
-        kinds = [kind for kind, marker in _EXPECTED_MARKERS.items() if marker in tokens]
-        for kind in kinds:
-            marker_counts[kind] += 1
+        matched_specs = [
+            marker_to_spec[token] for token in tokens if token in marker_to_spec
+        ]
+        kinds = [item["kind"] for item in matched_specs]
+        if len(matched_specs) == 1:
+            matched = matched_specs[0]
+            marker_counts[matched["kind"]] += 1
+            marker_query_start_counts[(matched["kind"], matched["query_start"])] += 1
+            expected_query_start = int(matched["query_start"])
+        else:
+            matched = None
+            expected_query_start = -1
         query_start = _nonzero_probe()._canonical_raw_metadata_field(
-            _decode_ir(block), "query_start", 0
+            _decode_ir(block), "query_start", expected_query_start
         )
         query_size = _nonzero_probe()._canonical_raw_metadata_field(
-            _decode_ir(block), "query_size", _SEQUENCE_LENGTH
+            _decode_ir(block), "query_size", _QUERY_CHUNK_SIZE
         )
         checks = {
             "sole_exact_target": target_occurrences == [_EXACT_TARGET],
-            "exactly_one_expected_marker": len(kinds) == 1,
-            "query_start_is_exact_canonical_zero": query_start["passed"],
+            "exactly_one_expected_marker": len(matched_specs) == 1,
+            "query_start_is_exact_canonical_expected_chunk_start": query_start[
+                "passed"
+            ],
             "query_size_is_exact_canonical_512": query_size["passed"],
         }
         all_call_checks.append(all(checks.values()))
@@ -1893,6 +2512,11 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
             {
                 "index": index,
                 "kind": kinds[0] if len(kinds) == 1 else None,
+                "marker_sha256": (
+                    hashlib.sha256(matched["marker"].encode("utf-8")).hexdigest()
+                    if matched is not None
+                    else None
+                ),
                 "target_count": len(target_occurrences),
                 "sole_target_matches_expected": target_occurrences == [_EXACT_TARGET],
                 "sole_target_sha256": (
@@ -1908,16 +2532,31 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
         )
     checks = {
         "parser_matches_textual_custom_call_count": len(raw_blocks) == textual_count,
-        "exactly_three_custom_calls_total": len(raw_blocks) == textual_count == 3,
-        "all_three_calls_pass_target_marker_and_metadata": len(all_call_checks) == 3
+        "exact_expected_custom_calls_total": (
+            len(raw_blocks) == textual_count == expected_count
+        ),
+        "all_expected_calls_pass_target_marker_and_metadata": len(all_call_checks)
+        == expected_count
         and all(all_call_checks),
-        "each_expected_marker_occurs_in_exactly_one_call": all(
-            marker_counts[kind] == 1 for kind in _EXPECTED_MARKERS
+        "each_expected_kind_occurs_once_per_query_chunk": all(
+            marker_counts[kind] == _case_sequence_length(case) // _QUERY_CHUNK_SIZE
+            for kind in _EXPECTED_MARKERS
+        ),
+        "each_expected_marker_query_start_pair_occurs_once": all(
+            count == 1 for count in marker_query_start_counts.values()
         ),
         "no_unexpected_or_lookalike_bounded_markers": not unexpected,
         "all_calls_direct_entry_and_container_independent": (ownership["passed"]),
         "no_outer_while": while_count == 0,
     }
+    accumulator_dataflow = None
+    if case == _ALL_VALID_T1024_CASE:
+        accumulator_dataflow = _t1024_accumulator_dataflow_summary(
+            text, dialect, calls, raw_blocks
+        )
+        checks["two_chunk_accumulator_dataflow_and_aliases_proven"] = (
+            accumulator_dataflow["passed"]
+        )
     return {
         "dialect": dialect,
         "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -1926,10 +2565,15 @@ def _strict_vjp_ir_summary(text: str, dialect: str) -> dict[str, Any]:
         "custom_call_count": len(raw_blocks),
         "custom_call_token_count": textual_count,
         "marker_call_counts": marker_counts,
+        "marker_query_start_counts": [
+            {"kind": kind, "query_start": query_start, "count": count}
+            for (kind, query_start), count in sorted(marker_query_start_counts.items())
+        ],
         "unexpected_bounded_marker_occurrences": len(unexpected),
         "while_count": while_count,
         "calls": calls,
         "entry_call_ownership": ownership,
+        "two_chunk_accumulator_dataflow": accumulator_dataflow,
         "quote_lexing_diagnostic": {
             "syntax_was_lexed_before_local_escape_decoding": True,
             "raw_unquoted_custom_call_count": textual_count,
@@ -1969,7 +2613,10 @@ def _structural_gate(*summaries: dict[str, Any]) -> dict[str, Any]:
     return {"checks": checks, "passed": all(checks.values())}
 
 
-def _compiled_memory_gate(memory: dict[str, Any]) -> dict[str, Any]:
+def _compiled_memory_gate(
+    memory: dict[str, Any], case: str = _ALL_VALID_CASE
+) -> dict[str, Any]:
+    contract = _case_memory_contract(case)
     values = {
         name: memory.get(name)
         for name in (
@@ -1986,17 +2633,17 @@ def _compiled_memory_gate(memory: dict[str, Any]) -> dict[str, Any]:
     checks = {
         "memory_analysis_available": available,
         "argument_bytes_exact": values["argument_size_in_bytes"]
-        == _EXPECTED_ARGUMENT_BYTES,
-        "output_bytes_exact": values["output_size_in_bytes"] == _EXPECTED_OUTPUT_BYTES,
-        "alias_bytes_exact": values["alias_size_in_bytes"] == _EXPECTED_ALIAS_BYTES,
-        "temporary_bytes_at_most_64_mib": available
-        and values["temp_size_in_bytes"] <= _MAX_TEMP_BYTES,
+        == contract["argument"],
+        "output_bytes_exact": values["output_size_in_bytes"] == contract["output"],
+        "alias_bytes_exact": values["alias_size_in_bytes"] == contract["alias"],
+        "temporary_bytes_within_case_ceiling": available
+        and values["temp_size_in_bytes"] <= contract["temporary"],
     }
     return {
-        "expected_argument_bytes": _EXPECTED_ARGUMENT_BYTES,
-        "expected_output_bytes": _EXPECTED_OUTPUT_BYTES,
-        "expected_alias_bytes": _EXPECTED_ALIAS_BYTES,
-        "maximum_temporary_bytes": _MAX_TEMP_BYTES,
+        "expected_argument_bytes": contract["argument"],
+        "expected_output_bytes": contract["output"],
+        "expected_alias_bytes": contract["alias"],
+        "maximum_temporary_bytes": contract["temporary"],
         "checks": checks,
         "passed": all(checks.values()),
     }
@@ -2046,14 +2693,17 @@ def _wrap_checked(
     )
 
 
-def _shape_signature(jax: Any, jnp: Any) -> tuple[Any, ...]:
-    q_shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM)
-    kv_shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM)
+def _shape_signature(
+    jax: Any, jnp: Any, case: str = _ALL_VALID_CASE
+) -> tuple[Any, ...]:
+    sequence = _case_sequence_length(case)
+    q_shape = (_BATCH_SIZE, sequence, _QUERY_HEADS, _HEAD_DIM)
+    kv_shape = (_BATCH_SIZE, sequence, _KV_HEADS, _HEAD_DIM)
     return (
         jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
         jax.ShapeDtypeStruct(kv_shape, jnp.bfloat16),
         jax.ShapeDtypeStruct(kv_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct((_BATCH_SIZE, _SEQUENCE_LENGTH), jnp.int32),
+        jax.ShapeDtypeStruct((_BATCH_SIZE, sequence), jnp.int32),
         jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
     )
 
@@ -2065,7 +2715,10 @@ def _compile_vjp_artifact(
     require_clean_boot: Callable[[], dict[str, Any]],
     counters: dict[str, int],
     output: TextIO,
+    case: str = _ALL_VALID_CASE,
 ) -> tuple[Any, dict[str, Any]]:
+    case = _normalize_case(case)
+
     def forward_and_vjp(
         q_arg: Any, k_arg: Any, v_arg: Any, mask_arg: Any, dout_arg: Any
     ) -> tuple[Any, Any, Any, Any]:
@@ -2102,11 +2755,11 @@ def _compile_vjp_artifact(
     counters["lower_attempts"] += 1
     lower_start = time.perf_counter()
     try:
-        lowered = jax.jit(forward_and_vjp).lower(*_shape_signature(jax, jnp))
+        lowered = jax.jit(forward_and_vjp).lower(*_shape_signature(jax, jnp, case))
         lower_seconds = time.perf_counter() - lower_start
         counters["lower_completions"] += 1
         stablehlo_text = str(lowered.compiler_ir(dialect="stablehlo"))
-        stablehlo = _strict_vjp_ir_summary(stablehlo_text, "stablehlo")
+        stablehlo = _strict_vjp_ir_summary(stablehlo_text, "stablehlo", case)
         del stablehlo_text
         _emit(
             {
@@ -2143,17 +2796,26 @@ def _compile_vjp_artifact(
         compile_seconds = time.perf_counter() - compile_start
         counters["compile_completions"] += 1
         optimized_hlo_text = compiled.as_text()
-        optimized_hlo = _strict_vjp_ir_summary(optimized_hlo_text, "optimized_hlo")
+        optimized_hlo = _strict_vjp_ir_summary(
+            optimized_hlo_text, "optimized_hlo", case
+        )
         del optimized_hlo_text
         memory = _compile_probe()._compiled_memory(compiled)
         structural = _structural_gate(stablehlo, optimized_hlo)
-        memory_gate = _compiled_memory_gate(memory)
+        memory_gate = _compiled_memory_gate(memory, case)
+        diagnostic_evidence_passed = structural["passed"] and memory_gate["passed"]
+        runtime_release_authorized_by_case = case != _ALL_VALID_T1024_CASE
         proof = {
             "structural_gate_passed": structural["passed"],
             "compiled_memory_gate_passed": memory_gate["passed"],
-            "exact_logical_dispatches": dict.fromkeys(_EXPECTED_MARKERS, 1),
+            "diagnostic_evidence_passed": diagnostic_evidence_passed,
+            "runtime_release_authorized_by_case": runtime_release_authorized_by_case,
+            "exact_logical_dispatches": dict.fromkeys(
+                _EXPECTED_MARKERS,
+                _case_sequence_length(case) // _QUERY_CHUNK_SIZE,
+            ),
             "explicit_scale_exact_fraction": "3/32",
-            "passed": structural["passed"] and memory_gate["passed"],
+            "passed": diagnostic_evidence_passed and runtime_release_authorized_by_case,
         }
         report = {
             "record_type": "vjp_compiled",
@@ -2201,11 +2863,22 @@ def _run_compile_diagnostic(
     require_clean_boot: Callable[[], dict[str, Any]],
     counters: dict[str, int],
     output: TextIO,
+    case: str = _ALL_VALID_CASE,
 ) -> int:
     compiled = None
     try:
-        compiled, report = _compile_vjp_artifact(
-            jax, jnp, query_bounded_gqa, require_clean_boot, counters, output
+        compile_arguments = (
+            jax,
+            jnp,
+            query_bounded_gqa,
+            require_clean_boot,
+            counters,
+            output,
+        )
+        compiled, report = (
+            _compile_vjp_artifact(*compile_arguments)
+            if case == _ALL_VALID_CASE
+            else _compile_vjp_artifact(*compile_arguments, case)
         )
     finally:
         if compiled is not None:
@@ -2218,10 +2891,16 @@ def _run_compile_diagnostic(
             "record_type": "compile_diagnostic_completed",
             "timestamp": _utc_now(),
             "status": (
-                "structure_and_memory_passed_no_release"
+                "t1024_diagnostic_evidence_passed_runtime_still_withheld"
+                if case == _ALL_VALID_T1024_CASE
+                and report["release_gate"]["diagnostic_evidence_passed"]
+                else "t1024_diagnostic_capture_failed_runtime_withheld"
+                if case == _ALL_VALID_T1024_CASE
+                else "structure_and_memory_passed_no_release"
                 if report["release_gate"]["passed"]
                 else "structure_or_memory_failed_no_release"
             ),
+            "case": case,
             "structural_gate": report["structural_gate"],
             "compiled_memory_gate": report["compiled_memory_gate"],
             "release_gate_observed_but_not_authorized": report["release_gate"],
@@ -2701,6 +3380,123 @@ def _valid385_sensitivity_controls(
     }
 
 
+def _t1024_reset_sensitivity_control(
+    np: Any,
+    q: Any,
+    k: Any,
+    v: Any,
+    key_mask: Any,
+    dout: Any,
+    expected: tuple[Any, ...],
+) -> dict[str, Any]:
+    q512_only_dout = np.zeros_like(dout)
+    q512_only_dout[:, _QUERY_CHUNK_SIZE:] = dout[:, _QUERY_CHUNK_SIZE:]
+    q512_only, _ = _tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        key_mask,
+        q512_only_dout,
+        scale=_ATTENTION_SCALE,
+    )
+    wrong_dk, wrong_dv = q512_only[2], q512_only[3]
+    correct_dk, correct_dv = expected[2], expected[3]
+    metrics = {
+        f"{name}_keys_{start}_{stop}": _float_difference_metrics(
+            np, wrong[:, start:stop], correct[:, start:stop]
+        )
+        for name, wrong, correct in (
+            ("dk", wrong_dk, correct_dk),
+            ("dv", wrong_dv, correct_dv),
+        )
+        for start, stop in ((0, 512), (512, 1024))
+    }
+    first_half_failures = {
+        name: (
+            item["relative_l2"] >= _MAX_RELATIVE_L2
+            or item["cosine"] < _MIN_COSINE
+            or item["max_abs"] > _MAX_ABSOLUTE_ERROR
+        )
+        for name, item in metrics.items()
+        if name.endswith("_0_512")
+    }
+    second_half_exact_equal = {
+        "dk": bool(np.array_equal(wrong_dk[:, 512:], correct_dk[:, 512:])),
+        "dv": bool(np.array_equal(wrong_dv[:, 512:], correct_dv[:, 512:])),
+    }
+    return {
+        "failure_model": "q0_fp32_dk_dv_accumulators_reset_before_q512_dkdv",
+        "alternative_reference_sha256": {
+            "reset_before_q512_dk": _array_manifest("reset_before_q512_dk", wrong_dk)[
+                "sha256"
+            ],
+            "reset_before_q512_dv": _array_manifest("reset_before_q512_dv", wrong_dv)[
+                "sha256"
+            ],
+        },
+        "per_key_half_metrics": metrics,
+        "first_key_half_fails_numerical_gate": first_half_failures,
+        "second_key_half_exactly_equal_by_causality": second_half_exact_equal,
+        "control_decisive": all(first_half_failures.values())
+        and all(second_half_exact_equal.values()),
+        "accelerator_used": False,
+    }
+
+
+def _t1024_omit_q512_sensitivity_control(
+    np: Any,
+    q: Any,
+    k: Any,
+    v: Any,
+    key_mask: Any,
+    dout: Any,
+    expected: tuple[Any, ...],
+) -> dict[str, Any]:
+    q0_only_dout = np.zeros_like(dout)
+    q0_only_dout[:, :_QUERY_CHUNK_SIZE] = dout[:, :_QUERY_CHUNK_SIZE]
+    q0_only, _ = _tiled_causal_gqa_forward_vjp_oracle(
+        np,
+        q,
+        k,
+        v,
+        key_mask,
+        q0_only_dout,
+        scale=_ATTENTION_SCALE,
+    )
+    wrong_dk, wrong_dv = q0_only[2], q0_only[3]
+    correct_dk, correct_dv = expected[2], expected[3]
+    metrics = {
+        f"{name}_keys_{start}_{stop}": _float_difference_metrics(
+            np, wrong[:, start:stop], correct[:, start:stop]
+        )
+        for name, wrong, correct in (
+            ("dk", wrong_dk, correct_dk),
+            ("dv", wrong_dv, correct_dv),
+        )
+        for start, stop in ((0, 512), (512, 1024))
+    }
+    half_failures = {
+        name: (
+            item["relative_l2"] >= _MAX_RELATIVE_L2
+            or item["cosine"] < _MIN_COSINE
+            or item["max_abs"] > _MAX_ABSOLUTE_ERROR
+        )
+        for name, item in metrics.items()
+    }
+    return {
+        "failure_model": "q512_dk_dv_accumulator_contribution_omitted",
+        "alternative_reference_sha256": {
+            "omit_q512_dk": _array_manifest("omit_q512_dk", wrong_dk)["sha256"],
+            "omit_q512_dv": _array_manifest("omit_q512_dv", wrong_dv)["sha256"],
+        },
+        "per_key_half_metrics": metrics,
+        "all_key_halves_fail_numerical_gate": half_failures,
+        "control_decisive": all(half_failures.values()),
+        "accelerator_used": False,
+    }
+
+
 def _case_calibration(
     case: str,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, float], float]:
@@ -2718,6 +3514,13 @@ def _case_calibration(
             _EXPECTED_VALID385_REFERENCE_NORMS,
             _EXPECTED_VALID385_MAXIMUM_ABSOLUTE_VALID_LOGIT,
         )
+    if case == _ALL_VALID_T1024_CASE:
+        return (
+            _EXPECTED_T1024_INPUT_SHA256,
+            _EXPECTED_T1024_REFERENCE_SHA256,
+            _EXPECTED_T1024_REFERENCE_NORMS,
+            _EXPECTED_T1024_MAXIMUM_ABSOLUTE_VALID_LOGIT,
+        )
     raise RuntimeError("VJP host construction case is outside the closed set")
 
 
@@ -2725,10 +3528,15 @@ def _construct_host_case(
     np: Any, ml_dtypes: Any, case: str = _ALL_VALID_CASE, *, _skip_pins: bool = False
 ) -> tuple[tuple[Any, ...], list[dict[str, Any]], tuple[Any, ...], dict[str, Any]]:
     case = _normalize_case(case)
+    sequence = _case_sequence_length(case)
     valid_tokens = _CASE_VALID_TOKENS[case]
-    q_shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM)
-    kv_shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM)
-    input_rng = np.random.Generator(np.random.PCG64(_INPUT_SEED))
+    q_shape = (_BATCH_SIZE, sequence, _QUERY_HEADS, _HEAD_DIM)
+    kv_shape = (_BATCH_SIZE, sequence, _KV_HEADS, _HEAD_DIM)
+    input_seed = _T1024_INPUT_SEED if case == _ALL_VALID_T1024_CASE else _INPUT_SEED
+    cotangent_seed = (
+        _T1024_COTANGENT_SEED if case == _ALL_VALID_T1024_CASE else _COTANGENT_SEED
+    )
+    input_rng = np.random.Generator(np.random.PCG64(input_seed))
     q = _iid_nonzero_grid(
         np, ml_dtypes, input_rng, q_shape, _QKV_MAXIMUM_INTEGER_MAGNITUDE
     )
@@ -2738,9 +3546,9 @@ def _construct_host_case(
     v = _iid_nonzero_grid(
         np, ml_dtypes, input_rng, kv_shape, _QKV_MAXIMUM_INTEGER_MAGNITUDE
     )
-    key_mask = np.zeros((_BATCH_SIZE, _SEQUENCE_LENGTH), dtype=np.int32)
+    key_mask = np.zeros((_BATCH_SIZE, sequence), dtype=np.int32)
     key_mask[:, :valid_tokens] = 1
-    dout_rng = np.random.Generator(np.random.PCG64(_COTANGENT_SEED))
+    dout_rng = np.random.Generator(np.random.PCG64(cotangent_seed))
     unmasked_dout = _iid_nonzero_grid(
         np,
         ml_dtypes,
@@ -2749,7 +3557,7 @@ def _construct_host_case(
         _COTANGENT_MAXIMUM_INTEGER_MAGNITUDE,
     )
     dout = unmasked_dout.copy()
-    if valid_tokens < _SEQUENCE_LENGTH:
+    if valid_tokens < sequence:
         dout[:, valid_tokens:] = ml_dtypes.bfloat16(0)
     unmasked_dout_manifest = _array_manifest("unmasked_dout", unmasked_dout)
     inputs = (q, k, v, key_mask, dout)
@@ -2764,6 +3572,8 @@ def _construct_host_case(
         _array_manifest(name, value)
         for name, value in zip(("output", "dq", "dk", "dv"), expected, strict=True)
     ]
+    host_input_bytes = sum(int(item["nbytes"]) for item in input_manifests)
+    host_reference_bytes = sum(int(item["nbytes"]) for item in expected_manifests)
     norms = {
         name: float(np.linalg.norm(np.asarray(value, np.float64).ravel()))
         for name, value in zip(("output", "dq", "dk", "dv"), expected, strict=True)
@@ -2800,6 +3610,8 @@ def _construct_host_case(
         ),
     }
     sensitivity: dict[str, Any] | None = None
+    t1024_reset_sensitivity: dict[str, Any] | None = None
+    t1024_omit_q512_sensitivity: dict[str, Any] | None = None
     if case == _VALID385_CASE:
         sensitivity = _valid385_sensitivity_controls(
             np, q, k, v, key_mask, dout, unmasked_dout, expected
@@ -2879,6 +3691,45 @@ def _construct_host_case(
                 == _EXPECTED_VALID385_SENSITIVITY_METRICS,
             }
         )
+    elif case == _ALL_VALID_T1024_CASE:
+        t1024_reset_sensitivity = _t1024_reset_sensitivity_control(
+            np, q, k, v, key_mask, dout, expected
+        )
+        t1024_omit_q512_sensitivity = _t1024_omit_q512_sensitivity_control(
+            np, q, k, v, key_mask, dout, expected
+        )
+        checks.update(
+            {
+                "host_input_bytes_pinned": (
+                    host_input_bytes == _T1024_EXPECTED_HOST_INPUT_BYTES
+                ),
+                "host_fp32_reference_bytes_pinned": (
+                    host_reference_bytes == _T1024_EXPECTED_HOST_REFERENCE_BYTES
+                ),
+                "two_chunk_reset_control_decisive": t1024_reset_sensitivity[
+                    "control_decisive"
+                ],
+                "two_chunk_reset_hashes_pinned": t1024_reset_sensitivity[
+                    "alternative_reference_sha256"
+                ]
+                == _EXPECTED_T1024_RESET_SENSITIVITY_SHA256,
+                "two_chunk_reset_metrics_pinned": t1024_reset_sensitivity[
+                    "per_key_half_metrics"
+                ]
+                == _EXPECTED_T1024_RESET_SENSITIVITY_METRICS,
+                "two_chunk_omit_q512_control_decisive": (
+                    t1024_omit_q512_sensitivity["control_decisive"]
+                ),
+                "two_chunk_omit_q512_hashes_pinned": (
+                    t1024_omit_q512_sensitivity["alternative_reference_sha256"]
+                    == _EXPECTED_T1024_OMIT_Q512_SENSITIVITY_SHA256
+                ),
+                "two_chunk_omit_q512_metrics_pinned": (
+                    t1024_omit_q512_sensitivity["per_key_half_metrics"]
+                    == _EXPECTED_T1024_OMIT_Q512_SENSITIVITY_METRICS
+                ),
+            }
+        )
     if not _skip_pins and not all(checks.values()):
         raise RuntimeError("VJP host input or oracle calibration pin changed")
     reference_manifest = {
@@ -2909,6 +3760,25 @@ def _construct_host_case(
                     ),
                     "raw_values_emitted": False,
                 },
+            }
+        )
+    elif case == _ALL_VALID_T1024_CASE:
+        reference_manifest.update(
+            {
+                "case": case,
+                "sequence_length": sequence,
+                "query_chunks": 2,
+                "query_chunk_size": _QUERY_CHUNK_SIZE,
+                "compile_diagnostic_only": True,
+                "host_memory_accounting": {
+                    "input_bytes": host_input_bytes,
+                    "fp32_reference_bytes": host_reference_bytes,
+                    "oracle_scratch_bytes": oracle[
+                        "conservative_accounted_numpy_array_scratch_bytes"
+                    ],
+                },
+                "reset_before_q512_sensitivity_control": t1024_reset_sensitivity,
+                "omit_q512_sensitivity_control": t1024_omit_q512_sensitivity,
             }
         )
     return (
@@ -3024,15 +3894,18 @@ def _validate_candidate(
     case: str = _ALL_VALID_CASE,
 ) -> dict[str, Any]:
     case = _normalize_case(case)
+    sequence = _case_sequence_length(case)
     if not isinstance(actual_host, tuple) or len(actual_host) != 4:
         raise RuntimeError("checked VJP executable did not return an exact four-tuple")
     shapes = (
-        (_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM),
-        (_BATCH_SIZE, _SEQUENCE_LENGTH, _QUERY_HEADS, _HEAD_DIM),
-        (_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM),
-        (_BATCH_SIZE, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM),
+        (_BATCH_SIZE, sequence, _QUERY_HEADS, _HEAD_DIM),
+        (_BATCH_SIZE, sequence, _QUERY_HEADS, _HEAD_DIM),
+        (_BATCH_SIZE, sequence, _KV_HEADS, _HEAD_DIM),
+        (_BATCH_SIZE, sequence, _KV_HEADS, _HEAD_DIM),
     )
-    nbytes = (4_194_304, 4_194_304, 1_048_576, 1_048_576)
+    q_nbytes = _BATCH_SIZE * sequence * _QUERY_HEADS * _HEAD_DIM * 2
+    kv_nbytes = _BATCH_SIZE * sequence * _KV_HEADS * _HEAD_DIM * 2
+    nbytes = (q_nbytes, q_nbytes, kv_nbytes, kv_nbytes)
     metrics = {
         name: _tensor_metrics(
             np,
@@ -3053,6 +3926,8 @@ def _validate_candidate(
     per_tensor = {name: _numerical_metrics_pass(item) for name, item in metrics.items()}
     padded_validation: dict[str, Any] | None = None
     padded_passed = True
+    t1024_validation: dict[str, Any] | None = None
+    t1024_passed = True
     if case == _VALID385_CASE:
         valid_tokens = _CASE_VALID_TOKENS[case]
         output_tail_actual = np.asarray(actual_host[0])[:, valid_tokens:]
@@ -3163,6 +4038,43 @@ def _validate_candidate(
             "all_zero_tail_gates_passed": zero_tails_passed,
             "passed": padded_passed,
         }
+    elif case == _ALL_VALID_T1024_CASE:
+        half_metrics = {
+            f"{name}_{axis}_rows_{start}_{stop}": _tensor_metrics(
+                np,
+                np.asarray(actual)[:, start:stop],
+                np.asarray(expected)[:, start:stop],
+                expected_shape=(
+                    _BATCH_SIZE,
+                    stop - start,
+                    heads,
+                    _HEAD_DIM,
+                ),
+                expected_actual_nbytes=(
+                    _BATCH_SIZE * (stop - start) * heads * _HEAD_DIM * 2
+                ),
+            )
+            for name, axis, actual, expected, heads in zip(
+                ("output", "dq", "dk", "dv"),
+                ("query", "query", "key", "key"),
+                actual_host,
+                expected_host,
+                (_QUERY_HEADS, _QUERY_HEADS, _KV_HEADS, _KV_HEADS),
+                strict=True,
+            )
+            for start, stop in ((0, 512), (512, 1024))
+        }
+        half_passed = {
+            name: _numerical_metrics_pass(item) for name, item in half_metrics.items()
+        }
+        t1024_passed = all(half_passed.values())
+        t1024_validation = {
+            "query_halves": [[0, 512], [512, 1024]],
+            "key_halves": [[0, 512], [512, 1024]],
+            "per_half_metrics": _json_safe_metrics(half_metrics),
+            "per_half_numerical_passed": half_passed,
+            "passed": t1024_passed,
+        }
     safety_duration = math.isfinite(seconds) and 0 <= seconds < _MAX_CANDIDATE_SECONDS
     promotion_duration = (
         math.isfinite(seconds) and 0 <= seconds < _MAX_PROMOTION_CANDIDATE_SECONDS
@@ -3170,6 +4082,7 @@ def _validate_candidate(
     passed = (
         all(per_tensor.values())
         and padded_passed
+        and t1024_passed
         and safety_duration
         and promotion_duration
     )
@@ -3180,7 +4093,10 @@ def _validate_candidate(
             "passed"
             if passed
             else "not_promoted"
-            if all(per_tensor.values()) and padded_passed and safety_duration
+            if all(per_tensor.values())
+            and padded_passed
+            and t1024_passed
+            and safety_duration
             else "failed"
         ),
         "metrics": _json_safe_metrics(metrics),
@@ -3201,6 +4117,7 @@ def _validate_candidate(
             "per_tensor_numerical_passed": per_tensor,
             "all_tensor_numerical_passed": all(per_tensor.values()),
             "case_specific_padded_validation_passed": padded_passed,
+            "case_specific_t1024_half_validation_passed": t1024_passed,
             "safety_duration_passed": safety_duration,
             "promotion_duration_passed": promotion_duration,
             "promotion_passed": passed,
@@ -3210,6 +4127,8 @@ def _validate_candidate(
     }
     if padded_validation is not None:
         record["padded_validation"] = padded_validation
+    if t1024_validation is not None:
+        record["t1024_half_validation"] = t1024_validation
     _emit(record, output)
     if not passed:
         raise RuntimeError("full VJP candidate failed numerical or duration gates")
@@ -3303,6 +4222,11 @@ def _run_rocm(
     _dependencies: tuple[Any, Any, Any, Any, Any, Any, Any] | None = None,
 ) -> int:
     case = _normalize_case(case)
+    if case == _ALL_VALID_T1024_CASE and not compile_diagnostic:
+        raise RuntimeError(
+            "all_valid_t1024 runtime release is unavailable in this source "
+            "revision; run compile diagnostic and qualify captured dataflow first"
+        )
     proof = _prove_command_buffers_disabled(environment)
     architecture_binding = _assert_gfx1100_drm()
     _emit(
@@ -3357,10 +4281,21 @@ def _run_rocm(
             require_clean_boot,
             counters,
             output,
+            case,
         )
 
-    compiled, compile_report = _compile_vjp_artifact(
-        jax, jnp, query_bounded_gqa, require_clean_boot, counters, output
+    compile_arguments = (
+        jax,
+        jnp,
+        query_bounded_gqa,
+        require_clean_boot,
+        counters,
+        output,
+    )
+    compiled, compile_report = (
+        _compile_vjp_artifact(*compile_arguments)
+        if case == _ALL_VALID_CASE
+        else _compile_vjp_artifact(*compile_arguments, case)
     )
     executable = _release_checked_vjp(compiled, compile_report, counters)
     del compiled
@@ -3474,12 +4409,16 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
                     "guarded_exact_t512_full_vjp_compile_diagnostic"
                     if case == _ALL_VALID_CASE
                     else "guarded_exact_t512_valid385_loss_masked_full_vjp_compile_diagnostic"
+                    if case == _VALID385_CASE
+                    else "guarded_exact_t1024_two_chunk_full_vjp_compile_diagnostic_only"
                 )
                 if compile_diagnostic
                 else (
                     "guarded_exact_t512_full_vjp"
                     if case == _ALL_VALID_CASE
                     else "guarded_exact_t512_valid385_loss_masked_active_token_cotangent_vjp"
+                    if case == _VALID385_CASE
+                    else "refused_t1024_runtime_not_qualified"
                 )
             ),
             "contract": (

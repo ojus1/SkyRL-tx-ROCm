@@ -52,6 +52,11 @@ def valid385_case():
     return _PROBE._construct_host_case(np, ml_dtypes, "valid385")
 
 
+@pytest.fixture(scope="module")
+def all_valid_t1024_case():
+    return _PROBE._construct_host_case(np, ml_dtypes, "all_valid_t1024")
+
+
 def test_default_is_abstract_refusal_without_accelerator_import():
     before = _accelerator_modules()
     output = io.StringIO()
@@ -158,6 +163,48 @@ def test_valid385_parser_and_compile_diagnostic_remain_explicit_and_closed(tmp_p
     assert contract["executable_invocation_authorized"] is False
 
 
+def test_t1024_parser_is_compile_diagnostic_only_and_runtime_fails_closed(
+    tmp_path, capsys
+):
+    diagnostic = tmp_path / "t1024-diagnostic.jsonl"
+    args = _PROBE._parse_args(
+        [
+            "--platform",
+            "rocm",
+            "--allow-gpu",
+            "--compile-diagnostic",
+            "--case",
+            "all_valid_t1024",
+            "--output",
+            str(diagnostic),
+        ]
+    )
+    assert args.case == "all_valid_t1024"
+    assert args.compile_diagnostic is True
+    with pytest.raises(SystemExit) as raised:
+        _PROBE._parse_args(
+            [
+                "--platform",
+                "rocm",
+                "--allow-gpu",
+                "--case",
+                "all_valid_t1024",
+                "--output",
+                str(tmp_path / "forbidden-runtime.jsonl"),
+            ]
+        )
+    assert raised.value.code == 2
+    assert "compile-diagnostic-only" in capsys.readouterr().err
+    with pytest.raises(RuntimeError, match="runtime release is unavailable"):
+        _PROBE._run_rocm(
+            io.StringIO(),
+            lambda: dict(_CLEAN),
+            _PROBE._zero_counters(),
+            environment={},
+            case="all_valid_t1024",
+        )
+
+
 def test_exact_contract_fixes_shape_dispatch_memory_and_numerical_gates():
     contract = _PROBE._exact_contract()
     assert contract["operation"] == "query_bounded_gqa_t512_forward_and_full_vjp"
@@ -235,6 +282,93 @@ def test_valid385_contract_adds_only_host_case_and_validation_gates():
     assert padded["tiles"] == default["tiles"]
     assert padded["affected_forward_output_rows_numerically_gated"] == [385, 512]
     assert all(padded["padded_zero_gates"].values())
+
+
+def test_t1024_contract_fixes_two_chunks_memory_and_withholds_runtime():
+    contract = _PROBE._exact_contract("all_valid_t1024")
+    assert contract["case"] == "all_valid_t1024"
+    assert contract["sequence_length"] == 1024
+    assert contract["query_chunks"] == 2
+    assert [item["shape"] for item in contract["inputs"]] == [
+        [1, 1024, 16, 256],
+        [1, 1024, 4, 256],
+        [1, 1024, 4, 256],
+        [1, 1024],
+        [1, 1024, 16, 256],
+    ]
+    gate = contract["compile_gate"]
+    assert gate["exact_custom_calls"] == {"forward": 2, "dq": 2, "dkdv": 2}
+    assert gate["exact_total_custom_calls"] == 6
+    assert gate["exact_argument_bytes"] == 20_975_616
+    assert gate["exact_output_bytes"] == 20_971_552
+    assert gate["exact_alias_bytes"] == 0
+    assert gate["maximum_temporary_bytes"] == 128 * 1024**2
+    assert contract["output_tensor_leaf_bytes"] == 20_971_520
+    assert contract["compiled_output_root_bytes"] == 32
+    assert contract["host_input_bytes"] == 20_975_616
+    assert contract["host_fp32_reference_bytes"] == 41_943_040
+    assert contract["host_oracle_scratch_bytes"] == 323_072
+    assert contract["internal_accumulator_memory"] == {
+        "shape": [1, 1024, 4, 256],
+        "dtype": "float32",
+        "leaf_bytes": 4_194_304,
+        "pair_bytes": 8_388_608,
+    }
+    diagnostic = _PROBE._compile_diagnostic_contract("all_valid_t1024")
+    assert diagnostic["host_input_bytes"] == 20_975_616
+    assert diagnostic["host_fp32_reference_bytes"] == 41_943_040
+    assert diagnostic["host_oracle_scratch_bytes"] == 323_072
+    assert (
+        diagnostic["internal_accumulator_memory"]
+        == contract["internal_accumulator_memory"]
+    )
+    assert contract["compile_diagnostic_only"] is True
+    assert (
+        contract["runtime_capability_release_authorized_in_this_source_revision"]
+        is False
+    )
+    assert contract["physical_launch_count_claimed"] is False
+    assert (
+        contract[
+            "six_calls_are_bounded_attention_custom_calls_not_physical_launch_count"
+        ]
+        is True
+    )
+    assert all(contract["required_internal_accumulator_proof"].values())
+
+
+def test_t1024_shape_and_external_memory_gates_are_exact():
+    signature = _PROBE._shape_signature(
+        SimpleNamespace(ShapeDtypeStruct=_FakeShape),
+        SimpleNamespace(bfloat16="bf16", int32="i32"),
+        "all_valid_t1024",
+    )
+    assert [item.shape for item in signature] == [
+        (1, 1024, 16, 256),
+        (1, 1024, 4, 256),
+        (1, 1024, 4, 256),
+        (1, 1024),
+        (1, 1024, 16, 256),
+    ]
+    memory = {
+        "available": True,
+        "argument_size_in_bytes": 20_975_616,
+        "output_size_in_bytes": 20_971_552,
+        "alias_size_in_bytes": 0,
+        "temp_size_in_bytes": 128 * 1024**2,
+    }
+    assert _PROBE._compiled_memory_gate(memory, "all_valid_t1024")["passed"] is True
+    for name, value in (
+        ("argument_size_in_bytes", 20_975_615),
+        ("output_size_in_bytes", 20_971_520),
+        ("alias_size_in_bytes", 1),
+        ("temp_size_in_bytes", 128 * 1024**2 + 1),
+    ):
+        corrupt = dict(memory)
+        corrupt[name] = value
+        assert (
+            _PROBE._compiled_memory_gate(corrupt, "all_valid_t1024")["passed"] is False
+        )
 
 
 def test_static_source_binding_and_kernel_api_are_exact(monkeypatch):
@@ -373,6 +507,78 @@ def test_valid385_calibration_pin_mutation_fails_closed(monkeypatch):
     monkeypatch.setattr(_PROBE, "_EXPECTED_VALID385_INPUT_SHA256", corrupted)
     with pytest.raises(RuntimeError, match="calibration pin changed"):
         _PROBE._construct_host_case(np, ml_dtypes, "valid385")
+
+
+def test_t1024_host_case_hashes_norms_oracle_and_chunk_sensitivity_controls(
+    all_valid_t1024_case,
+):
+    inputs, manifests, expected, reference = all_valid_t1024_case
+    q, k, v, key_mask, dout = inputs
+    assert {item["name"]: item["sha256"] for item in manifests} == (
+        _PROBE._EXPECTED_T1024_INPUT_SHA256
+    )
+    assert {item["name"]: item["sha256"] for item in reference["outputs"]} == (
+        _PROBE._EXPECTED_T1024_REFERENCE_SHA256
+    )
+    assert reference["reference_l2_norms"] == pytest.approx(
+        _PROBE._EXPECTED_T1024_REFERENCE_NORMS, abs=1e-12
+    )
+    assert all(reference["calibration_pin_checks"].values())
+    assert reference["oracle"]["valid_tokens"] == 1024
+    assert reference["oracle"]["right_padded_key_mask"] is False
+    assert (
+        reference["oracle"]["conservative_accounted_numpy_array_scratch_bytes"]
+        == 323_072
+    )
+    assert reference["oracle"][
+        "observed_maximum_absolute_valid_logit"
+    ] == pytest.approx(1.580984115600586, abs=1e-12)
+    assert reference["host_memory_accounting"] == {
+        "input_bytes": 20_975_616,
+        "fp32_reference_bytes": 41_943_040,
+        "oracle_scratch_bytes": 323_072,
+    }
+    assert q.shape == dout.shape == (1, 1024, 16, 256)
+    assert k.shape == v.shape == (1, 1024, 4, 256)
+    assert q.dtype == k.dtype == v.dtype == dout.dtype == ml_dtypes.bfloat16
+    assert key_mask.dtype == np.int32 and np.all(key_mask == 1)
+    assert all(np.count_nonzero(value) == value.size for value in (q, k, v, dout))
+    assert all(value.dtype == np.float32 for value in expected)
+    reset = reference["reset_before_q512_sensitivity_control"]
+    assert reset["alternative_reference_sha256"] == (
+        _PROBE._EXPECTED_T1024_RESET_SENSITIVITY_SHA256
+    )
+    assert reset["per_key_half_metrics"] == (
+        _PROBE._EXPECTED_T1024_RESET_SENSITIVITY_METRICS
+    )
+    assert all(reset["first_key_half_fails_numerical_gate"].values())
+    assert all(reset["second_key_half_exactly_equal_by_causality"].values())
+    assert reset["control_decisive"] is True
+    assert reset["accelerator_used"] is False
+    omitted = reference["omit_q512_sensitivity_control"]
+    assert omitted["alternative_reference_sha256"] == (
+        _PROBE._EXPECTED_T1024_OMIT_Q512_SENSITIVITY_SHA256
+    )
+    assert omitted["per_key_half_metrics"] == (
+        _PROBE._EXPECTED_T1024_OMIT_Q512_SENSITIVITY_METRICS
+    )
+    assert all(omitted["all_key_halves_fail_numerical_gate"].values())
+    assert omitted["control_decisive"] is True
+    assert omitted["accelerator_used"] is False
+
+
+def test_t1024_calibration_pin_mutation_fails_closed(monkeypatch):
+    corrupted = dict(_PROBE._EXPECTED_T1024_REFERENCE_SHA256)
+    corrupted["dv"] = "0" * 64
+    monkeypatch.setattr(_PROBE, "_EXPECTED_T1024_REFERENCE_SHA256", corrupted)
+    with pytest.raises(RuntimeError, match="calibration pin changed"):
+        _PROBE._construct_host_case(np, ml_dtypes, "all_valid_t1024")
+
+
+def test_t1024_host_memory_pin_mutation_fails_closed(monkeypatch):
+    monkeypatch.setattr(_PROBE, "_T1024_EXPECTED_HOST_REFERENCE_BYTES", 41_943_039)
+    with pytest.raises(RuntimeError, match="calibration pin changed"):
+        _PROBE._construct_host_case(np, ml_dtypes, "all_valid_t1024")
 
 
 @pytest.mark.parametrize(
@@ -536,6 +742,39 @@ def test_padded_oracle_proves_key_mask_and_loss_mask_sensitivity_limits():
     )
 
 
+def test_all_valid_two_chunk_oracle_accumulates_both_cotangent_halves():
+    rng = np.random.Generator(np.random.PCG64(1024512))
+    q = rng.uniform(-0.6, 0.6, (1, 8, 4, 3)).astype(np.float32)
+    k = rng.uniform(-0.6, 0.6, (1, 8, 2, 3)).astype(np.float32)
+    v = rng.uniform(-0.6, 0.6, k.shape).astype(np.float32)
+    dout = rng.uniform(-0.4, 0.4, q.shape).astype(np.float32)
+    mask = np.ones((1, 8), np.int32)
+    full, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np, q, k, v, mask, dout, scale=3 / 32, query_tile=2, key_tile=3
+    )
+    first_dout = dout.copy()
+    first_dout[:, 4:] = 0
+    second_dout = dout.copy()
+    second_dout[:, :4] = 0
+    first, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np, q, k, v, mask, first_dout, scale=3 / 32, query_tile=2, key_tile=3
+    )
+    second, _ = _PROBE._tiled_causal_gqa_forward_vjp_oracle(
+        np, q, k, v, mask, second_dout, scale=3 / 32, query_tile=2, key_tile=3
+    )
+    assert np.array_equal(first[0], full[0])
+    assert np.array_equal(second[0], full[0])
+    for full_gradient, first_gradient, second_gradient in zip(
+        full[1:], first[1:], second[1:], strict=True
+    ):
+        np.testing.assert_allclose(
+            first_gradient + second_gradient,
+            full_gradient,
+            rtol=3e-6,
+            atol=6e-7,
+        )
+
+
 def test_exact_t512_tiled_oracle_matches_dense_reference(exact_case):
     inputs, _manifests, expected, _reference = exact_case
     dense = _PROBE._dense_causal_gqa_forward_vjp_reference(np, *inputs, scale=3 / 32)
@@ -673,6 +912,248 @@ def _optimized_hlo_calls(
     ]
     return "\n".join(
         ["ENTRY main (p0: bf16[1]{0}) -> bf16[1]{0} {", *calls, "}", extra]
+    )
+
+
+def _t1024_two_chunk_ir(dialect: str) -> str:
+    specs = _PROBE._expected_call_specs("all_valid_t1024")
+    if dialect == "stablehlo":
+        accumulator = "tensor<1x1024x4x256xf32>"
+        definitions = [
+            f'#loc{index} = loc("{item["marker"]} query_start={item["query_start"]} query_size=512")'
+            for index, item in enumerate(specs)
+        ]
+        arguments = ", ".join(f"%a{index}: {accumulator}" for index in range(9))
+        operands = ", ".join(f"%a{index}" for index in range(9))
+        types = ", ".join([accumulator] * 9)
+        aliases = (
+            "#stablehlo.output_operand_alias<output_tuple_indices = [0], "
+            "operand_index = 7, operand_tuple_indices = []>, "
+            "#stablehlo.output_operand_alias<output_tuple_indices = [1], "
+            "operand_index = 8, operand_tuple_indices = []>"
+        )
+        lines = [*definitions, "module {", f"  func.func public @main({arguments}) {{"]
+        lines.extend(
+            f'    %x{index} = stablehlo.custom_call @"{_TARGET}"() : () -> tensor<1xbf16> loc(#loc{index})'
+            for index in range(4)
+        )
+        lines.append(
+            f'    %dk0:2 = stablehlo.custom_call @"{_TARGET}"({operands}) '
+            f"{{output_operand_aliases = [{aliases}]}} : ({types}) -> "
+            f"({accumulator}, {accumulator}) loc(#loc4)"
+        )
+        q512_operands = ", ".join(
+            [*(f"%a{index}" for index in range(7)), "%dk0#0", "%dk0#1"]
+        )
+        lines.append(
+            f'    %dk512:2 = stablehlo.custom_call @"{_TARGET}"({q512_operands}) '
+            f"{{output_operand_aliases = [{aliases}]}} : ({types}) -> "
+            f"({accumulator}, {accumulator}) loc(#loc5)"
+        )
+        return "\n".join([*lines, "    return", "  }", "}"])
+    if dialect == "optimized_hlo":
+        accumulator = "f32[1,1024,4,256]"
+        parameters = ", ".join(f"%p{index}: {accumulator}" for index in range(9))
+        operands = ", ".join(f"%p{index}" for index in range(9))
+        aliases = "{{0}: (7, {}), {1}: (8, {})}"
+        lines = ["HloModule t1024", f"ENTRY main ({parameters}) -> () {{"]
+        lines.extend(
+            f'  %x{index} = bf16[1] custom-call(), custom_call_target="{_TARGET}", '
+            f'op_name="{item["marker"]} query_start={item["query_start"]} query_size=512"'
+            for index, item in enumerate(specs[:4])
+        )
+        lines.append(
+            f"  %dk0 = ({accumulator}, {accumulator}) custom-call({operands}), "
+            f'custom_call_target="{_TARGET}", output_to_operand_aliasing={aliases}, '
+            f'op_name="{specs[4]["marker"]} query_start=0 query_size=512"'
+        )
+        lines.extend(
+            (
+                f"  %gte0 = {accumulator} get-tuple-element(%dk0), index=0",
+                f"  %gte1 = {accumulator} get-tuple-element(%dk0), index=1",
+            )
+        )
+        q512_operands = ", ".join(
+            [*(f"%p{index}" for index in range(7)), "%gte0", "%gte1"]
+        )
+        lines.append(
+            f"  %dk512 = ({accumulator}, {accumulator}) custom-call({q512_operands}), "
+            f'custom_call_target="{_TARGET}", output_to_operand_aliasing={aliases}, '
+            f'op_name="{specs[5]["marker"]} query_start=512 query_size=512"'
+        )
+        return "\n".join([*lines, "  ROOT %root = () tuple()", "}"])
+    raise ValueError("unsupported test dialect")
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_strict_ir_accepts_six_calls_aliases_and_accumulator_chain(dialect):
+    summary = _PROBE._strict_vjp_ir_summary(
+        _t1024_two_chunk_ir(dialect), dialect, "all_valid_t1024"
+    )
+    assert summary["passed"] is True
+    assert summary["custom_call_count"] == 6
+    assert summary["marker_call_counts"] == {"forward": 2, "dq": 2, "dkdv": 2}
+    assert all(item["count"] == 1 for item in summary["marker_query_start_counts"])
+    dataflow = summary["two_chunk_accumulator_dataflow"]
+    assert dataflow["passed"] is True
+    assert all(dataflow["checks"].values())
+    assert dataflow["q0_aliases"]["exact_internal_aliases_7_to_0_and_8_to_1"] is True
+    assert dataflow["q512_aliases"]["exact_internal_aliases_7_to_0_and_8_to_1"] is True
+    assert dataflow["accumulator_memory"] == {
+        "shape": [1, 1024, 4, 256],
+        "dtype": "float32",
+        "leaf_bytes": 4_194_304,
+        "pair_bytes": 8_388_608,
+    }
+    assert dataflow["raw_ir_emitted"] is False
+    assert dataflow["raw_symbols_emitted"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_call_counts_cannot_spoof_missing_accumulator_chain(dialect):
+    text = _t1024_two_chunk_ir(dialect)
+    text = (
+        text.replace("%dk0#0, %dk0#1", "%a7, %dk0#1")
+        if dialect == "stablehlo"
+        else text.replace("%gte0, %gte1", "%p7, %gte1")
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, dialect, "all_valid_t1024")
+    assert summary["custom_call_count"] == 6
+    assert summary["two_chunk_accumulator_dataflow"]["passed"] is False
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_quoted_alias_spoof_and_missing_real_alias_fail_closed(dialect):
+    text = _t1024_two_chunk_ir(dialect)
+    if dialect == "stablehlo":
+        text = text.replace(
+            "output_operand_aliases = [#stablehlo.output_operand_alias<",
+            'backend_config = "output_operand_aliases = [#stablehlo.output_operand_alias<',
+        ).replace(
+            "operand_index = 8, operand_tuple_indices = []>]}",
+            'operand_index = 8, operand_tuple_indices = []>]"}',
+        )
+    else:
+        text = text.replace(
+            "output_to_operand_aliasing={{0}: (7, {}), {1}: (8, {})}",
+            'backend_config="output_to_operand_aliasing={{0}: (7, {}), {1}: (8, {})}"',
+        )
+    summary = _PROBE._strict_vjp_ir_summary(text, dialect, "all_valid_t1024")
+    assert summary["two_chunk_accumulator_dataflow"]["passed"] is False
+    assert summary["passed"] is False
+
+
+def test_t1024_optimized_copy_or_duplicate_instruction_chain_fails_closed():
+    text = _t1024_two_chunk_ir("optimized_hlo")
+    copied = text.replace(
+        "  %gte1 = f32[1,1024,4,256] get-tuple-element(%dk0), index=1",
+        "  %gte1 = f32[1,1024,4,256] get-tuple-element(%dk0), index=1\n"
+        "  %copied = f32[1,1024,4,256] copy(%gte0)",
+    ).replace("%gte0, %gte1", "%copied, %gte1")
+    assert (
+        _PROBE._strict_vjp_ir_summary(copied, "optimized_hlo", "all_valid_t1024")[
+            "passed"
+        ]
+        is False
+    )
+    duplicate = text.replace(
+        "%gte1 = f32[1,1024,4,256] get-tuple-element",
+        "%gte0 = f32[1,1024,4,256] get-tuple-element",
+    )
+    assert (
+        _PROBE._strict_vjp_ir_summary(duplicate, "optimized_hlo", "all_valid_t1024")[
+            "passed"
+        ]
+        is False
+    )
+
+
+@pytest.mark.parametrize("opcode", ("concatenate", "convert", "copy"))
+def test_t1024_unrelated_data_movement_is_diagnostic_only(opcode):
+    text = _t1024_two_chunk_ir("optimized_hlo")
+    operands = "%p0, %p0" if opcode == "concatenate" else "%p0"
+    text = text.replace(
+        "  ROOT %root = () tuple()",
+        f"  %unrelated = f32[1,1024,4,256] {opcode}({operands})\n"
+        "  ROOT %root = () tuple()",
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "optimized_hlo", "all_valid_t1024")
+    assert summary["passed"] is True
+    diagnostic = summary["two_chunk_accumulator_dataflow"][
+        "whole_program_data_movement_opcode_counts_diagnostic_only"
+    ]
+    assert diagnostic[opcode] == 1
+
+
+@pytest.mark.parametrize(
+    ("opcode", "instruction"),
+    (
+        (
+            "convert",
+            "    %unrelated = stablehlo.convert %a0 : "
+            "(tensor<1x1024x4x256xf32>) -> tensor<1x1024x4x256xbf16>",
+        ),
+        (
+            "concatenate",
+            "    %unrelated = stablehlo.concatenate %a0, %a0, dim = 0 : "
+            "(tensor<1x1024x4x256xf32>, tensor<1x1024x4x256xf32>) -> "
+            "tensor<2x1024x4x256xf32>",
+        ),
+    ),
+)
+def test_t1024_stablehlo_unrelated_data_movement_is_diagnostic_only(
+    opcode, instruction
+):
+    text = _t1024_two_chunk_ir("stablehlo").replace(
+        "    return\n  }\n}", f"{instruction}\n    return\n  }}\n}}"
+    )
+    summary = _PROBE._strict_vjp_ir_summary(text, "stablehlo", "all_valid_t1024")
+    assert summary["passed"] is True
+    diagnostic = summary["two_chunk_accumulator_dataflow"][
+        "whole_program_data_movement_opcode_counts_diagnostic_only"
+    ]
+    assert diagnostic[opcode] == 1
+
+
+def test_t1024_accumulator_byte_pin_mutation_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        _PROBE,
+        "_T1024_EXPECTED_ACCUMULATOR_PAIR_BYTES",
+        8_388_607,
+    )
+    summary = _PROBE._strict_vjp_ir_summary(
+        _t1024_two_chunk_ir("optimized_hlo"),
+        "optimized_hlo",
+        "all_valid_t1024",
+    )
+    assert summary["two_chunk_accumulator_dataflow"]["passed"] is False
+    assert summary["passed"] is False
+
+
+@pytest.mark.parametrize("dialect", ("stablehlo", "optimized_hlo"))
+def test_t1024_wrong_q512_metadata_or_accumulator_dtype_fails_closed(dialect):
+    text = _t1024_two_chunk_ir(dialect).replace("query_start=512", "query_start=513", 1)
+    assert (
+        _PROBE._strict_vjp_ir_summary(text, dialect, "all_valid_t1024")["passed"]
+        is False
+    )
+    wrong_dtype = _t1024_two_chunk_ir(dialect)
+    if dialect == "stablehlo":
+        wrong_dtype = wrong_dtype.replace(
+            "-> (tensor<1x1024x4x256xf32>, tensor<1x1024x4x256xf32>)",
+            "-> (tensor<1x1024x4x256xbf16>, tensor<1x1024x4x256xf32>)",
+            1,
+        )
+    else:
+        wrong_dtype = wrong_dtype.replace(
+            "%gte0 = f32[1,1024,4,256] get-tuple-element",
+            "%gte0 = bf16[1,1024,4,256] get-tuple-element",
+            1,
+        )
+    assert (
+        _PROBE._strict_vjp_ir_summary(wrong_dtype, dialect, "all_valid_t1024")["passed"]
+        is False
     )
 
 
@@ -1355,6 +1836,54 @@ def test_bf16_rounded_reference_passes_and_corrupted_gradient_fails(exact_case):
         )
 
 
+def test_t1024_bf16_reference_passes_full_and_every_half_gate(
+    all_valid_t1024_case,
+):
+    _inputs, _manifests, expected, _reference = all_valid_t1024_case
+    actual = tuple(item.astype(ml_dtypes.bfloat16) for item in expected)
+    record = _PROBE._validate_candidate(
+        np,
+        actual,
+        expected,
+        0.01,
+        _PROBE._completed_counters(),
+        io.StringIO(),
+        "all_valid_t1024",
+    )
+    assert record["gates"]["all_tensor_numerical_passed"] is True
+    assert record["gates"]["case_specific_t1024_half_validation_passed"] is True
+    assert all(record["t1024_half_validation"]["per_half_numerical_passed"].values())
+    assert record["gates"]["promotion_passed"] is True
+
+
+def test_t1024_corrupted_query_half_fails_only_its_independent_half_gate(
+    all_valid_t1024_case,
+):
+    _inputs, _manifests, expected, _reference = all_valid_t1024_case
+    actual = [item.astype(ml_dtypes.bfloat16) for item in expected]
+    actual[0][:, 512:] = ml_dtypes.bfloat16(2.0)
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            tuple(actual),
+            expected,
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+            "all_valid_t1024",
+        )
+    [record] = _records(output)
+    halves = record["t1024_half_validation"]["per_half_numerical_passed"]
+    assert halves["output_query_rows_512_1024"] is False
+    assert all(
+        passed
+        for name, passed in halves.items()
+        if name != "output_query_rows_512_1024"
+    )
+    assert record["gates"]["case_specific_t1024_half_validation_passed"] is False
+
+
 def test_valid385_bf16_reference_passes_all_numerical_and_zero_tail_gates(
     valid385_case,
 ):
@@ -1676,6 +2205,78 @@ def test_compile_diagnostic_destroys_unreleased_artifact_with_all_runtime_counte
     [record] = _records(output)
     assert record["record_type"] == "compile_diagnostic_completed"
     assert record["status"] == "structure_and_memory_passed_no_release"
+    assert record["checked_capability_created_or_released"] is False
+    assert record["host_reference_constructed"] is False
+    assert record["host_or_device_inputs_constructed"] is False
+    assert record["executable_invoked"] is False
+    assert record["device_output_retrieved"] is False
+
+
+def test_t1024_compile_diagnostic_can_capture_evidence_but_never_release_runtime(
+    monkeypatch,
+):
+    state = {"destroyed": 0}
+
+    class DiagnosticArtifact:
+        def __del__(self):
+            state["destroyed"] += 1
+
+    def compile_artifact(_jax, _jnp, _api, _clean, counters, _output, case):
+        assert case == "all_valid_t1024"
+        for name in (
+            "lower_attempts",
+            "lower_completions",
+            "compile_attempts",
+            "compile_completions",
+        ):
+            counters[name] += 1
+        return DiagnosticArtifact(), {
+            "structural_gate": {"passed": True},
+            "compiled_memory_gate": {"passed": True},
+            "release_gate": {
+                "diagnostic_evidence_passed": True,
+                "runtime_release_authorized_by_case": False,
+                "passed": False,
+            },
+        }
+
+    monkeypatch.setattr(_PROBE, "_compile_vjp_artifact", compile_artifact)
+    for forbidden in (
+        "_release_checked_vjp",
+        "_construct_host_case",
+        "_device_put_inputs",
+        "_dispatch_candidate",
+        "_device_get_candidate",
+    ):
+        monkeypatch.setattr(
+            _PROBE,
+            forbidden,
+            lambda *_args, _name=forbidden, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"T1024 diagnostic reached {_name}")
+            ),
+        )
+    counters = _PROBE._zero_counters()
+    output = io.StringIO()
+    result = _PROBE._run_compile_diagnostic(
+        object(),
+        object(),
+        lambda *_args, **_kwargs: None,
+        lambda: dict(_CLEAN),
+        counters,
+        output,
+        "all_valid_t1024",
+    )
+    gc.collect()
+    assert result == 0
+    assert state["destroyed"] == 1
+    assert counters == _PROBE._compile_diagnostic_completed_counters()
+    [record] = _records(output)
+    assert record["status"] == "t1024_diagnostic_evidence_passed_runtime_still_withheld"
+    assert record["release_gate_observed_but_not_authorized"] == {
+        "diagnostic_evidence_passed": True,
+        "runtime_release_authorized_by_case": False,
+        "passed": False,
+    }
     assert record["checked_capability_created_or_released"] is False
     assert record["host_reference_constructed"] is False
     assert record["host_or_device_inputs_constructed"] is False
