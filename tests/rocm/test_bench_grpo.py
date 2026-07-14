@@ -295,6 +295,11 @@ def test_run_uses_importance_sampling_adam_and_cleanup_without_server(monkeypatc
     ]
     assert records[0]["sampling_performed"] is False
     assert records[0]["loss_fn"] == "importance_sampling"
+    assert records[0]["lora_targets"] == {
+        "attention": True,
+        "mlp": True,
+        "unembedding": False,
+    }
     assert records[-2]["adapter_unloaded"] is True
     assert records[-1]["measured_steps"] == 2
     assert (

@@ -321,6 +321,11 @@ async def _run(args: argparse.Namespace, output) -> None:
         "warmup_steps": args.warmup_steps,
         "measured_steps": args.measured_steps,
         "lora_rank": args.lora_rank,
+        "lora_targets": {
+            "attention": True,
+            "mlp": True,
+            "unembedding": False,
+        },
         "seed": args.seed,
         "optimizer": {
             "name": "adam",
