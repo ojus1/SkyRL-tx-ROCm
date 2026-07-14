@@ -820,7 +820,7 @@ def test_launcher_profiles_then_always_settles_before_final_journal_and_api() ->
         '--timeout "$prewarm_timeout_seconds"',
         "--sensor-grace-seconds 60",
         "--max-junction-temp-c 90",
-        "--max-gpu-power-watts 315",
+        "--max-gpu-power-watts 400",
         "--max-vram-gib 24",
         "--min-host-available-gib 0",
         "--max-swap-gib 8",
@@ -853,6 +853,8 @@ prewarm_optimizer=0
 prewarm_only="${FAKE_PREWARM_ONLY:-0}"
 prewarm_timeout_seconds=600
 memory_mode=growth
+bf16_rms_gate_up_lora_swiglu_contiguous="${FAKE_BF16_RMS_GATE_UP:-0}"
+engine_start_gate_enabled=0
 SKYRL_ROCM_PALLAS_ATTENTION=0
 model_path=/mock/qwen35
 amd_card_names=(card1)

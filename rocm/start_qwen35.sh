@@ -62,6 +62,9 @@ prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"
 prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"
 prewarm_timeout_seconds="${SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS:-3600}"
 engine_t64_cache_attest="${SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST-0}"
+engine_start_gate_dir="${SKYRL_QWEN35_ENGINE_START_GATE_DIR-}"
+engine_start_gate_timeout_seconds="${SKYRL_QWEN35_ENGINE_START_GATE_TIMEOUT_SECONDS-300}"
+engine_start_gate_enabled=0
 bf16_rms_gate_up_lora_swiglu_contiguous="${SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS-0}"
 runtime_cache_attestation_environment=()
 
@@ -121,6 +124,58 @@ if [[ ! "$prewarm_timeout_seconds" =~ ^[0-9]{3,5}$ ]] \
   || ((10#$prewarm_timeout_seconds < 600 || 10#$prewarm_timeout_seconds > 14400)); then
   echo "SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS must be an integer in [600, 14400]." >&2
   exit 2
+fi
+if [[ -z "$engine_start_gate_dir" \
+  && -v SKYRL_QWEN35_ENGINE_START_GATE_TIMEOUT_SECONDS ]]; then
+  echo "SKYRL_QWEN35_ENGINE_START_GATE_TIMEOUT_SECONDS requires nonempty SKYRL_QWEN35_ENGINE_START_GATE_DIR." >&2
+  exit 2
+fi
+if [[ -n "$engine_start_gate_dir" && "$prewarm_only" != "0" ]]; then
+  echo "SKYRL_QWEN35_ENGINE_START_GATE_DIR requires SKYRL_QWEN35_PREWARM_ONLY=0." >&2
+  exit 2
+fi
+if [[ -n "$engine_start_gate_dir" && "$prewarm_only" == "0" ]]; then
+  engine_start_gate_enabled=1
+  if [[ "$engine_t64_cache_attest" != "1" ]]; then
+    echo "SKYRL_QWEN35_ENGINE_START_GATE_DIR requires SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1." >&2
+    exit 2
+  fi
+  if [[ -z "$prewarm_buckets" ]]; then
+    echo "SKYRL_QWEN35_ENGINE_START_GATE_DIR requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
+    exit 2
+  fi
+  if [[ ! "$engine_start_gate_timeout_seconds" =~ ^[0-9]{1,4}$ ]] \
+    || ((10#$engine_start_gate_timeout_seconds < 1 \
+      || 10#$engine_start_gate_timeout_seconds > 3600)); then
+    echo "SKYRL_QWEN35_ENGINE_START_GATE_TIMEOUT_SECONDS must be an integer in [1, 3600]." >&2
+    exit 2
+  fi
+  if [[ "$engine_start_gate_dir" != /* || "$engine_start_gate_dir" == */ ]] \
+    || [[ -L "$engine_start_gate_dir" || ! -d "$engine_start_gate_dir" ]] \
+    || [[ "$(cd -P -- "$engine_start_gate_dir" && pwd -P)" \
+      != "$engine_start_gate_dir" ]] \
+    || [[ "$(/usr/bin/stat -c '%u:%a:%F' -- "$engine_start_gate_dir")" \
+      != "$EUID:700:directory" ]]; then
+    echo "SKYRL_QWEN35_ENGINE_START_GATE_DIR must be an absolute canonical, owned mode-0700 directory without symlinks." >&2
+    exit 2
+  fi
+  for engine_start_gate_marker in \
+    "$engine_start_gate_dir/engine-start.ready" \
+    "$engine_start_gate_dir/engine-start.release" \
+    "$engine_start_gate_dir/engine-start.watchdog.telemetry.jsonl" \
+    "$engine_start_gate_dir/engine-start.watchdog.telemetry.jsonl.summary.json"; do
+    if [[ -e "$engine_start_gate_marker" || -L "$engine_start_gate_marker" ]]; then
+      echo "refusing a stale engine-start gate marker: $engine_start_gate_marker" >&2
+      exit 2
+    fi
+  done
+  for engine_start_gate_executable in \
+    /usr/bin/fuser /usr/bin/mv /usr/bin/rm /usr/bin/sleep; do
+    if [[ ! -x "$engine_start_gate_executable" ]]; then
+      echo "refusing engine-start gate because a required executable is unavailable: $engine_start_gate_executable" >&2
+      exit 2
+    fi
+  done
 fi
 
 require_unset_or_exact() {
@@ -242,11 +297,11 @@ if [[ -n "$prewarm_buckets" ]]; then
     exit 2
   fi
 
-  source_index_flags="$("${source_git[@]}" ls-files -v -- rocm/prewarm_qwen35_buckets.py rocm/start_qwen35.sh rocm/verified_source_bootstrap.py 2>&1)" || {
+  source_index_flags="$("${source_git[@]}" ls-files -v -- rocm/prewarm_qwen35_buckets.py rocm/profile_rocm.py rocm/start_qwen35.sh rocm/verified_source_bootstrap.py 2>&1)" || {
     echo "refusing prewarm because runtime-source index flags are unavailable" >&2
     exit 2
   }
-  expected_source_index_flags=$'H rocm/prewarm_qwen35_buckets.py\nH rocm/start_qwen35.sh\nH rocm/verified_source_bootstrap.py'
+  expected_source_index_flags=$'H rocm/prewarm_qwen35_buckets.py\nH rocm/profile_rocm.py\nH rocm/start_qwen35.sh\nH rocm/verified_source_bootstrap.py'
   if [[ "$source_index_flags" != "$expected_source_index_flags" ]]; then
     echo "refusing prewarm because runtime source has assume-unchanged, skip-worktree, or unexpected index state" >&2
     exit 2
@@ -313,18 +368,23 @@ if [[ -n "$prewarm_buckets" ]]; then
   }
   launcher_source_path="$launcher_path"
   prewarm_source_path="$repo/rocm/prewarm_qwen35_buckets.py"
+  profile_source_path="$repo/rocm/profile_rocm.py"
   bootstrap_source_path="$repo/rocm/verified_source_bootstrap.py"
   if ! launcher_source_blob_oid="$(source_blob_oid rocm/start_qwen35.sh 100755)" \
     || ! prewarm_source_blob_oid="$(source_blob_oid rocm/prewarm_qwen35_buckets.py 100644)" \
+    || ! profile_source_blob_oid="$(source_blob_oid rocm/profile_rocm.py 100644)" \
     || ! bootstrap_source_blob_oid="$(source_blob_oid rocm/verified_source_bootstrap.py 100644)" \
     || ! launcher_source_sha256="$(source_sha256 "$launcher_source_path")" \
     || ! prewarm_source_sha256="$(source_sha256 "$prewarm_source_path")" \
+    || ! profile_source_sha256="$(source_sha256 "$profile_source_path")" \
     || ! bootstrap_source_sha256="$(source_sha256 "$bootstrap_source_path")" \
     || ! launcher_blob_sha256="$(source_blob_sha256 "$launcher_source_blob_oid")" \
     || ! prewarm_blob_sha256="$(source_blob_sha256 "$prewarm_source_blob_oid")" \
+    || ! profile_blob_sha256="$(source_blob_sha256 "$profile_source_blob_oid")" \
     || ! bootstrap_blob_sha256="$(source_blob_sha256 "$bootstrap_source_blob_oid")" \
     || [[ "$launcher_source_sha256" != "$launcher_blob_sha256" ]] \
     || [[ "$prewarm_source_sha256" != "$prewarm_blob_sha256" ]] \
+    || [[ "$profile_source_sha256" != "$profile_blob_sha256" ]] \
     || [[ "$bootstrap_source_sha256" != "$bootstrap_blob_sha256" ]]; then
     echo "refusing prewarm because exact runtime source does not match its HEAD blob" >&2
     exit 2
@@ -825,6 +885,507 @@ if [[ -n "$prewarm_buckets" ]]; then
   fi
 fi
 
+engine_start_watchdog_pid=
+engine_start_watchdog_start_ticks=
+engine_start_watchdog_manifest_sha256=
+engine_start_ready_payload=
+engine_start_release_payload=
+if ((engine_start_gate_enabled != 0)); then
+  engine_start_profile_python="$repo/.venv/bin/python"
+  engine_start_profile_source="$repo/rocm/profile_rocm.py"
+  engine_start_profile_sha256="$profile_source_sha256"
+  engine_start_telemetry="$engine_start_gate_dir/engine-start.watchdog.telemetry.jsonl"
+fi
+
+validate_engine_start_gate_directory() {
+  local physical_path
+  local metadata
+  if [[ "$engine_start_gate_dir" != /* || "$engine_start_gate_dir" == */ ]] \
+    || [[ -L "$engine_start_gate_dir" || ! -d "$engine_start_gate_dir" ]]; then
+    return 1
+  fi
+  physical_path="$(cd -P -- "$engine_start_gate_dir" && pwd -P)" || return 1
+  [[ "$physical_path" == "$engine_start_gate_dir" ]] || return 1
+  metadata="$(/usr/bin/stat -c '%u:%a:%F' -- "$engine_start_gate_dir")" \
+    || return 1
+  [[ "$metadata" == "$EUID:700:directory" ]]
+}
+
+read_engine_start_gate_marker() {
+  local marker_path="$1"
+  local expected_size
+  local marker_size
+  local marker_payload
+  local metadata
+  if [[ -L "$marker_path" || ! -f "$marker_path" ]]; then
+    return 1
+  fi
+  metadata="$(/usr/bin/stat -c '%u:%a:%F:%h:%s' -- "$marker_path")" || return 1
+  [[ "$metadata" =~ ^$EUID:600:regular\ file:1:([1-9][0-9]{0,3})$ ]] \
+    || return 1
+  marker_size="${BASH_REMATCH[1]}"
+  ((10#$marker_size <= 2048)) || return 1
+  IFS= read -r marker_payload <"$marker_path" || return 1
+  expected_size=$((${#marker_payload} + 1))
+  [[ "$metadata" == "$EUID:600:regular file:1:$expected_size" ]] || return 1
+  printf '%s' "$marker_payload"
+}
+
+validate_engine_start_gate_marker() {
+  local marker_path="$1"
+  local expected_payload="$2"
+  local marker_payload
+  marker_payload="$(read_engine_start_gate_marker "$marker_path")" || return 1
+  [[ "$marker_payload" == "$expected_payload" ]]
+}
+
+read_watchdog_start_ticks() {
+  local watchdog_pid="$1"
+  local stat_line
+  local stat_rest
+  local -a stat_fields
+  [[ -r "/proc/$watchdog_pid/stat" ]] || return 1
+  stat_line="$(<"/proc/$watchdog_pid/stat")" || return 1
+  [[ "${stat_line%% *}" == "$watchdog_pid" && "$stat_line" == *") "* ]] \
+    || return 1
+  stat_rest="${stat_line##*) }"
+  read -r -a stat_fields <<<"$stat_rest" || return 1
+  ((${#stat_fields[@]} >= 20)) || return 1
+  [[ "${stat_fields[0]}" == R || "${stat_fields[0]}" == S \
+    || "${stat_fields[0]}" == D ]] || return 1
+  [[ "${stat_fields[19]}" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s' "${stat_fields[19]}"
+}
+
+validate_engine_start_watchdog() {
+  local watchdog_pid="$1"
+  local expected_start_ticks="$2"
+  local first_start_ticks
+  local second_start_ticks
+  local status_key
+  local status_value
+  local real_uid=
+  local effective_uid=
+  local saved_uid=
+  local filesystem_uid=
+  local launcher_cgroup
+  local watchdog_cgroup
+
+  [[ "$watchdog_pid" != "$$" && "$watchdog_pid" =~ ^[1-9][0-9]{0,9}$ ]] \
+    || return 1
+  first_start_ticks="$(read_watchdog_start_ticks "$watchdog_pid")" || return 1
+  [[ "$first_start_ticks" == "$expected_start_ticks" ]] || return 1
+  [[ -r "/proc/$watchdog_pid/status" ]] || return 1
+  while IFS=: read -r status_key status_value; do
+    if [[ "$status_key" == Uid ]]; then
+      read -r real_uid effective_uid saved_uid filesystem_uid <<<"$status_value" \
+        || return 1
+      break
+    fi
+  done <"/proc/$watchdog_pid/status"
+  [[ "$real_uid" == "$EUID" && "$effective_uid" == "$EUID" \
+    && "$saved_uid" == "$EUID" && "$filesystem_uid" == "$EUID" ]] \
+    || return 1
+  [[ -r "/proc/$$/cgroup" && -r "/proc/$watchdog_pid/cgroup" ]] || return 1
+  launcher_cgroup="$(<"/proc/$$/cgroup")" || return 1
+  watchdog_cgroup="$(<"/proc/$watchdog_pid/cgroup")" || return 1
+  [[ -n "$launcher_cgroup" && "$watchdog_cgroup" == "$launcher_cgroup" ]] \
+    || return 1
+  second_start_ticks="$(read_watchdog_start_ticks "$watchdog_pid")" || return 1
+  [[ "$second_start_ticks" == "$expected_start_ticks" ]]
+}
+
+validate_engine_start_profiler_evidence() {
+  local watchdog_pid="$1"
+  local watchdog_start_ticks="$2"
+  local watchdog_manifest_sha256="$3"
+  /usr/bin/python3.12 -I -S -B -P - \
+    "$engine_start_telemetry" \
+    "$EUID" \
+    "$watchdog_pid" \
+    "$watchdog_start_ticks" \
+    "$engine_start_profile_source" \
+    "$engine_start_profile_sha256" \
+    "$engine_start_profile_python" \
+    "${amd_card_names[0]}" \
+    "$$" \
+    "$XLA_FLAGS" \
+    "$watchdog_manifest_sha256" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def refuse(message):
+    raise SystemExit(message)
+
+
+def strict_json(payload):
+    def reject_constant(value):
+        refuse(f"non-finite JSON constant: {value}")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                refuse(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            payload,
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        refuse(f"invalid telemetry JSON: {error}")
+
+
+(
+    telemetry_arg,
+    expected_uid_arg,
+    watchdog_pid_arg,
+    watchdog_start_ticks,
+    profile_source_arg,
+    profile_sha256,
+    profile_python_arg,
+    card,
+    server_pid_arg,
+    xla_flags,
+    manifest_sha256,
+) = sys.argv[1:]
+telemetry = Path(telemetry_arg)
+expected_uid = int(expected_uid_arg)
+watchdog_pid = int(watchdog_pid_arg)
+server_pid = int(server_pid_arg)
+profile_source = Path(profile_source_arg)
+profile_python = Path(profile_python_arg)
+
+if telemetry != telemetry.parent / "engine-start.watchdog.telemetry.jsonl":
+    refuse("unexpected watchdog telemetry path")
+try:
+    telemetry_stat = telemetry.lstat()
+except OSError as error:
+    refuse(f"watchdog telemetry is unavailable: {error}")
+if (
+    not stat.S_ISREG(telemetry_stat.st_mode)
+    or stat.S_IMODE(telemetry_stat.st_mode) != 0o600
+    or telemetry_stat.st_uid != expected_uid
+    or telemetry_stat.st_nlink != 1
+):
+    refuse("watchdog telemetry is not a private singly-linked regular file")
+
+flags = os.O_RDONLY | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+try:
+    descriptor = os.open(telemetry, flags)
+except OSError as error:
+    refuse(f"watchdog telemetry could not be opened safely: {error}")
+with os.fdopen(descriptor, "rb") as source:
+    opened_stat = os.fstat(source.fileno())
+    if (opened_stat.st_dev, opened_stat.st_ino) != (
+        telemetry_stat.st_dev,
+        telemetry_stat.st_ino,
+    ):
+        refuse("watchdog telemetry identity changed while opening")
+    first_line = source.readline(65537)
+    if not first_line.endswith(b"\n") or len(first_line) > 65536:
+        refuse("watchdog manifest line is missing or oversized")
+    if hashlib.sha256(first_line).hexdigest() != manifest_sha256:
+        refuse("watchdog manifest digest mismatch")
+    manifest = strict_json(first_line)
+    measured_sample = None
+    for _index in range(256):
+        line = source.readline(262145)
+        if not line:
+            break
+        if not line.endswith(b"\n") or len(line) > 262144:
+            refuse("watchdog sample line is incomplete or oversized")
+        record = strict_json(line)
+        if record.get("record_type") == "sample" and record.get("phase") == "measured":
+            measured_sample = record
+            break
+if measured_sample is None:
+    refuse("watchdog has not durably recorded a measured sample")
+
+try:
+    current_profile_sha256 = hashlib.sha256(profile_source.read_bytes()).hexdigest()
+except OSError as error:
+    refuse(f"profile source is unavailable: {error}")
+if current_profile_sha256 != profile_sha256:
+    refuse("profile source does not match its attested Git blob")
+
+expected_argv = [
+    str(profile_python),
+    "-B",
+    str(profile_source),
+    "--output",
+    str(telemetry),
+    "--card",
+    card,
+    "--interval",
+    "0.1",
+    "--include-pid",
+    f"server={server_pid}",
+    "--terminate-included-on-safety",
+    "--terminate-included-on-abort",
+    "--sensor-grace-seconds",
+    "60",
+    "--max-junction-temp-c",
+    "90",
+    "--max-gpu-power-watts",
+    "400",
+    "--max-vram-gib",
+    "24",
+    "--min-host-available-gib",
+    "0",
+    "--max-swap-gib",
+    "8",
+    "--record-command",
+]
+try:
+    raw_cmdline = Path(f"/proc/{watchdog_pid}/cmdline").read_bytes()
+    observed_argv = [
+        value.decode("utf-8", "strict")
+        for value in raw_cmdline.removesuffix(b"\0").split(b"\0")
+    ]
+    observed_executable = Path(f"/proc/{watchdog_pid}/exe").resolve(strict=True)
+    expected_executable = profile_python.resolve(strict=True)
+    watchdog_cgroup = Path(f"/proc/{watchdog_pid}/cgroup").read_bytes()
+    server_cgroup = Path(f"/proc/{server_pid}/cgroup").read_bytes()
+    raw_environment = Path(f"/proc/{watchdog_pid}/environ").read_bytes()
+    raw_server_environment = Path(f"/proc/{server_pid}/environ").read_bytes()
+except (OSError, UnicodeError) as error:
+    refuse(f"watchdog process evidence is unavailable: {error}")
+if observed_argv != expected_argv or observed_executable != expected_executable:
+    refuse("watchdog command identity is not the exact profile_rocm policy")
+if not watchdog_cgroup or watchdog_cgroup != server_cgroup:
+    refuse("watchdog is outside the server service cgroup")
+watchdog_xla = [
+    item.split(b"=", 1)[1].decode("utf-8", "strict")
+    for item in raw_environment.split(b"\0")
+    if item.startswith(b"XLA_FLAGS=")
+]
+if watchdog_xla != [xla_flags]:
+    refuse("watchdog process does not have the exact XLA policy")
+server_xla = [
+    item.split(b"=", 1)[1].decode("utf-8", "strict")
+    for item in raw_server_environment.split(b"\0")
+    if item.startswith(b"XLA_FLAGS=")
+]
+if server_xla != [xla_flags]:
+    refuse("server process does not have the exact XLA policy")
+
+expected_limits = {
+    "max_junction_temp_c": 90.0,
+    "max_gpu_power_watts": 400.0,
+    "max_vram_bytes": 24 * 1024**3,
+    "min_host_available_bytes": 0,
+    "max_swap_bytes": 8 * 1024**3,
+}
+if manifest.get("record_type") != "manifest":
+    refuse("watchdog first line is not a manifest")
+if (
+    manifest.get("interval_seconds") != 0.1
+    or manifest.get("baseline_seconds") != 0.0
+    or manifest.get("duration_seconds") is not None
+    or manifest.get("timeout_seconds") is not None
+    or manifest.get("sensor_grace_seconds") != 60.0
+    or manifest.get("safety_limits") != expected_limits
+    or manifest.get("terminate_included_on_safety") is not True
+    or manifest.get("terminate_included_on_abort") is not True
+    or manifest.get("command") != []
+    or manifest.get("command_recorded") is not True
+    or manifest.get("passed_file_descriptor_count") != 0
+):
+    refuse("watchdog manifest does not match the exact attach-only safety policy")
+gpu = manifest.get("gpu")
+if not isinstance(gpu, dict) or gpu.get("card") != card or gpu.get("device_id") != "0x744c":
+    refuse("watchdog manifest is bound to a different GPU")
+runtime = manifest.get("runtime")
+if (
+    not isinstance(runtime, dict)
+    or runtime.get("script_sha256") != profile_sha256
+    or not isinstance(runtime.get("accelerator_environment"), dict)
+    or runtime["accelerator_environment"].get("XLA_FLAGS") != xla_flags
+):
+    refuse("watchdog runtime manifest is not exact")
+explicit_processes = manifest.get("explicit_processes")
+if not isinstance(explicit_processes, dict) or set(explicit_processes) != {"server"}:
+    refuse("watchdog manifest does not have exactly one server target")
+server = explicit_processes["server"]
+if (
+    not isinstance(server, dict)
+    or server.get("pid") != server_pid
+    or server.get("unavailable") is not None
+    or not isinstance(server.get("command"), list)
+    or server.get("command") == ["<arguments omitted>"]
+    or not isinstance(server.get("accelerator_environment"), dict)
+    or server["accelerator_environment"].get("XLA_FLAGS") != xla_flags
+):
+    refuse("watchdog manifest is not attached to the exact server process")
+sample_processes = measured_sample.get("processes")
+sample_server = sample_processes.get("server") if isinstance(sample_processes, dict) else None
+if (
+    not isinstance(sample_server, dict)
+    or sample_server.get("root_pid") != server_pid
+    or not isinstance(sample_server.get("process_count"), int)
+    or sample_server["process_count"] < 1
+):
+    refuse("watchdog measured sample does not cover the server process")
+
+# The shell independently validates the live start ticks before and after this
+# check. Keep the release binding in this validator too.
+stat_fields = Path(f"/proc/{watchdog_pid}/stat").read_text().rsplit(") ", 1)[1].split()
+if len(stat_fields) < 20 or stat_fields[19] != watchdog_start_ticks:
+    refuse("watchdog PID start ticks changed during evidence validation")
+PY
+}
+
+revalidate_engine_start_watchdog() {
+  validate_engine_start_gate_directory \
+    && validate_engine_start_gate_marker \
+      "$engine_start_gate_dir/engine-start.ready" "$engine_start_ready_payload" \
+    && validate_engine_start_gate_marker \
+      "$engine_start_gate_dir/engine-start.release" "$engine_start_release_payload" \
+    && validate_engine_start_watchdog \
+      "$engine_start_watchdog_pid" "$engine_start_watchdog_start_ticks" \
+    && validate_engine_start_profiler_evidence \
+      "$engine_start_watchdog_pid" \
+      "$engine_start_watchdog_start_ticks" \
+      "$engine_start_watchdog_manifest_sha256"
+}
+
+require_engine_start_kfd_unowned() {
+  local kfd_owners
+  local fuser_status
+  if kfd_owners="$(/usr/bin/fuser /dev/kfd 2>&1)"; then
+    echo "refusing API start because /dev/kfd is owned after prewarm handoff: $kfd_owners" >&2
+    return 1
+  fi
+  fuser_status=$?
+  if ((fuser_status != 1)) || [[ -n "${kfd_owners//[[:space:]]/}" ]]; then
+    echo "refusing API start because exact /dev/kfd ownership could not be verified" >&2
+    return 1
+  fi
+}
+
+await_engine_start_release() {
+  local boot_id
+  local gate_token
+  local payload
+  local ready_marker="$engine_start_gate_dir/engine-start.ready"
+  local release_marker="$engine_start_gate_dir/engine-start.release"
+  local telemetry_summary="$engine_start_telemetry.summary.json"
+  local marker_path
+  local ready_tmp
+  local release_payload
+  local watchdog_manifest_sha256
+  local watchdog_pid
+  local watchdog_start_ticks
+  local wait_started
+
+  if ! validate_engine_start_gate_directory; then
+    echo "refusing engine-start gate because its directory is no longer private and canonical" >&2
+    return 2
+  fi
+  for marker_path in \
+    "$ready_marker" "$release_marker" "$engine_start_telemetry" "$telemetry_summary"; do
+    if [[ -e "$marker_path" || -L "$marker_path" ]]; then
+      echo "refusing a stale engine-start gate marker: $marker_path" >&2
+      return 2
+    fi
+  done
+  IFS= read -r gate_token </proc/sys/kernel/random/uuid || {
+    echo "refusing engine-start gate because a kernel token is unavailable" >&2
+    return 2
+  }
+  if [[ ! "$gate_token" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    echo "refusing engine-start gate because its kernel token is malformed" >&2
+    return 2
+  fi
+  IFS= read -r boot_id </proc/sys/kernel/random/boot_id || {
+    echo "refusing engine-start gate because the current boot ID is unavailable" >&2
+    return 2
+  }
+  if [[ ! "$boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || [[ ! "$prewarm_audit_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ ! "$prewarm_handoff_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing engine-start gate because its runtime identity is malformed" >&2
+    return 2
+  fi
+  payload="skyrl-qwen35-engine-start-ready-v1 nonce=$gate_token launcher_pid=$$ boot_id=$boot_id run_id=$run_id fused=$bf16_rms_gate_up_lora_swiglu_contiguous prewarm_sha256=$prewarm_audit_sha256 handoff_sha256=$prewarm_handoff_sha256"
+  ready_tmp="$engine_start_gate_dir/.engine-start.ready.$gate_token.tmp"
+  if [[ -e "$ready_tmp" || -L "$ready_tmp" ]] \
+    || ! (set -o noclobber; printf '%s\n' "$payload" >"$ready_tmp") \
+    || ! /usr/bin/chmod 600 -- "$ready_tmp" \
+    || ! validate_engine_start_gate_marker "$ready_tmp" "$payload"; then
+    /usr/bin/rm -f -- "$ready_tmp"
+    echo "refusing engine-start gate because its ready marker could not be staged" >&2
+    return 2
+  fi
+  if ! /usr/bin/mv --no-clobber --no-target-directory \
+      "$ready_tmp" "$ready_marker" \
+    || [[ -e "$ready_tmp" || -L "$ready_tmp" ]] \
+    || ! validate_engine_start_gate_marker "$ready_marker" "$payload"; then
+    /usr/bin/rm -f -- "$ready_tmp"
+    echo "refusing engine-start gate because its ready marker could not be published atomically" >&2
+    return 2
+  fi
+
+  wait_started=$SECONDS
+  while true; do
+    if [[ -e "$release_marker" || -L "$release_marker" ]]; then
+      if ! validate_engine_start_gate_directory \
+        || ! validate_engine_start_gate_marker "$ready_marker" "$payload" \
+        || ! release_payload="$(read_engine_start_gate_marker "$release_marker")" \
+        || [[ ! "$release_payload" =~ ^skyrl-qwen35-engine-start-release-v1\ nonce=([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\ launcher_pid=([1-9][0-9]{0,9})\ boot_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\ run_id=([A-Za-z0-9][A-Za-z0-9._-]*)\ fused=([01])\ prewarm_sha256=([0-9a-f]{64})\ handoff_sha256=([0-9a-f]{64})\ watchdog_pid=([1-9][0-9]{0,9})\ watchdog_start_ticks=([1-9][0-9]*)\ watchdog_manifest_sha256=([0-9a-f]{64})$ ]]; then
+        echo "refusing an invalid engine-start release marker" >&2
+        return 2
+      fi
+      if [[ "${BASH_REMATCH[1]}" != "$gate_token" \
+        || "${BASH_REMATCH[2]}" != "$$" \
+        || "${BASH_REMATCH[3]}" != "$boot_id" \
+        || "${BASH_REMATCH[4]}" != "$run_id" \
+        || "${BASH_REMATCH[5]}" != "$bf16_rms_gate_up_lora_swiglu_contiguous" \
+        || "${BASH_REMATCH[6]}" != "$prewarm_audit_sha256" \
+        || "${BASH_REMATCH[7]}" != "$prewarm_handoff_sha256" ]]; then
+        echo "refusing an engine-start release marker bound to different runtime evidence" >&2
+        return 2
+      fi
+      watchdog_pid="${BASH_REMATCH[8]}"
+      watchdog_start_ticks="${BASH_REMATCH[9]}"
+      watchdog_manifest_sha256="${BASH_REMATCH[10]}"
+      if [[ ! "$watchdog_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        || ! validate_engine_start_watchdog \
+          "$watchdog_pid" "$watchdog_start_ticks" \
+        || ! validate_engine_start_profiler_evidence \
+          "$watchdog_pid" \
+          "$watchdog_start_ticks" \
+          "$watchdog_manifest_sha256"; then
+        echo "refusing an engine-start release marker without a live owned watchdog" >&2
+        return 2
+      fi
+      engine_start_watchdog_pid="$watchdog_pid"
+      engine_start_watchdog_start_ticks="$watchdog_start_ticks"
+      engine_start_watchdog_manifest_sha256="$watchdog_manifest_sha256"
+      engine_start_ready_payload="$payload"
+      engine_start_release_payload="$release_payload"
+      return 0
+    fi
+    if ((SECONDS - wait_started >= 10#$engine_start_gate_timeout_seconds)); then
+      echo "timed out waiting for the engine-start release marker" >&2
+      return 2
+    fi
+    /usr/bin/sleep 0.1
+  done
+}
+
 # Default-off, compile-only static-bucket prewarm. This populates the trusted
 # persistent cache before the API starts, but never invokes a compiled model
 # pass or optimizer step. ROCm compilation may still run bounded autotuning.
@@ -1083,6 +1644,26 @@ unset SKYRL_VERIFIED_SOURCE_SNAPSHOT_ROOT
 if [[ "$prewarm_only" == "1" ]]; then
   trap - EXIT INT TERM
   exit 0
+fi
+
+if ((engine_start_gate_enabled != 0)); then
+  await_engine_start_release
+  if ! run_amdgpu_safety >/dev/null; then
+    echo "refusing API start because the post-release AMDGPU boot-journal gate failed" >&2
+    exit 2
+  fi
+  if ! require_engine_start_kfd_unowned; then
+    exit 2
+  fi
+fi
+unset SKYRL_QWEN35_ENGINE_START_GATE_DIR
+unset SKYRL_QWEN35_ENGINE_START_GATE_TIMEOUT_SECONDS
+
+if ((engine_start_gate_enabled != 0)); then
+  if ! revalidate_engine_start_watchdog; then
+    echo "refusing API start because the engine-start watchdog did not survive final safety checks" >&2
+    exit 2
+  fi
 fi
 
 trap - EXIT INT TERM
