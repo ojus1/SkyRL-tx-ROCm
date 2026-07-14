@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
@@ -8,6 +9,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -25,11 +27,43 @@ def _valid_errors() -> dict:
         "finite": True,
     }
     return {
+        "forward_output": dict(common),
         "output": dict(common),
         "dx": dict(common),
         "d_lora_a": dict(common),
         "d_lora_b": dict(common),
     }
+
+
+_NUMERICS_RESULT_SHAPES = (
+    (1, 64, 9216),
+    (1, 64, 2560),
+    (2560, 8),
+    (8, 18432),
+)
+
+
+def _host_bf16_arguments() -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
+    forward_arguments = tuple(np.zeros((1,), dtype=bfloat16) for _ in range(6))
+    cotangent = np.zeros((1,), dtype=bfloat16)
+    return (*forward_arguments, cotangent), forward_arguments
+
+
+def _numerics_result_tree(value: float = 1.0) -> tuple[np.ndarray, ...]:
+    return tuple(
+        np.full(shape, value, dtype=bfloat16) for shape in _NUMERICS_RESULT_SHAPES
+    )
+
+
+def _mock_host_input_manifest(
+    forward_arguments: tuple[object, ...], step_arguments: tuple[object, ...]
+) -> dict[str, object]:
+    assert len(forward_arguments) == 6
+    assert len(step_arguments) == 7
+    assert all(left is right for left, right in zip(forward_arguments, step_arguments))
+    assert all(type(argument) is np.ndarray for argument in step_arguments)
+    assert all(argument.dtype == bfloat16 for argument in step_arguments)
+    return {"test_host_bfloat16_inputs": True}
 
 
 def _clear_accelerator_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,9 +146,38 @@ def test_exact_contract_fixes_geometry_target_limits_capture_and_gates() -> None
             "requires_finite_host_output": True,
             "performance_qualification": False,
         },
+        "numerics_once": {
+            "compiled_programs": [
+                "reference_forward",
+                "candidate_forward",
+                "reference_forward_and_vjp",
+                "candidate_forward_and_vjp",
+            ],
+            "program_order": [
+                "reference_forward",
+                "candidate_forward",
+                "reference_forward_and_vjp",
+                "candidate_forward_and_vjp",
+            ],
+            "executable_invocations_per_program": 1,
+            "watchdog_seconds_per_program": 5.0,
+            "requires_host_bfloat16_inputs": True,
+            "requires_readonly_host_inputs": True,
+            "requires_post_dispatch_input_rehash": True,
+            "requires_exact_clean_compile_evidence": True,
+            "requires_completed_compile_profile_summary": True,
+            "requires_cgroup_wide_timeout_kill": True,
+            "relative_l2_limit_exclusive": 0.03,
+            "output_cosine_limit_inclusive": 0.9999,
+            "gradient_cosine_similarity_report_only": True,
+            "warmups": 0,
+            "iterations": 0,
+            "performance_qualification": False,
+        },
         "execute_gates": {
             "relative_l2_limit_exclusive": 0.03,
             "output_cosine_limit_inclusive": 0.9999,
+            "gradient_cosine_similarity_report_only": True,
             "minimum_forward_and_vjp_speedup": 1.10,
             "minimum_rematerialized_stage_speedup": 1.15,
             "deterministic_repeat_required": True,
@@ -126,17 +189,19 @@ def test_exact_contract_fixes_geometry_target_limits_capture_and_gates() -> None
 def test_numerics_gate_uses_exclusive_three_percent_for_every_result() -> None:
     assert probe._numerics_gate_passed(_valid_errors())
 
-    for name in ("output", "dx", "d_lora_a", "d_lora_b"):
+    for name in ("forward_output", "output", "dx", "d_lora_a", "d_lora_b"):
         errors = _valid_errors()
         errors[name]["relative_l2"] = 0.03
         assert not probe._numerics_gate_passed(errors)
 
-    output_cosine = _valid_errors()
-    output_cosine["output"]["cosine_similarity"] = 0.9998
-    assert not probe._numerics_gate_passed(output_cosine)
+    for name in ("forward_output", "output"):
+        output_cosine = _valid_errors()
+        output_cosine[name]["cosine_similarity"] = 0.9998
+        assert not probe._numerics_gate_passed(output_cosine)
 
     gradient_cosine_is_report_only = _valid_errors()
-    gradient_cosine_is_report_only["dx"]["cosine_similarity"] = 0.0
+    for name in ("dx", "d_lora_a", "d_lora_b"):
+        gradient_cosine_is_report_only[name]["cosine_similarity"] = -1.0
     assert probe._numerics_gate_passed(gradient_cosine_is_report_only)
 
     nonfinite = _valid_errors()
@@ -206,7 +271,7 @@ def test_parser_requires_double_ack_and_exact_production_geometry(
             )
 
 
-def test_parser_keeps_execute_sampling_floor_but_compile_only_runs_zero_samples(
+def test_parser_allows_zero_compile_samples_but_rejects_unguarded_execute(
     tmp_path: Path,
 ) -> None:
     output = (tmp_path / "probe.jsonl").resolve()
@@ -224,15 +289,8 @@ def test_parser_keeps_execute_sampling_floor_but_compile_only_runs_zero_samples(
     )
     assert (compile_args.warmups, compile_args.iterations) == (0, 0)
 
-    execute_args = probe._parse_args(
-        ["--allow-gpu", "--execute", "--output", str(output)]
-    )
-    assert (execute_args.warmups, execute_args.iterations) == (3, 11)
-    for flag, value in (("--warmups", "2"), ("--iterations", "10")):
-        with pytest.raises(SystemExit):
-            probe._parse_args(
-                ["--allow-gpu", "--execute", "--output", str(output), flag, value]
-            )
+    with pytest.raises(SystemExit):
+        probe._parse_args(["--allow-gpu", "--execute", "--output", str(output)])
 
 
 def test_parser_requires_exact_guarded_forward_once_contract(tmp_path: Path) -> None:
@@ -317,6 +375,68 @@ def test_parser_requires_exact_guarded_forward_once_contract(tmp_path: Path) -> 
     del missing_summary[summary_index : summary_index + 2]
     with pytest.raises(SystemExit):
         probe._parse_args(missing_summary)
+
+
+def test_parser_requires_exact_guarded_numerics_once_contract(tmp_path: Path) -> None:
+    output = (tmp_path / "probe.jsonl").resolve()
+    progress = (tmp_path / "progress.jsonl").resolve()
+    evidence = (tmp_path / "compile.jsonl").resolve()
+    profile_summary = (tmp_path / "telemetry.jsonl.summary.json").resolve()
+    evidence.write_text("{}\n")
+    profile_summary.write_text("{}\n")
+    base = [
+        "--allow-gpu",
+        "--numerics-once",
+        "--output",
+        str(output),
+        "--progress-output",
+        str(progress),
+        "--compile-evidence",
+        str(evidence),
+        "--compile-profile-summary",
+        str(profile_summary),
+        "--warmups",
+        "0",
+        "--iterations",
+        "0",
+    ]
+    args = probe._parse_args(base)
+    assert args.mode == "numerics_once"
+    assert args.progress_output == progress
+    assert args.compile_evidence == evidence
+    assert args.compile_profile_summary == profile_summary
+    assert (args.block_m, args.block_n, args.block_k) == (16, 32, 64)
+    assert (args.warmups, args.iterations) == (0, 0)
+
+    for mutation in (
+        ["--block-m", "32"],
+        ["--block-n", "16"],
+        ["--block-k", "32"],
+        ["--warmups", "1"],
+        ["--iterations", "1"],
+    ):
+        with pytest.raises(SystemExit):
+            probe._parse_args([*base, *mutation])
+
+    for required_flag in (
+        "--progress-output",
+        "--compile-evidence",
+        "--compile-profile-summary",
+    ):
+        missing = list(base)
+        index = missing.index(required_flag)
+        del missing[index : index + 2]
+        with pytest.raises(SystemExit):
+            probe._parse_args(missing)
+
+    relative_progress = list(base)
+    relative_progress[relative_progress.index(str(progress))] = "progress.jsonl"
+    with pytest.raises(SystemExit):
+        probe._parse_args(relative_progress)
+
+    progress.write_text("occupied\n")
+    with pytest.raises(SystemExit):
+        probe._parse_args(base)
 
 
 def test_parser_rejects_unsupported_or_nondivisible_tiles(tmp_path: Path) -> None:
@@ -416,6 +536,7 @@ def test_compile_evidence_is_exactly_source_git_and_zero_invocations_bound(
         "jaxlib": "test",
         "jax-rocm7-pjrt": "test",
         "jax-rocm7-plugin": "test",
+        "ml_dtypes": "test",
         "numpy": "test",
     }
     compilation = {
@@ -474,6 +595,13 @@ def test_compile_evidence_is_exactly_source_git_and_zero_invocations_bound(
             "profiler_parent": {
                 "validated": True,
                 "limits": dict(probe._EXACT_PROFILE_LIMITS),
+                "parent_command_python": str(Path(sys.executable).absolute()),
+                "profiler_path": source["profiler"]["path"],
+                "profiler_sha256": source["profiler"]["sha256"],
+                "timeout_seconds": 600.0,
+                "interval_seconds": 0.05,
+                "baseline_seconds": 5.0,
+                "sensor_grace_seconds": 15.0,
             },
         },
         "postflight": {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
@@ -544,7 +672,76 @@ def test_compile_profile_summary_must_complete_with_observed_safe_limits(
     os.utime(evidence, ns=(evidence_time, evidence_time))
     evidence_manifest = {
         "mtime_ns": evidence_time,
+        "profile_binding": {
+            "python_command": "/repo/.venv/bin/python",
+            "profiler_path": "/repo/profile_rocm.py",
+            "profiler_sha256": "f" * 64,
+            "probe_path": "/repo/probe_bf16_rms_gate_up_lora_swiglu.py",
+            "timeout_seconds": 600.0,
+            "interval_seconds": 0.05,
+            "baseline_seconds": 5.0,
+            "sensor_grace_seconds": 15.0,
+        },
     }
+    telemetry_path = tmp_path / "telemetry.jsonl"
+    telemetry_manifest = {
+        "record_type": "manifest",
+        "interval_seconds": 0.05,
+        "baseline_seconds": 5.0,
+        "duration_seconds": None,
+        "timeout_seconds": 600.0,
+        "safety_limits": {
+            "max_junction_temp_c": 90.0,
+            "max_gpu_power_watts": 400.0,
+            "max_vram_bytes": 24.0 * 1024**3,
+            "min_host_available_bytes": 0.0,
+            "max_swap_bytes": 8.0 * 1024**3,
+        },
+        "sensor_grace_seconds": 15.0,
+        "terminate_included_on_safety": False,
+        "gpu": {
+            "card": "card1",
+            "vendor_id": "0x1002",
+            "device_id": "0x744c",
+        },
+        "runtime": {
+            "script_sha256": "f" * 64,
+            "accelerator_environment": {
+                "HIP_VISIBLE_DEVICES": "0",
+                "JAX_PLATFORMS": "rocm",
+                "XLA_FLAGS": "--xla_gpu_enable_command_buffer=",
+            },
+        },
+        "command": [
+            "/repo/.venv/bin/python",
+            "/repo/probe_bf16_rms_gate_up_lora_swiglu.py",
+            "--allow-gpu",
+            "--compile-only",
+            "--output",
+            str(evidence),
+            "--block-m",
+            "16",
+            "--block-n",
+            "32",
+            "--block-k",
+            "64",
+            "--warmups",
+            "0",
+            "--iterations",
+            "0",
+        ],
+        "command_recorded": True,
+        "passed_file_descriptor_count": 0,
+    }
+    telemetry_records = [telemetry_manifest] + [
+        {"record_type": "sample", "ordinal": index} for index in range(31)
+    ]
+    telemetry_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in telemetry_records)
+    )
+    telemetry_path.chmod(0o600)
+    telemetry_time = evidence_time + 500_000
+    os.utime(telemetry_path, ns=(telemetry_time, telemetry_time))
     summary_path = tmp_path / "telemetry.jsonl.summary.json"
     summary = {
         "record_type": "summary",
@@ -575,6 +772,8 @@ def test_compile_profile_summary_must_complete_with_observed_safe_limits(
     assert manifest["status"] == "completed"
     assert manifest["returncode"] == 0
     assert manifest["observed_maxima"]["gpu_power_watts"] == 200.0
+    assert manifest["telemetry"]["record_count"] == 32
+    assert manifest["telemetry"]["evidence_output_path"] == str(evidence)
 
     summary["metrics"]["gpu_power_watts"]["measured_max"] = 400.1
     summary_path.unlink()
@@ -799,6 +998,393 @@ def test_forward_once_plan_and_workload_run_only_one_candidate_forward(
     assert all(record["wall_time_ns"] > 0 for record in records)
     assert all(record["monotonic_time_ns"] > 0 for record in records)
     assert stat.S_IMODE(progress.stat().st_mode) == 0o600
+
+
+def test_numerics_once_plan_and_workload_run_exact_guarded_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    markers = {
+        "reference_forward_and_vjp": object(),
+        "candidate_forward_and_vjp": object(),
+        "reference_forward": object(),
+        "candidate_forward": object(),
+    }
+    step_arguments, forward_arguments = _host_bf16_arguments()
+    plan = probe._compilation_plan(
+        mode="numerics_once",
+        reference_step=markers["reference_forward_and_vjp"],
+        candidate_step=markers["candidate_forward_and_vjp"],
+        reference_forward=markers["reference_forward"],
+        candidate_forward=markers["candidate_forward"],
+        step_arguments=step_arguments,
+        forward_arguments=forward_arguments,
+    )
+    assert list(plan) == [
+        "reference_forward",
+        "candidate_forward",
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+    ]
+    assert plan == {
+        "reference_forward": (markers["reference_forward"], forward_arguments),
+        "candidate_forward": (markers["candidate_forward"], forward_arguments),
+        "reference_forward_and_vjp": (
+            markers["reference_forward_and_vjp"],
+            step_arguments,
+        ),
+        "candidate_forward_and_vjp": (
+            markers["candidate_forward_and_vjp"],
+            step_arguments,
+        ),
+    }
+
+    result_tree = _numerics_result_tree()
+    calls: list[str] = []
+
+    class Executable:
+        def __init__(self, name: str, result: object):
+            self.name = name
+            self.result = result
+
+        def __call__(self, *arguments):
+            calls.append(self.name)
+            expected_count = 7 if self.name.endswith("and_vjp") else 6
+            assert len(arguments) == expected_count
+            assert all(type(argument) is np.ndarray for argument in arguments)
+            assert all(argument.dtype == bfloat16 for argument in arguments)
+            return self.result
+
+    executables = {
+        "reference_forward": Executable("reference_forward", result_tree[0]),
+        "candidate_forward": Executable("candidate_forward", result_tree[0]),
+        "reference_forward_and_vjp": Executable(
+            "reference_forward_and_vjp", result_tree
+        ),
+        "candidate_forward_and_vjp": Executable(
+            "candidate_forward_and_vjp", result_tree
+        ),
+    }
+    watchdogs: list[dict[str, object]] = []
+    watchdog_events: list[tuple[str, int, bool | None]] = []
+
+    def start_watchdog(_cgroup_kill_fd):
+        identifier = len(watchdogs)
+        state: dict[str, object] = {
+            "identifier": identifier,
+            "arm_sent": False,
+            "armed": False,
+            "settled": False,
+            "cgroup_wide_timeout_kill": True,
+            "timeout_seconds": 5.0,
+        }
+        watchdogs.append(state)
+        watchdog_events.append(("started", identifier, None))
+        return state
+
+    def arm_watchdog(state):
+        identifier = int(state["identifier"])
+        armed_monotonic_ns = time.monotonic_ns()
+        state.update(
+            {
+                "arm_sent": True,
+                "armed": True,
+                "armed_monotonic_ns": armed_monotonic_ns,
+                "deadline_monotonic_ns": armed_monotonic_ns + 5_000_000_000,
+                "armed_ack_received_monotonic_ns": armed_monotonic_ns + 1,
+            }
+        )
+        watchdog_events.append(("armed", identifier, None))
+
+    def settle_watchdog(state, *, invocation_completed):
+        identifier = int(state["identifier"])
+        assert state["settled"] is False
+        state["settled"] = True
+        watchdog_events.append(("settled", identifier, invocation_completed))
+
+    monkeypatch.setattr(probe, "_start_forward_once_watchdog", start_watchdog)
+    monkeypatch.setattr(probe, "_arm_forward_once_watchdog", arm_watchdog)
+    monkeypatch.setattr(probe, "_settle_forward_once_watchdog", settle_watchdog)
+    monkeypatch.setattr(probe, "_block_tree", lambda value: value)
+    monkeypatch.setattr(probe, "_host_input_manifest", _mock_host_input_manifest)
+    progress = tmp_path / "numerics-progress.jsonl"
+    kill_path = tmp_path / "cgroup.kill"
+    kill_path.touch()
+    kill_fd = os.open(kill_path, os.O_WRONLY)
+    try:
+        result = probe._run_numerics_once_workload(
+            executables=executables,
+            step_arguments=step_arguments,
+            forward_arguments=forward_arguments,
+            progress_output=progress,
+            binding={"test": "exact-guarded-numerics-order"},
+            cgroup_kill_fd=kill_fd,
+        )
+    finally:
+        os.close(kill_fd)
+
+    expected_order = [
+        "reference_forward",
+        "candidate_forward",
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+    ]
+    assert calls == expected_order
+    assert len({id(watchdog) for watchdog in watchdogs}) == 4
+    assert watchdog_events == [
+        (event, identifier, completed)
+        for identifier in range(4)
+        for event, completed in (
+            ("started", None),
+            ("armed", None),
+            ("settled", True),
+        )
+    ]
+    exact_once = dict.fromkeys(
+        (
+            "reference_forward",
+            "candidate_forward",
+            "reference_forward_and_vjp",
+            "candidate_forward_and_vjp",
+        ),
+        1,
+    )
+    assert result["invocation_counts"] == exact_once
+    assert result["invocation_completion_counts"] == exact_once
+    assert result["host_inputs_unchanged"] is True
+    assert set(result["errors"]) == set(_valid_errors())
+    for manifest in result["errors"].values():
+        assert manifest["relative_l2"] == 0.0
+        assert manifest["cosine_similarity"] == pytest.approx(1.0, abs=1e-12)
+        assert manifest["max_absolute"] == 0.0
+        assert manifest["finite"] is True
+    assert result["numerics_passed"] is True
+    assert result["progress"]["record_count"] == 10
+    assert result["progress"]["protocol"] == "durable_fsync_jsonl_v1"
+    raw_progress = progress.read_bytes()
+    assert result["progress"]["bytes"] == len(raw_progress)
+    assert result["progress"]["sha256"] == hashlib.sha256(raw_progress).hexdigest()
+    assert stat.S_IMODE(progress.stat().st_mode) == 0o600
+
+    records = [json.loads(line) for line in raw_progress.splitlines()]
+    assert [record["event"] for record in records] == [
+        "host_inputs_ready",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+        "dispatch_completed",
+        "numerics_completed",
+    ]
+    dispatch_records = [
+        record
+        for record in records
+        if record["event"] in ("dispatch_started", "dispatch_completed")
+    ]
+    assert [record["program"] for record in dispatch_records] == [
+        program for program in expected_order for _ in range(2)
+    ]
+    assert records[0]["host_inputs"] == {"test_host_bfloat16_inputs": True}
+    assert records[-1]["passed"] is True
+    assert records[-1]["errors"] == result["errors"]
+    assert all(record["wall_time_ns"] > 0 for record in records)
+    assert all(record["monotonic_time_ns"] > 0 for record in records)
+
+
+@pytest.mark.parametrize("invalid_kind", ("shape", "dtype", "nonfinite"))
+def test_numerics_once_invalid_candidate_forward_tree_never_completes_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    step_arguments, forward_arguments = _host_bf16_arguments()
+    valid_tree = _numerics_result_tree()
+    if invalid_kind == "shape":
+        invalid = np.ones((1, 64, 9215), dtype=bfloat16)
+    elif invalid_kind == "dtype":
+        invalid = np.ones(_NUMERICS_RESULT_SHAPES[0], dtype=np.float32)
+    else:
+        invalid = np.full(_NUMERICS_RESULT_SHAPES[0], np.nan, dtype=bfloat16)
+
+    executables = {
+        "reference_forward": lambda *_arguments: valid_tree[0],
+        "candidate_forward": lambda *_arguments: invalid,
+        "reference_forward_and_vjp": lambda *_arguments: valid_tree,
+        "candidate_forward_and_vjp": lambda *_arguments: valid_tree,
+    }
+    completions: list[bool] = []
+    watchdog_identifier = 0
+
+    def start_watchdog(_cgroup_kill_fd):
+        nonlocal watchdog_identifier
+        watchdog_identifier += 1
+        return {
+            "identifier": watchdog_identifier,
+            "arm_sent": False,
+            "armed": False,
+            "settled": False,
+            "cgroup_wide_timeout_kill": True,
+            "timeout_seconds": 5.0,
+        }
+
+    def arm_watchdog(state):
+        armed_monotonic_ns = time.monotonic_ns()
+        state.update(
+            {
+                "arm_sent": True,
+                "armed": True,
+                "armed_monotonic_ns": armed_monotonic_ns,
+                "deadline_monotonic_ns": armed_monotonic_ns + 5_000_000_000,
+                "armed_ack_received_monotonic_ns": armed_monotonic_ns + 1,
+            }
+        )
+
+    def settle_watchdog(state, *, invocation_completed):
+        assert state["settled"] is False
+        state["settled"] = True
+        completions.append(invocation_completed)
+
+    monkeypatch.setattr(probe, "_start_forward_once_watchdog", start_watchdog)
+    monkeypatch.setattr(probe, "_arm_forward_once_watchdog", arm_watchdog)
+    monkeypatch.setattr(probe, "_settle_forward_once_watchdog", settle_watchdog)
+    monkeypatch.setattr(probe, "_block_tree", lambda value: value)
+    monkeypatch.setattr(probe, "_host_input_manifest", _mock_host_input_manifest)
+    progress = tmp_path / f"invalid-{invalid_kind}.jsonl"
+    kill_path = tmp_path / "cgroup.kill"
+    kill_path.touch()
+    kill_fd = os.open(kill_path, os.O_WRONLY)
+    expected_error = {
+        "shape": "shape=",
+        "dtype": "dtype=",
+        "nonfinite": "nonfinite",
+    }[invalid_kind]
+    try:
+        with pytest.raises(RuntimeError, match=expected_error):
+            probe._run_numerics_once_workload(
+                executables=executables,
+                step_arguments=step_arguments,
+                forward_arguments=forward_arguments,
+                progress_output=progress,
+                binding={"test": invalid_kind},
+                cgroup_kill_fd=kill_fd,
+            )
+    finally:
+        os.close(kill_fd)
+
+    assert completions == [True, False]
+    records = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [record["event"] for record in records] == [
+        "host_inputs_ready",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+    ]
+    assert records[-1]["program"] == "candidate_forward"
+    assert records[-1]["invocation_attempt_counts"]["candidate_forward"] == 1
+    assert records[-1]["invocation_completion_counts"]["candidate_forward"] == 0
+
+
+def test_numerics_once_executable_exception_never_signals_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    step_arguments, forward_arguments = _host_bf16_arguments()
+    valid_tree = _numerics_result_tree()
+    calls: list[str] = []
+
+    def result(name: str, value: object):
+        def executable(*_arguments):
+            calls.append(name)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        return executable
+
+    executables = {
+        "reference_forward": result("reference_forward", valid_tree[0]),
+        "candidate_forward": result("candidate_forward", valid_tree[0]),
+        "reference_forward_and_vjp": result("reference_forward_and_vjp", valid_tree),
+        "candidate_forward_and_vjp": result(
+            "candidate_forward_and_vjp",
+            RuntimeError("synthetic candidate VJP failure"),
+        ),
+    }
+    completions: list[bool] = []
+    watchdog_identifier = 0
+
+    def start_watchdog(_cgroup_kill_fd):
+        nonlocal watchdog_identifier
+        watchdog_identifier += 1
+        return {
+            "identifier": watchdog_identifier,
+            "arm_sent": False,
+            "armed": False,
+            "settled": False,
+            "cgroup_wide_timeout_kill": True,
+            "timeout_seconds": 5.0,
+        }
+
+    def arm_watchdog(state):
+        armed_monotonic_ns = time.monotonic_ns()
+        state.update(
+            {
+                "arm_sent": True,
+                "armed": True,
+                "armed_monotonic_ns": armed_monotonic_ns,
+                "deadline_monotonic_ns": armed_monotonic_ns + 5_000_000_000,
+                "armed_ack_received_monotonic_ns": armed_monotonic_ns + 1,
+            }
+        )
+
+    def settle_watchdog(state, *, invocation_completed):
+        assert state["settled"] is False
+        state["settled"] = True
+        completions.append(invocation_completed)
+
+    monkeypatch.setattr(probe, "_start_forward_once_watchdog", start_watchdog)
+    monkeypatch.setattr(probe, "_arm_forward_once_watchdog", arm_watchdog)
+    monkeypatch.setattr(probe, "_settle_forward_once_watchdog", settle_watchdog)
+    monkeypatch.setattr(probe, "_block_tree", lambda value: value)
+    monkeypatch.setattr(probe, "_host_input_manifest", _mock_host_input_manifest)
+    progress = tmp_path / "exception-progress.jsonl"
+    kill_path = tmp_path / "cgroup.kill"
+    kill_path.touch()
+    kill_fd = os.open(kill_path, os.O_WRONLY)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic candidate VJP failure"):
+            probe._run_numerics_once_workload(
+                executables=executables,
+                step_arguments=step_arguments,
+                forward_arguments=forward_arguments,
+                progress_output=progress,
+                binding={"test": "exception-is-not-completion"},
+                cgroup_kill_fd=kill_fd,
+            )
+    finally:
+        os.close(kill_fd)
+
+    assert calls == [
+        "reference_forward",
+        "candidate_forward",
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+    ]
+    assert completions == [True, True, True, False]
+    records = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [record["event"] for record in records] == [
+        "host_inputs_ready",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+        "dispatch_completed",
+        "dispatch_started",
+    ]
+    assert records[-1]["program"] == "candidate_forward_and_vjp"
+    assert records[-1]["invocation_completion_counts"]["candidate_forward_and_vjp"] == 0
 
 
 def test_real_forward_once_watchdog_deadline_exists_before_armed_ack(

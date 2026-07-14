@@ -1,10 +1,12 @@
 """Guarded gfx1100 gate for the BF16 RMS + gate/up LoRA + SwiGLU stage.
 
 The compile-only mode proves that the exact production forward and
-forward-plus-VJP programs compile without invoking either executable.  The
-execute mode is a separate, explicit qualification rung that checks numerical
-agreement, determinism, and isolated-stage speed.  Neither mode authorizes
-default model enablement; that still requires a separate end-to-end gate.
+forward-plus-VJP programs compile without invoking either executable.
+Forward-once proves candidate liveness, while numerics-once performs exactly
+one guarded reference/candidate forward and VJP comparison.  The legacy
+multi-call execute mode remains disabled until it has per-dispatch containment.
+No mode authorizes default model enablement; that still requires a separate
+end-to-end gate.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from ml_dtypes import bfloat16
 
 _DISABLE_COMMAND_BUFFERS = "--xla_gpu_enable_command_buffer="
 _EXACT_GEOMETRY = (1, 64, 64, 2560, 18432, 9216, 8)
@@ -41,10 +44,29 @@ _MIN_FORWARD_VJP_SPEEDUP = 1.10
 _MIN_REMATERIALIZED_STAGE_SPEEDUP = 1.15
 _FORWARD_ONCE_WATCHDOG_SECONDS = 5.0
 _FORWARD_ONCE_OUTPUT_SHAPE = (1, 64, 9216)
-_FORWARD_ONCE_SCOPE_PATTERN = (
-    r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
-    r"(skyrl-bf16-forward-[0-9]+-[0-9a-f]+\.scope)"
+_PROGRAM_ORDER = (
+    "reference_forward",
+    "candidate_forward",
+    "reference_forward_and_vjp",
+    "candidate_forward_and_vjp",
 )
+_FORWARD_RESULT_SPECS = (("output", (1, 64, 9216)),)
+_STEP_RESULT_SPECS = (
+    ("output", (1, 64, 9216)),
+    ("dx", (1, 64, 2560)),
+    ("d_lora_a", (2560, 8)),
+    ("d_lora_b", (8, 18432)),
+)
+_GUARDED_SCOPE_PATTERNS = {
+    "forward_once": (
+        r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
+        r"(skyrl-bf16-forward-[0-9]+-[0-9a-f]+\.scope)"
+    ),
+    "numerics_once": (
+        r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
+        r"(skyrl-bf16-numerics-[0-9]+-[0-9a-f]+\.scope)"
+    ),
+}
 _EXACT_PROFILE_LIMITS = {
     "--max-junction-temp-c": 90.0,
     "--max-gpu-power-watts": 400.0,
@@ -101,9 +123,28 @@ def _exact_contract() -> dict[str, Any]:
             "requires_finite_host_output": True,
             "performance_qualification": False,
         },
+        "numerics_once": {
+            "compiled_programs": list(_PROGRAM_ORDER),
+            "program_order": list(_PROGRAM_ORDER),
+            "executable_invocations_per_program": 1,
+            "watchdog_seconds_per_program": _FORWARD_ONCE_WATCHDOG_SECONDS,
+            "requires_host_bfloat16_inputs": True,
+            "requires_readonly_host_inputs": True,
+            "requires_post_dispatch_input_rehash": True,
+            "requires_exact_clean_compile_evidence": True,
+            "requires_completed_compile_profile_summary": True,
+            "requires_cgroup_wide_timeout_kill": True,
+            "relative_l2_limit_exclusive": _RELATIVE_L2_LIMIT,
+            "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
+            "gradient_cosine_similarity_report_only": True,
+            "warmups": 0,
+            "iterations": 0,
+            "performance_qualification": False,
+        },
         "execute_gates": {
             "relative_l2_limit_exclusive": _RELATIVE_L2_LIMIT,
             "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
+            "gradient_cosine_similarity_report_only": True,
             "minimum_forward_and_vjp_speedup": _MIN_FORWARD_VJP_SPEEDUP,
             "minimum_rematerialized_stage_speedup": _MIN_REMATERIALIZED_STAGE_SPEEDUP,
             "deterministic_repeat_required": True,
@@ -121,6 +162,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     mode.add_argument(
         "--forward-once", dest="mode", action="store_const", const="forward_once"
+    )
+    mode.add_argument(
+        "--numerics-once", dest="mode", action="store_const", const="numerics_once"
     )
     mode.add_argument("--execute", dest="mode", action="store_const", const="execute")
     parser.add_argument("--output", type=Path, required=True)
@@ -148,9 +192,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"refusing to overwrite existing output: {args.output}")
     if not args.output.is_absolute():
         parser.error("--output must be an absolute path")
-    if args.mode == "forward_once":
+    guarded_mode = args.mode in ("forward_once", "numerics_once")
+    mode_label = args.mode.replace("_", "-")
+    if guarded_mode:
         if args.progress_output is None:
-            parser.error("forward-once mode requires --progress-output")
+            parser.error(f"{mode_label} mode requires --progress-output")
         if not args.progress_output.is_absolute():
             parser.error("--progress-output must be an absolute path")
         if args.progress_output.exists():
@@ -161,23 +207,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.progress_output.resolve() == args.output.resolve():
             parser.error("--progress-output must differ from --output")
         if args.compile_evidence is None:
-            parser.error("forward-once mode requires --compile-evidence")
+            parser.error(f"{mode_label} mode requires --compile-evidence")
         if not args.compile_evidence.is_absolute():
             parser.error("--compile-evidence must be an absolute path")
         if not args.compile_evidence.is_file():
             parser.error("--compile-evidence must be an existing regular file")
         if args.compile_profile_summary is None:
-            parser.error("forward-once mode requires --compile-profile-summary")
+            parser.error(f"{mode_label} mode requires --compile-profile-summary")
         if not args.compile_profile_summary.is_absolute():
             parser.error("--compile-profile-summary must be an absolute path")
         if not args.compile_profile_summary.is_file():
             parser.error("--compile-profile-summary must be an existing regular file")
     elif args.progress_output is not None:
-        parser.error("--progress-output is only valid with --forward-once")
+        parser.error(
+            "--progress-output is only valid with --forward-once or --numerics-once"
+        )
     elif args.compile_evidence is not None:
-        parser.error("--compile-evidence is only valid with --forward-once")
+        parser.error(
+            "--compile-evidence is only valid with --forward-once or --numerics-once"
+        )
     elif args.compile_profile_summary is not None:
-        parser.error("--compile-profile-summary is only valid with --forward-once")
+        parser.error(
+            "--compile-profile-summary is only valid with --forward-once or "
+            "--numerics-once"
+        )
 
     geometry = (
         args.batch_size,
@@ -213,12 +266,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--product-features must be divisible by --block-n")
     if args.in_features % args.block_k:
         parser.error("--in-features must be divisible by --block-k")
-    if args.mode == "forward_once" and (
+    if guarded_mode and (
         args.block_m,
         args.block_n,
         args.block_k,
     ) != (16, 32, 64):
-        parser.error("forward-once mode requires exact BM16/BN32/BK64 tiles")
+        parser.error(f"{mode_label} mode requires exact BM16/BN32/BK64 tiles")
+    if args.mode == "execute":
+        parser.error(
+            "execute mode is disabled until every executable invocation has an "
+            "independent cgroup-wide watchdog"
+        )
     if args.mode == "execute" and args.warmups < _MIN_WARMUPS:
         parser.error(f"execute mode requires --warmups of at least {_MIN_WARMUPS}")
     if args.mode == "execute" and args.iterations < _MIN_ITERATIONS:
@@ -227,8 +285,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.warmups < 0 or args.iterations < 0:
         parser.error("--warmups and --iterations cannot be negative")
-    if args.mode == "forward_once" and (args.warmups, args.iterations) != (0, 0):
-        parser.error("forward-once mode requires --warmups 0 --iterations 0")
+    if guarded_mode and (args.warmups, args.iterations) != (0, 0):
+        parser.error(f"{mode_label} mode requires --warmups 0 --iterations 0")
     return args
 
 
@@ -404,12 +462,17 @@ def _require_profile_parent(repo: Path) -> dict[str, Any]:
     }
 
 
-def _require_forward_once_scope(
+def _require_guarded_scope(
     parent_pid: int,
     *,
+    mode: str,
     proc_root: Path = Path("/proc"),
     cgroup_root: Path = Path("/sys/fs/cgroup"),
 ) -> tuple[dict[str, Any], int]:
+    if mode not in _GUARDED_SCOPE_PATTERNS:
+        raise ValueError(f"unsupported guarded mode: {mode}")
+    mode_label = mode.replace("_", "-")
+
     def exact_unified_cgroup(pid: str) -> str:
         lines = [
             line
@@ -424,18 +487,20 @@ def _require_forward_once_scope(
     parent_cgroup = exact_unified_cgroup(str(parent_pid))
     if parent_cgroup != cgroup:
         raise RuntimeError("probe and profile_rocm parent are not in the same cgroup")
-    match = re.fullmatch(_FORWARD_ONCE_SCOPE_PATTERN, cgroup)
+    match = re.fullmatch(_GUARDED_SCOPE_PATTERNS[mode], cgroup)
     if match is None:
-        raise RuntimeError("forward-once probe is not in a private BF16 systemd scope")
+        raise RuntimeError(
+            f"{mode_label} probe is not in a private BF16 systemd scope"
+        )
     uid = os.getuid()
     expected_prefix = f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/"
     if not cgroup.startswith(expected_prefix) or ".." in cgroup:
-        raise RuntimeError("forward-once cgroup user identity is not exact")
+        raise RuntimeError(f"{mode_label} cgroup user identity is not exact")
 
     kill_path = cgroup_root / cgroup.removeprefix("/") / "cgroup.kill"
     path_info = kill_path.lstat()
     if not stat.S_ISREG(path_info.st_mode) or stat.S_ISLNK(path_info.st_mode):
-        raise RuntimeError("forward-once cgroup.kill is not an exact control file")
+        raise RuntimeError(f"{mode_label} cgroup.kill is not an exact control file")
     descriptor = os.open(
         kill_path,
         os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -446,10 +511,12 @@ def _require_forward_once_scope(
             descriptor_info.st_dev,
             descriptor_info.st_ino,
         ) != (path_info.st_dev, path_info.st_ino):
-            raise RuntimeError("forward-once cgroup.kill descriptor identity changed")
+            raise RuntimeError(
+                f"{mode_label} cgroup.kill descriptor identity changed"
+            )
         os.set_inheritable(descriptor, False)
         if os.get_inheritable(descriptor):
-            raise RuntimeError("forward-once cgroup.kill descriptor is inheritable")
+            raise RuntimeError(f"{mode_label} cgroup.kill descriptor is inheritable")
     except BaseException:
         os.close(descriptor)
         raise
@@ -465,6 +532,20 @@ def _require_forward_once_scope(
             "timeout_kill_scope": "entire_systemd_cgroup",
         },
         descriptor,
+    )
+
+
+def _require_forward_once_scope(
+    parent_pid: int,
+    *,
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> tuple[dict[str, Any], int]:
+    return _require_guarded_scope(
+        parent_pid,
+        mode="forward_once",
+        proc_root=proc_root,
+        cgroup_root=cgroup_root,
     )
 
 
@@ -519,10 +600,14 @@ def _cosine_similarity(actual: np.ndarray, expected: np.ndarray) -> float:
     return min(1.0, max(-1.0, cosine))
 
 
-def _error_manifest(actual_tree: Any, expected_tree: Any) -> dict[str, Any]:
+def _error_manifest(
+    actual_tree: Any,
+    expected_tree: Any,
+    *,
+    names: tuple[str, ...] = ("output", "dx", "d_lora_a", "d_lora_b"),
+) -> dict[str, Any]:
     import jax
 
-    names = ("output", "dx", "d_lora_a", "d_lora_b")
     actual_leaves = jax.tree.leaves(actual_tree)
     expected_leaves = jax.tree.leaves(expected_tree)
     if len(actual_leaves) != len(names) or len(expected_leaves) != len(names):
@@ -545,12 +630,19 @@ def _error_manifest(actual_tree: Any, expected_tree: Any) -> dict[str, Any]:
 
 
 def _numerics_gate_passed(errors: dict[str, Any]) -> bool:
+    output_names = tuple(
+        name for name in ("forward_output", "output") if name in errors
+    )
     return bool(
-        all(manifest["finite"] for manifest in errors.values())
+        output_names
+        and all(manifest["finite"] for manifest in errors.values())
         and all(
             manifest["relative_l2"] < _RELATIVE_L2_LIMIT for manifest in errors.values()
         )
-        and errors["output"]["cosine_similarity"] >= _OUTPUT_COSINE_LIMIT
+        and all(
+            errors[name]["cosine_similarity"] >= _OUTPUT_COSINE_LIMIT
+            for name in output_names
+        )
     )
 
 
@@ -931,7 +1023,7 @@ def _run_forward_once_workload(
                 progress_record(
                     "compiled_input_ready",
                     compiled_programs=["candidate_forward"],
-                    concrete_device_inputs_ready=True,
+                    concrete_host_inputs_ready=True,
                     watchdog_seconds=_FORWARD_ONCE_WATCHDOG_SECONDS,
                 ),
             )
@@ -971,6 +1063,7 @@ def _run_forward_once_workload(
             host_output = np.asarray(device_output, dtype=np.float32)
             if host_output.shape != _FORWARD_ONCE_OUTPUT_SHAPE:
                 raise RuntimeError("forward-once host transfer changed output shape")
+            del device_output
             invocation_completed = True
         finally:
             _settle_forward_once_watchdog(
@@ -1031,8 +1124,313 @@ def _run_forward_once_workload(
     }
 
 
+def _host_input_manifest(
+    forward_arguments: tuple[Any, ...], step_arguments: tuple[Any, ...]
+) -> dict[str, Any]:
+    specs = (
+        ("x", (1, 64, 2560)),
+        ("rms_delta", (2560,)),
+        ("weight", (2560, 18432)),
+        ("lora_a", (2560, 8)),
+        ("lora_b", (8, 18432)),
+        ("scale", ()),
+        ("cotangent", (1, 64, 9216)),
+    )
+    if len(forward_arguments) != 6 or len(step_arguments) != 7:
+        raise RuntimeError("numerics-once host argument arity is not exact")
+    if any(left is not right for left, right in zip(forward_arguments, step_arguments)):
+        raise RuntimeError("numerics-once forward/step host arguments are not shared")
+    manifests: dict[str, Any] = {}
+    for (name, expected_shape), value in zip(specs, step_arguments, strict=True):
+        if type(value) is not np.ndarray:
+            raise RuntimeError(f"numerics-once {name} is not a host NumPy array")
+        if tuple(value.shape) != expected_shape or str(value.dtype) != "bfloat16":
+            raise RuntimeError(
+                f"numerics-once {name} host contract is not exact: "
+                f"shape={value.shape}, dtype={value.dtype}"
+            )
+        if not value.flags.c_contiguous:
+            raise RuntimeError(f"numerics-once {name} is not C-contiguous")
+        if value.flags.writeable:
+            raise RuntimeError(f"numerics-once {name} host input is writeable")
+        raw = value.tobytes(order="C")
+        manifests[name] = {
+            "shape": list(value.shape),
+            "dtype": "bfloat16",
+            "element_count": int(value.size),
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    return manifests
+
+
+def _copy_exact_program_result_to_host(
+    program: str, result: Any
+) -> tuple[Any, dict[str, Any]]:
+    specs = (
+        _FORWARD_RESULT_SPECS
+        if program in ("reference_forward", "candidate_forward")
+        else _STEP_RESULT_SPECS
+    )
+    if program not in _PROGRAM_ORDER:
+        raise ValueError(f"unsupported numerics-once program: {program}")
+    blocked = _block_tree(result)
+    if len(specs) == 1:
+        leaves = (blocked,)
+    else:
+        if type(blocked) is not tuple or len(blocked) != len(specs):
+            raise RuntimeError(
+                f"numerics-once {program} result tree is not an exact tuple"
+            )
+        leaves = blocked
+    host_leaves: list[np.ndarray] = []
+    manifests: dict[str, Any] = {}
+    for (name, expected_shape), leaf in zip(specs, leaves, strict=True):
+        device_shape = tuple(getattr(leaf, "shape", ()))
+        device_dtype = str(getattr(leaf, "dtype", ""))
+        if device_shape != expected_shape or device_dtype != "bfloat16":
+            raise RuntimeError(
+                f"numerics-once {program}/{name} device contract is not exact: "
+                f"shape={device_shape}, dtype={device_dtype!r}"
+            )
+        host_bf16 = np.asarray(leaf)
+        if (
+            type(host_bf16) is not np.ndarray
+            or tuple(host_bf16.shape) != expected_shape
+            or str(host_bf16.dtype) != "bfloat16"
+        ):
+            raise RuntimeError(
+                f"numerics-once {program}/{name} BF16 host transfer is not exact"
+            )
+        host_f32 = np.asarray(host_bf16, dtype=np.float32)
+        finite = bool(np.all(np.isfinite(host_f32)))
+        if tuple(host_f32.shape) != expected_shape:
+            raise RuntimeError(
+                f"numerics-once {program}/{name} FP32 host shape is not exact"
+            )
+        if not finite:
+            raise RuntimeError(
+                f"numerics-once {program}/{name} host result is nonfinite"
+            )
+        raw = np.ascontiguousarray(host_bf16).tobytes(order="C")
+        manifests[name] = {
+            "shape": list(host_f32.shape),
+            "device_dtype": device_dtype,
+            "host_dtype": str(host_f32.dtype),
+            "element_count": int(host_f32.size),
+            "bf16_bytes": len(raw),
+            "bf16_sha256": hashlib.sha256(raw).hexdigest(),
+            "finite": finite,
+        }
+        host_leaves.append(host_f32)
+    host_tree: Any = host_leaves[0] if len(host_leaves) == 1 else tuple(host_leaves)
+    return host_tree, manifests
+
+
+def _run_numerics_once_workload(
+    *,
+    executables: dict[str, Any],
+    step_arguments: tuple[Any, ...],
+    forward_arguments: tuple[Any, ...],
+    progress_output: Path,
+    binding: dict[str, Any],
+    cgroup_kill_fd: int,
+) -> dict[str, Any]:
+    if tuple(executables) != _PROGRAM_ORDER or set(executables) != set(_PROGRAM_ORDER):
+        raise RuntimeError("numerics-once executable order/set is not exact")
+    counts = dict.fromkeys(_PROGRAM_ORDER, 0)
+    completion_counts = dict(counts)
+    progress_digest = hashlib.sha256()
+    progress_byte_count = 0
+    progress_record_count = 0
+    watchdog_manifests: list[dict[str, Any]] = []
+    host_results: dict[str, Any] = {}
+    result_manifests: dict[str, Any] = {}
+
+    def progress_record(event: str, **fields: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "event": event,
+            "mode": "numerics_once",
+            "probe_pid": os.getpid(),
+            "wall_time_ns": time.time_ns(),
+            "monotonic_time_ns": time.monotonic_ns(),
+            "binding": binding,
+            "invocation_attempt_counts": dict(counts),
+            "invocation_completion_counts": dict(completion_counts),
+            **fields,
+        }
+
+    def write_progress(output: Any, payload: dict[str, Any]) -> None:
+        nonlocal progress_byte_count, progress_record_count
+        encoded = _durable_progress_record(output, payload)
+        progress_digest.update(encoded)
+        progress_byte_count += len(encoded)
+        progress_record_count += 1
+
+    inputs = _host_input_manifest(forward_arguments, step_arguments)
+    with _open_private_progress(progress_output) as progress:
+        write_progress(
+            progress,
+            progress_record(
+                "host_inputs_ready",
+                compiled_programs=list(_PROGRAM_ORDER),
+                program_order=list(_PROGRAM_ORDER),
+                host_inputs=inputs,
+                watchdog_seconds_per_program=_FORWARD_ONCE_WATCHDOG_SECONDS,
+            ),
+        )
+        for ordinal, program in enumerate(_PROGRAM_ORDER, start=1):
+            watchdog = _start_forward_once_watchdog(cgroup_kill_fd)
+            invocation_completed = False
+            try:
+                _arm_forward_once_watchdog(watchdog)
+                counts[program] += 1
+                write_progress(
+                    progress,
+                    progress_record(
+                        "dispatch_started",
+                        dispatch_ordinal=ordinal,
+                        program=program,
+                        watchdog_seconds=_FORWARD_ONCE_WATCHDOG_SECONDS,
+                        watchdog_armed_monotonic_ns=watchdog[
+                            "armed_monotonic_ns"
+                        ],
+                        watchdog_deadline_monotonic_ns=watchdog[
+                            "deadline_monotonic_ns"
+                        ],
+                        watchdog_armed_ack_received_monotonic_ns=watchdog[
+                            "armed_ack_received_monotonic_ns"
+                        ],
+                    ),
+                )
+                arguments = (
+                    forward_arguments
+                    if program in ("reference_forward", "candidate_forward")
+                    else step_arguments
+                )
+                invocation_started_ns = time.monotonic_ns()
+                result = executables[program](*arguments)
+                host_result, result_manifest = _copy_exact_program_result_to_host(
+                    program, result
+                )
+                del result
+                invocation_completed_ns = time.monotonic_ns()
+                if invocation_completed_ns >= watchdog["deadline_monotonic_ns"]:
+                    raise RuntimeError(
+                        f"numerics-once {program} completed at or after its deadline"
+                    )
+                host_results[program] = host_result
+                result_manifests[program] = result_manifest
+                completion_counts[program] += 1
+                completion_record = progress_record(
+                    "dispatch_completed",
+                    dispatch_ordinal=ordinal,
+                    program=program,
+                    invocation_started_monotonic_ns=invocation_started_ns,
+                    invocation_completed_monotonic_ns=invocation_completed_ns,
+                    invocation_elapsed_seconds=(
+                        invocation_completed_ns - invocation_started_ns
+                    )
+                    / 1_000_000_000,
+                    device_results_released_before_completion=True,
+                    result=result_manifest,
+                )
+                write_progress(progress, completion_record)
+                invocation_completed = True
+            finally:
+                _settle_forward_once_watchdog(
+                    watchdog, invocation_completed=invocation_completed
+                )
+            watchdog_manifests.append(
+                {
+                    "dispatch_ordinal": ordinal,
+                    "program": program,
+                    "external_process": True,
+                    "watchdog_pid": getattr(watchdog.get("process"), "pid", None),
+                    "timeout_action": "cgroup.kill_then_pidfd_SIGKILL_fallback",
+                    "cgroup_wide_timeout_kill": watchdog[
+                        "cgroup_wide_timeout_kill"
+                    ],
+                    "timeout_seconds": watchdog["timeout_seconds"],
+                    "armed_monotonic_ns": watchdog["armed_monotonic_ns"],
+                    "deadline_monotonic_ns": watchdog["deadline_monotonic_ns"],
+                    "armed_ack_received_monotonic_ns": watchdog[
+                        "armed_ack_received_monotonic_ns"
+                    ],
+                    "dispatch_completed": invocation_completed,
+                }
+            )
+
+        post_inputs = _host_input_manifest(forward_arguments, step_arguments)
+        if post_inputs != inputs:
+            raise RuntimeError("numerics-once host inputs changed across dispatches")
+        forward_errors = _error_manifest(
+            host_results["candidate_forward"],
+            host_results["reference_forward"],
+            names=("forward_output",),
+        )
+        step_errors = _error_manifest(
+            host_results["candidate_forward_and_vjp"],
+            host_results["reference_forward_and_vjp"],
+        )
+        errors = {**forward_errors, **step_errors}
+        numerics_passed = _numerics_gate_passed(errors)
+        write_progress(
+            progress,
+            progress_record(
+                "numerics_completed",
+                relative_l2_limit_exclusive=_RELATIVE_L2_LIMIT,
+                output_cosine_limit_inclusive=_OUTPUT_COSINE_LIMIT,
+                gradient_cosine_similarity_report_only=True,
+                errors=errors,
+                host_inputs_unchanged=True,
+                passed=numerics_passed,
+            ),
+        )
+        progress_info = os.fstat(progress.fileno())
+        if (
+            not stat.S_ISREG(progress_info.st_mode)
+            or stat.S_IMODE(progress_info.st_mode) != 0o600
+            or progress_info.st_uid != os.getuid()
+            or progress_info.st_size != progress_byte_count
+            or progress_record_count != 10
+        ):
+            raise RuntimeError("numerics-once progress evidence is not exact")
+    _fsync_private_parent(progress_output)
+    return {
+        "invocation_counts": counts,
+        "invocation_completion_counts": completion_counts,
+        "compile_only_zero_candidate_reference_executable_invocations": False,
+        "warmup_orders": [],
+        "measurement_orders": [],
+        "host_inputs": inputs,
+        "host_inputs_unchanged": True,
+        "host_results": result_manifests,
+        "errors": errors,
+        "numerics_passed": numerics_passed,
+        "progress": {
+            "path": str(progress_output),
+            "protocol": "durable_fsync_jsonl_v1",
+            "record_count": progress_record_count,
+            "bytes": progress_byte_count,
+            "sha256": progress_digest.hexdigest(),
+            "mode": "0600",
+            "directory_fsynced": True,
+        },
+        "watchdogs": watchdog_manifests,
+    }
+
+
 def _package_versions() -> dict[str, str | None]:
-    names = ("jax", "jaxlib", "jax-rocm7-pjrt", "jax-rocm7-plugin", "numpy")
+    names = (
+        "jax",
+        "jaxlib",
+        "jax-rocm7-pjrt",
+        "jax-rocm7-plugin",
+        "ml_dtypes",
+        "numpy",
+    )
     versions: dict[str, str | None] = {}
     for name in names:
         try:
@@ -1078,9 +1476,9 @@ def _json_exact(actual: Any, expected: Any) -> bool:
     return bool(actual == expected)
 
 
-def _read_strict_private_json(
-    path: Path, *, maximum_bytes: int = 1 << 20
-) -> tuple[Any, dict[str, Any]]:
+def _read_strict_private_bytes(
+    path: Path, *, maximum_bytes: int
+) -> tuple[bytes, dict[str, Any]]:
     resolved = path.resolve(strict=True)
     if resolved != path.absolute():
         raise RuntimeError("private JSON path must not traverse symlinks")
@@ -1131,6 +1529,18 @@ def _read_strict_private_json(
     finally:
         os.close(descriptor)
 
+    return raw, {
+        "path": str(path),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "mode": "0600",
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mtime_ns": before.st_mtime_ns,
+    }
+
+
+def _strict_json_loads(raw: bytes) -> Any:
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -1142,23 +1552,24 @@ def _read_strict_private_json(
     def reject_constant(value: str) -> Any:
         raise ValueError(f"non-finite JSON constant: {value}")
 
+    return json.loads(
+        raw,
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
+
+
+def _read_strict_private_json(
+    path: Path, *, maximum_bytes: int = 1 << 20
+) -> tuple[Any, dict[str, Any]]:
+    raw, file_manifest = _read_strict_private_bytes(
+        path, maximum_bytes=maximum_bytes
+    )
     try:
-        payload = json.loads(
-            raw,
-            object_pairs_hook=reject_duplicate_keys,
-            parse_constant=reject_constant,
-        )
+        payload = _strict_json_loads(raw)
     except (UnicodeDecodeError, ValueError) as error:
         raise RuntimeError("private JSON is not strict JSON") from error
-    return payload, {
-        "path": str(path),
-        "bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "mode": "0600",
-        "device": before.st_dev,
-        "inode": before.st_ino,
-        "mtime_ns": before.st_mtime_ns,
-    }
+    return payload, file_manifest
 
 
 def _validate_compile_evidence(
@@ -1274,8 +1685,36 @@ def _validate_compile_evidence(
         not isinstance(profiler_parent, dict)
         or profiler_parent.get("validated") is not True
         or not _json_exact(profiler_parent.get("limits"), _EXACT_PROFILE_LIMITS)
+        or profiler_parent.get("profiler_path")
+        != expected_source["profiler"]["path"]
+        or profiler_parent.get("profiler_sha256")
+        != expected_source["profiler"]["sha256"]
+        or profiler_parent.get("parent_command_python")
+        != str(Path(sys.executable).absolute())
     ):
         raise RuntimeError("compile evidence profiler limits are not exact")
+    profile_seconds: dict[str, float] = {}
+    for name in (
+        "timeout_seconds",
+        "interval_seconds",
+        "baseline_seconds",
+        "sensor_grace_seconds",
+    ):
+        value = profiler_parent.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise RuntimeError("compile evidence profiler timing is not exact")
+        profile_seconds[name] = float(value)
+    if not (
+        0 < profile_seconds["timeout_seconds"] <= 1800
+        and 0 < profile_seconds["interval_seconds"] <= 0.25
+        and profile_seconds["baseline_seconds"] >= 2
+        and 0 <= profile_seconds["sensor_grace_seconds"] <= 60
+    ):
+        raise RuntimeError("compile evidence profiler timing is outside exact bounds")
     if not _json_exact(
         evidence.get("postflight"),
         {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
@@ -1287,6 +1726,13 @@ def _validate_compile_evidence(
         "programs": sorted(expected_programs),
         "zero_executable_invocations": True,
         "clean_preflight_and_postflight": True,
+        "profile_binding": {
+            "python_command": profiler_parent["parent_command_python"],
+            "profiler_path": expected_source["profiler"]["path"],
+            "profiler_sha256": expected_source["profiler"]["sha256"],
+            "probe_path": expected_source["probe"]["path"],
+            **profile_seconds,
+        },
     }
 
 
@@ -1304,8 +1750,35 @@ def _validate_compile_profile_summary(
     summary, file_manifest = _read_strict_private_json(path)
     if not isinstance(summary, dict):
         raise RuntimeError("compile profile summary root is not an object")
-    if file_manifest["mtime_ns"] < evidence_manifest["mtime_ns"]:
-        raise RuntimeError("compile profile summary predates child compile evidence")
+    profile_binding = evidence_manifest.get("profile_binding")
+    if not isinstance(profile_binding, dict):
+        raise RuntimeError("compile evidence profile binding is missing")
+    telemetry_path = path.with_name("telemetry.jsonl")
+    telemetry_raw, telemetry_file_manifest = _read_strict_private_bytes(
+        telemetry_path, maximum_bytes=16 << 20
+    )
+    if not telemetry_raw.endswith(b"\n"):
+        raise RuntimeError("compile profile telemetry is not complete JSONL")
+    telemetry_lines = telemetry_raw.splitlines()
+    try:
+        telemetry_records = [_strict_json_loads(line) for line in telemetry_lines]
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("compile profile telemetry is not strict JSONL") from error
+    if not telemetry_records or not isinstance(telemetry_records[0], dict):
+        raise RuntimeError("compile profile telemetry manifest is missing")
+    telemetry_manifest = telemetry_records[0]
+    if any(
+        not isinstance(record, dict) or record.get("record_type") != "sample"
+        for record in telemetry_records[1:]
+    ):
+        raise RuntimeError("compile profile telemetry sample stream is not exact")
+    if not (
+        evidence_manifest["mtime_ns"] < telemetry_file_manifest["mtime_ns"]
+        < file_manifest["mtime_ns"]
+    ):
+        raise RuntimeError(
+            "compile profile evidence, telemetry, and summary order is not strict"
+        )
     if (
         summary.get("record_type") != "summary"
         or summary.get("status") != "completed"
@@ -1323,10 +1796,77 @@ def _validate_compile_profile_summary(
         != summary["baseline_samples"] + summary["measured_samples"] + 1
     ):
         raise RuntimeError("compile profile sample accounting is not exact")
+    if len(telemetry_records) != summary["samples"] + 1:
+        raise RuntimeError("compile profile telemetry sample count is not exact")
     if summary.get("safety_violation") is not None:
         raise RuntimeError("compile profile records a safety violation")
     if summary.get("kernel_driver_errors") not in (None, []):
         raise RuntimeError("compile profile records kernel driver errors")
+    expected_command = [
+        profile_binding["python_command"],
+        profile_binding["probe_path"],
+        "--allow-gpu",
+        "--compile-only",
+        "--output",
+        str(evidence_path),
+        "--block-m",
+        "16",
+        "--block-n",
+        "32",
+        "--block-k",
+        "64",
+        "--warmups",
+        "0",
+        "--iterations",
+        "0",
+    ]
+    expected_safety_limits = {
+        "max_junction_temp_c": _EXACT_PROFILE_LIMITS["--max-junction-temp-c"],
+        "max_gpu_power_watts": _EXACT_PROFILE_LIMITS["--max-gpu-power-watts"],
+        "max_vram_bytes": _EXACT_PROFILE_LIMITS["--max-vram-gib"] * 1024**3,
+        "min_host_available_bytes": _EXACT_PROFILE_LIMITS[
+            "--min-host-available-gib"
+        ]
+        * 1024**3,
+        "max_swap_bytes": _EXACT_PROFILE_LIMITS["--max-swap-gib"] * 1024**3,
+    }
+    gpu = telemetry_manifest.get("gpu")
+    runtime = telemetry_manifest.get("runtime")
+    if (
+        telemetry_manifest.get("record_type") != "manifest"
+        or telemetry_manifest.get("interval_seconds")
+        != profile_binding["interval_seconds"]
+        or telemetry_manifest.get("baseline_seconds")
+        != profile_binding["baseline_seconds"]
+        or telemetry_manifest.get("duration_seconds") is not None
+        or telemetry_manifest.get("timeout_seconds")
+        != profile_binding["timeout_seconds"]
+        or telemetry_manifest.get("sensor_grace_seconds")
+        != profile_binding["sensor_grace_seconds"]
+        or telemetry_manifest.get("terminate_included_on_safety") is not False
+        or not _json_exact(
+            telemetry_manifest.get("safety_limits"), expected_safety_limits
+        )
+        or not isinstance(gpu, dict)
+        or gpu.get("card") != "card1"
+        or gpu.get("vendor_id") != "0x1002"
+        or gpu.get("device_id") != "0x744c"
+        or not isinstance(runtime, dict)
+        or runtime.get("script_sha256") != profile_binding["profiler_sha256"]
+        or not _json_exact(
+            runtime.get("accelerator_environment"),
+            {
+                "HIP_VISIBLE_DEVICES": "0",
+                "JAX_PLATFORMS": "rocm",
+                "XLA_FLAGS": _DISABLE_COMMAND_BUFFERS,
+            },
+        )
+        or telemetry_manifest.get("command_recorded") is not True
+        or type(telemetry_manifest.get("passed_file_descriptor_count")) is not int
+        or telemetry_manifest["passed_file_descriptor_count"] != 0
+        or not _json_exact(telemetry_manifest.get("command"), expected_command)
+    ):
+        raise RuntimeError("compile profile telemetry manifest is not exact")
     metrics = summary.get("metrics")
     limits = {
         "gpu_junction_temp_c": _EXACT_PROFILE_LIMITS["--max-junction-temp-c"],
@@ -1354,6 +1894,15 @@ def _validate_compile_profile_summary(
         "status": "completed",
         "returncode": 0,
         "sensor_samples": summary["samples"],
+        "telemetry": {
+            **telemetry_file_manifest,
+            "record_count": len(telemetry_records),
+            "command_sha256": hashlib.sha256(
+                json.dumps(expected_command, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "profiler_sha256": profile_binding["profiler_sha256"],
+            "evidence_output_path": str(evidence_path),
+        },
         "observed_maxima": observed_maxima,
         "limits": limits,
         "safety_violation": None,
@@ -1385,6 +1934,13 @@ def _compilation_plan(
 ) -> dict[str, tuple[Any, tuple[Any, ...]]]:
     if mode == "forward_once":
         return {"candidate_forward": (candidate_forward, forward_arguments)}
+    if mode == "numerics_once":
+        return {
+            "reference_forward": (reference_forward, forward_arguments),
+            "candidate_forward": (candidate_forward, forward_arguments),
+            "reference_forward_and_vjp": (reference_step, step_arguments),
+            "candidate_forward_and_vjp": (candidate_step, step_arguments),
+        }
     return {
         "reference_forward_and_vjp": (reference_step, step_arguments),
         "candidate_forward_and_vjp": (candidate_step, step_arguments),
@@ -1479,7 +2035,7 @@ def _run(
     args: argparse.Namespace,
     preflight: dict[str, Any],
     *,
-    forward_once_cgroup_kill_fd: int | None = None,
+    guarded_cgroup_kill_fd: int | None = None,
 ) -> dict[str, Any]:
     probe_path = Path(__file__).resolve(strict=True)
     repo = probe_path.parent.parent
@@ -1572,13 +2128,17 @@ def _run(
     }
     compile_evidence: dict[str, Any] | None = None
     compile_profile_summary: dict[str, Any] | None = None
-    if args.mode == "forward_once":
+    guarded_mode = args.mode in ("forward_once", "numerics_once")
+    mode_label = args.mode.replace("_", "-")
+    if guarded_mode:
         if git_preflight.get("clean") is not True:
-            raise RuntimeError("forward-once dispatch requires an exact clean Git tree")
+            raise RuntimeError(
+                f"{mode_label} dispatch requires an exact clean Git tree"
+            )
         if args.compile_evidence is None:
-            raise RuntimeError("forward-once compile evidence is missing")
+            raise RuntimeError(f"{mode_label} compile evidence is missing")
         if args.compile_profile_summary is None:
-            raise RuntimeError("forward-once compile profile summary is missing")
+            raise RuntimeError(f"{mode_label} compile profile summary is missing")
         compile_evidence = _validate_compile_evidence(
             args.compile_evidence,
             expected_contract=_exact_contract(),
@@ -1663,40 +2223,49 @@ def _run(
 
     concrete_arguments: tuple[Any, ...] | None = None
     concrete_forward_arguments: tuple[Any, ...] | None = None
-    if args.mode in ("forward_once", "execute"):
+    if guarded_mode:
         rng = np.random.default_rng(20260714)
 
-        def device_bf16(shape: tuple[int, ...], scale: float = 1.0):
+        def host_bf16(shape: tuple[int, ...], scale: float = 1.0) -> np.ndarray:
             host = rng.standard_normal(shape, dtype=np.float32) * scale
-            return jax.device_put(jnp.asarray(host, dtype=jnp.bfloat16), devices[0])
+            result = np.ascontiguousarray(np.asarray(host, dtype=bfloat16))
+            result.flags.writeable = False
+            return result
+
+        lora_scale = np.asarray(2.0, dtype=bfloat16)
+        lora_scale.flags.writeable = False
 
         concrete_forward_arguments = (
-            device_bf16(
+            host_bf16(
                 (args.batch_size, args.sequence_length, args.in_features), 0.02
             ),
-            device_bf16((args.in_features,), 0.01),
-            device_bf16(
+            host_bf16((args.in_features,), 0.01),
+            host_bf16(
                 (args.in_features, args.physical_features),
                 1.0 / math.sqrt(args.in_features),
             ),
-            device_bf16((args.in_features, args.rank), 0.01),
-            device_bf16((args.rank, args.physical_features), 0.01),
-            jax.device_put(jnp.asarray(2.0, dtype=jnp.bfloat16), devices[0]),
+            host_bf16((args.in_features, args.rank), 0.01),
+            host_bf16((args.rank, args.physical_features), 0.01),
+            lora_scale,
         )
-        if args.mode == "execute":
+        if args.mode == "numerics_once":
             concrete_arguments = (
                 *concrete_forward_arguments,
-                device_bf16(
+                host_bf16(
                     (args.batch_size, args.sequence_length, args.product_features),
                     0.02,
                 ),
             )
 
     if args.mode == "forward_once" and concrete_forward_arguments is None:
-        raise RuntimeError("forward-once mode requires concrete device arguments")
-    if args.mode == "forward_once":
+        raise RuntimeError("forward-once mode requires concrete host arguments")
+    if args.mode == "numerics_once" and (
+        concrete_forward_arguments is None or concrete_arguments is None
+    ):
+        raise RuntimeError("numerics-once mode requires concrete host arguments")
+    if guarded_mode:
         compile_arguments = signature_arguments
-        compile_forward_arguments = concrete_forward_arguments
+        compile_forward_arguments = signature_arguments[:-1]
     else:
         compile_arguments = (
             concrete_arguments
@@ -1731,7 +2300,7 @@ def _run(
             "compile_seconds": compile_seconds,
         }
 
-    forward_once_binding = {
+    guarded_binding = {
         "contract": _exact_contract(),
         "geometry": geometry_manifest,
         "preflight": preflight,
@@ -1745,15 +2314,31 @@ def _run(
         if (
             args.progress_output is None
             or concrete_forward_arguments is None
-            or forward_once_cgroup_kill_fd is None
+            or guarded_cgroup_kill_fd is None
         ):
             raise RuntimeError("forward-once mode is missing its required arguments")
         workload = _run_forward_once_workload(
             executable=executables["candidate_forward"],
             arguments=concrete_forward_arguments,
             progress_output=args.progress_output,
-            binding=forward_once_binding,
-            cgroup_kill_fd=forward_once_cgroup_kill_fd,
+            binding=guarded_binding,
+            cgroup_kill_fd=guarded_cgroup_kill_fd,
+        )
+    elif args.mode == "numerics_once":
+        if (
+            args.progress_output is None
+            or concrete_forward_arguments is None
+            or concrete_arguments is None
+            or guarded_cgroup_kill_fd is None
+        ):
+            raise RuntimeError("numerics-once mode is missing its required arguments")
+        workload = _run_numerics_once_workload(
+            executables=executables,
+            step_arguments=concrete_arguments,
+            forward_arguments=concrete_forward_arguments,
+            progress_output=args.progress_output,
+            binding=guarded_binding,
+            cgroup_kill_fd=guarded_cgroup_kill_fd,
         )
     else:
         workload = _run_compiled_workload(
@@ -1779,10 +2364,10 @@ def _run(
         },
     }
     git_postflight = _git_manifest(repo)
-    if args.mode == "forward_once" and (
+    if guarded_mode and (
         source_postflight != source_preflight or git_postflight != git_preflight
     ):
-        raise RuntimeError("forward-once source/Git state changed across dispatch")
+        raise RuntimeError(f"{mode_label} source/Git state changed across dispatch")
     numerics: dict[str, Any]
     determinism: dict[str, Any]
     measurement: dict[str, Any]
@@ -1859,6 +2444,64 @@ def _run(
             and compile_profile_summary is not None
             and preflight.get("forward_once_scope", {}).get("validated") is True
         )
+    elif args.mode == "numerics_once":
+        numerics_passed = workload["numerics_passed"]
+        numerics = {
+            "executed": True,
+            "reference_compared": True,
+            "passed": numerics_passed,
+            "relative_l2_limit_exclusive": _RELATIVE_L2_LIMIT,
+            "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
+            "gradient_cosine_similarity_report_only": True,
+            "errors": workload["errors"],
+            "host_results": workload["host_results"],
+        }
+        determinism = {
+            "executed": False,
+            "passed": None,
+            "reason": "numerics-once invokes each program exactly once",
+        }
+        measurement = {
+            "executed": False,
+            "performance_measured": False,
+            "warmups": 0,
+            "iterations": 0,
+            "reason": "numerics-once dispatch durations are safety evidence only",
+        }
+        performance_gate = {
+            "executed": False,
+            "passed": None,
+            "reason": "numerics-once is not a performance qualification",
+        }
+        exact_one = dict.fromkeys(_PROGRAM_ORDER, 1)
+        passed = bool(
+            numerics_passed
+            and tuple(compilation) == _PROGRAM_ORDER
+            and all(
+                manifest["lower_calls"] == 1 and manifest["compile_calls"] == 1
+                for manifest in compilation.values()
+            )
+            and workload["invocation_counts"] == exact_one
+            and workload["invocation_completion_counts"] == exact_one
+            and workload["host_inputs_unchanged"] is True
+            and workload["progress"]["record_count"] == 10
+            and len(workload["watchdogs"]) == len(_PROGRAM_ORDER)
+            and all(
+                watchdog["program"] == program
+                and watchdog["dispatch_ordinal"] == ordinal
+                and watchdog["external_process"] is True
+                and type(watchdog["watchdog_pid"]) is int
+                and watchdog["watchdog_pid"] > 0
+                and watchdog["cgroup_wide_timeout_kill"] is True
+                and watchdog["dispatch_completed"] is True
+                for ordinal, (program, watchdog) in enumerate(
+                    zip(_PROGRAM_ORDER, workload["watchdogs"], strict=True), start=1
+                )
+            )
+            and compile_evidence is not None
+            and compile_profile_summary is not None
+            and preflight.get("numerics_once_scope", {}).get("validated") is True
+        )
     else:
         errors = _error_manifest(workload["actual"], workload["expected"])
         numerics_passed = _numerics_gate_passed(errors)
@@ -1890,6 +2533,7 @@ def _run(
             "passed": numerics_passed,
             "relative_l2_limit_exclusive": _RELATIVE_L2_LIMIT,
             "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
+            "gradient_cosine_similarity_report_only": True,
             "errors": errors,
         }
         determinism = {
@@ -1986,6 +2630,19 @@ def _run(
             "invocation_completion_counts": workload["invocation_completion_counts"],
             "source_and_git_unchanged_across_dispatch": True,
         }
+    elif args.mode == "numerics_once":
+        payload["numerics_once"] = {
+            "compile_evidence": compile_evidence,
+            "compile_profile_summary": compile_profile_summary,
+            "progress": workload["progress"],
+            "watchdogs": workload["watchdogs"],
+            "host_inputs": workload["host_inputs"],
+            "host_inputs_unchanged": workload["host_inputs_unchanged"],
+            "host_results": workload["host_results"],
+            "invocation_attempt_counts": workload["invocation_counts"],
+            "invocation_completion_counts": workload["invocation_completion_counts"],
+            "source_and_git_unchanged_across_dispatch": True,
+        }
     return payload
 
 
@@ -2023,12 +2680,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         profiler_parent = _require_profile_parent(repo)
-        forward_once_scope: dict[str, Any] | None = None
-        forward_once_cgroup_kill_fd: int | None = None
+        guarded_scope: dict[str, Any] | None = None
+        guarded_cgroup_kill_fd: int | None = None
         try:
-            if args.mode == "forward_once":
-                forward_once_scope, forward_once_cgroup_kill_fd = (
-                    _require_forward_once_scope(profiler_parent["parent_pid"])
+            if args.mode in _GUARDED_SCOPE_PATTERNS:
+                guarded_scope, guarded_cgroup_kill_fd = _require_guarded_scope(
+                    profiler_parent["parent_pid"], mode=args.mode
                 )
             card_identity = _require_exact_card_identity()
             environment = _configure_environment()
@@ -2057,20 +2714,20 @@ def main(argv: list[str] | None = None) -> int:
                         "sha256": hashlib.sha256(safety_path.read_bytes()).hexdigest(),
                     },
                 }
-                if forward_once_scope is not None:
-                    preflight["forward_once_scope"] = forward_once_scope
+                if guarded_scope is not None:
+                    preflight[f"{args.mode}_scope"] = guarded_scope
                 try:
                     payload = _run(
                         args,
                         preflight,
-                        forward_once_cgroup_kill_fd=forward_once_cgroup_kill_fd,
+                        guarded_cgroup_kill_fd=guarded_cgroup_kill_fd,
                     )
                 finally:
                     postflight = safety_module.require_clean_amdgpu_boot()
                 payload["postflight"] = postflight
         finally:
-            if forward_once_cgroup_kill_fd is not None:
-                os.close(forward_once_cgroup_kill_fd)
+            if guarded_cgroup_kill_fd is not None:
+                os.close(guarded_cgroup_kill_fd)
         descriptor = output_descriptor
         output_descriptor = None
         _write_reserved_private_output(args.output, descriptor, payload)
