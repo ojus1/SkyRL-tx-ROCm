@@ -127,7 +127,7 @@ class _ServerFixture:
             "sample_max_num_sequences": 1,
             "gradient_checkpointing": True,
             "loss_chunk_size": 64,
-            "qwen35_bf16_down_lora_residual": True,
+            "qwen35_bf16_down_lora_residual": False,
             "abstract_model_load": False,
         }
 
@@ -865,7 +865,7 @@ def test_attestation_and_revalidation_bind_exact_wrapper_process_tree(tmp_path):
     }
     assert record["backend"]["name"] == "jax"
     assert record["backend"]["sample_max_num_sequences"] == 1
-    assert record["backend"]["qwen35_bf16_down_lora_residual"] is True
+    assert record["backend"]["qwen35_bf16_down_lora_residual"] is False
     assert record["backend"]["abstract_model_load"] is False
     assert record["environment"]["XLA_FLAGS"] == ("--xla_gpu_enable_command_buffer=")
     assert record["environment"]["JAX_PLATFORMS"] == "rocm"
@@ -1640,7 +1640,7 @@ def test_required_startup_cache_invokes_full_validator_initially_and_finally(
         ("construction", "abstract-load"),
         ("model_path", "/tmp/wrong-model"),
         ("backend_config.max_lora_rank", 16),
-        ("backend_config.qwen35_bf16_down_lora_residual", False),
+        ("backend_config.qwen35_bf16_down_lora_residual", True),
     ],
 )
 def test_required_cache_seed_must_match_observed_server_contract(
@@ -1772,28 +1772,28 @@ def test_attestation_rejects_noncanonical_loopback_urls(tmp_path, base_url):
             '{"max_lora_adapters":2,"max_lora_rank":8,'
             '"train_micro_batch_size":1,"sample_max_num_sequences":true,'
             '"gradient_checkpointing":true,"loss_chunk_size":64,'
-            '"qwen35_bf16_down_lora_residual":true,'
+            '"qwen35_bf16_down_lora_residual":false,'
             '"abstract_model_load":false}'
         ),
         (
             '{"max_lora_adapters":2,"max_lora_rank":8,'
             '"train_micro_batch_size":1,"sample_max_num_sequences":2,'
             '"gradient_checkpointing":true,"loss_chunk_size":64,'
-            '"qwen35_bf16_down_lora_residual":true,'
+            '"qwen35_bf16_down_lora_residual":false,'
             '"abstract_model_load":false}'
         ),
         (
             '{"max_lora_adapters":2,"max_lora_rank":8,'
             '"train_micro_batch_size":1,"sample_max_num_sequences":1,'
             '"gradient_checkpointing":true,"loss_chunk_size":64,'
-            '"qwen35_bf16_down_lora_residual":true,'
+            '"qwen35_bf16_down_lora_residual":false,'
             '"abstract_model_load":false,"unexpected":0}'
         ),
         (
             '{"max_lora_adapters":2,"max_lora_rank":8,'
             '"train_micro_batch_size":1,"sample_max_num_sequences":1,'
             '"gradient_checkpointing":true,"loss_chunk_size":64,'
-            '"qwen35_bf16_down_lora_residual":true,'
+            '"qwen35_bf16_down_lora_residual":false,'
             '"abstract_model_load":false,"sample_max_num_sequences":1}'
         ),
     ],

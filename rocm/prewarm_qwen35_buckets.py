@@ -1037,7 +1037,7 @@ def _run_rocm(
         "sample_max_num_sequences": 1,
         "gradient_checkpointing": True,
         "loss_chunk_size": 64,
-        "qwen35_bf16_down_lora_residual": True,
+        "qwen35_bf16_down_lora_residual": False,
         "abstract_model_load": args.construction == "abstract-load",
     }
     if "abstract_model_load" not in JaxBackendConfig.model_fields:

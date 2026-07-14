@@ -362,7 +362,7 @@ def _prewarm_records(cache_path: Path) -> list[dict[str, object]]:
     backend_config = {
         "abstract_model_load": False,
         "enforce_eager": False,
-        "qwen35_bf16_down_lora_residual": True,
+        "qwen35_bf16_down_lora_residual": False,
     }
     backend_hash = attestation.canonical_json_sha256(
         backend_config, domain="skyrl-qwen35-resolved-jax-backend-config-v1"
@@ -853,6 +853,30 @@ def test_prewarm_rejects_authoritative_record_reordering(tmp_path: Path) -> None
 
     with pytest.raises(
         attestation.CacheAttestationError, match="record structure|out of order"
+    ):
+        attestation.validate_prewarm_t64_artifact(
+            _jsonl(records),
+            expected_git_head="a" * 40,
+            expected_git_tree="b" * 40,
+            expected_cache_path=str(cache),
+            expected_attention_backend="pallas",
+        )
+
+
+def test_prewarm_rejects_rehashed_unpromoted_down_fusion(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    records = _prewarm_records(cache)
+    backend_config = records[1]["backend_config"]
+    assert isinstance(backend_config, dict)
+    backend_config["qwen35_bf16_down_lora_residual"] = True
+    records[1]["backend_config_sha256"] = attestation.canonical_json_sha256(
+        backend_config,
+        domain="skyrl-qwen35-resolved-jax-backend-config-v1",
+    )
+
+    with pytest.raises(
+        attestation.CacheAttestationError, match="unpromoted BF16 down fusion"
     ):
         attestation.validate_prewarm_t64_artifact(
             _jsonl(records),
