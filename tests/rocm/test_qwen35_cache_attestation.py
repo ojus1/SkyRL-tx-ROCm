@@ -358,11 +358,40 @@ def _jsonl(records: list[dict[str, object]]) -> bytes:
     )
 
 
+def _fused_mlp_route(
+    *, enabled: bool, bucket: int = attestation.BUCKET
+) -> dict[str, object]:
+    if not enabled:
+        status = attestation.FUSED_MLP_ROUTE_STATUS_DISABLED_GLOBAL
+        rationale = attestation.FUSED_MLP_ROUTE_RATIONALE_DISABLED_GLOBAL
+        indices: list[int] = []
+    elif bucket != attestation.BUCKET:
+        status = attestation.FUSED_MLP_ROUTE_STATUS_DISABLED_BUCKET
+        rationale = attestation.FUSED_MLP_ROUTE_RATIONALE_DISABLED_BUCKET
+        indices = []
+    else:
+        status = attestation.FUSED_MLP_ROUTE_STATUS_QUALIFIED
+        rationale = attestation.FUSED_MLP_ROUTE_RATIONALE_QUALIFIED
+        indices = list(attestation.FUSED_MLP_ROUTE_LAYER_INDICES)
+    return {
+        "kind": attestation.FUSED_MLP_ROUTE_KIND,
+        "enabled": enabled,
+        "bucket": bucket,
+        "status": status,
+        "expected_layer_indices": indices,
+        "expected_layer_count": len(indices),
+        "qualified_layer_indices": list(indices),
+        "qualified_layer_count": len(indices),
+        "static_python_routing_rationale": rationale,
+    }
+
+
 def _prewarm_records(cache_path: Path) -> list[dict[str, object]]:
     backend_config = {
         "abstract_model_load": False,
         "enforce_eager": False,
         "qwen35_bf16_down_lora_residual": False,
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": False,
     }
     backend_hash = attestation.canonical_json_sha256(
         backend_config, domain="skyrl-qwen35-resolved-jax-backend-config-v1"
@@ -535,6 +564,7 @@ def _prewarm_records(cache_path: Path) -> list[dict[str, object]]:
         "lower_seconds": 1.0,
         "compile_seconds": 2.0,
         "compiled_memory": {},
+        "fused_mlp_route_attestation": _fused_mlp_route(enabled=False),
         "train_bucket_lower_calls": 1,
         "train_bucket_compile_calls": 1,
         "optimizer_lower_calls": 0,
@@ -780,6 +810,9 @@ def test_build_and_revalidate_startup_claim_without_jax(tmp_path: Path) -> None:
 
     assert claim["status"] == attestation.REQUIREMENT
     assert claim["seed"]["target_cache_entry"]["key"] == _KEY
+    assert claim["seed"]["fused_mlp_route_attestation"] == _fused_mlp_route(
+        enabled=False
+    )
     assert (
         attestation.revalidate_startup_cache_claim(claim, boot_id_path=boot_id) == claim
     )
@@ -884,6 +917,116 @@ def test_prewarm_rejects_rehashed_unpromoted_down_fusion(tmp_path: Path) -> None
             expected_git_tree="b" * 40,
             expected_cache_path=str(cache),
             expected_attention_backend="pallas",
+        )
+
+
+@pytest.mark.parametrize("value", [None, 0, "false"])
+def test_prewarm_requires_exact_contiguous_fused_mlp_bool(
+    tmp_path: Path, value: object
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    records = _prewarm_records(cache)
+    backend_config = records[1]["backend_config"]
+    assert isinstance(backend_config, dict)
+    key = "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    if value is None:
+        backend_config.pop(key)
+    else:
+        backend_config[key] = value
+    records[1]["backend_config_sha256"] = attestation.canonical_json_sha256(
+        backend_config,
+        domain="skyrl-qwen35-resolved-jax-backend-config-v1",
+    )
+
+    with pytest.raises(attestation.CacheAttestationError, match="not an exact bool"):
+        attestation.validate_prewarm_t64_artifact(
+            _jsonl(records),
+            expected_git_head="a" * 40,
+            expected_git_tree="b" * 40,
+            expected_cache_path=str(cache),
+            expected_attention_backend="pallas",
+        )
+
+
+def test_prewarm_seed_preserves_enabled_contiguous_fused_mlp_policy(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    records = _prewarm_records(cache)
+    backend_config = records[1]["backend_config"]
+    assert isinstance(backend_config, dict)
+    key = "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    backend_config[key] = True
+    records[1]["backend_config_sha256"] = attestation.canonical_json_sha256(
+        backend_config,
+        domain="skyrl-qwen35-resolved-jax-backend-config-v1",
+    )
+    records[4]["fused_mlp_route_attestation"] = _fused_mlp_route(enabled=True)
+
+    seed = attestation.validate_prewarm_t64_artifact(
+        _jsonl(records),
+        expected_git_head="a" * 40,
+        expected_git_tree="b" * 40,
+        expected_cache_path=str(cache),
+        expected_attention_backend="pallas",
+    )
+
+    assert seed["backend_config"][key] is True
+    assert seed["fused_mlp_route_attestation"] == _fused_mlp_route(enabled=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("qualified_layer_count", 31, "does not match its exact bucket policy"),
+        ("status", "claimed", "does not match its exact bucket policy"),
+        ("unexpected", False, "schema is invalid"),
+    ],
+)
+def test_prewarm_rejects_nonexact_fused_mlp_route_attestation(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    records = _prewarm_records(cache)
+    route = records[4]["fused_mlp_route_attestation"]
+    assert isinstance(route, dict)
+    route[field] = value
+
+    with pytest.raises(attestation.CacheAttestationError, match=message):
+        attestation.validate_prewarm_t64_artifact(
+            _jsonl(records),
+            expected_git_head="a" * 40,
+            expected_git_tree="b" * 40,
+            expected_cache_path=str(cache),
+            expected_attention_backend="pallas",
+        )
+
+
+def test_fused_mlp_route_validator_requires_non_t64_disabled_state() -> None:
+    route = _fused_mlp_route(enabled=True, bucket=256)
+
+    assert attestation._validate_fused_mlp_route_attestation(
+        route,
+        enabled=True,
+        bucket=256,
+    ) == route
+
+    route["qualified_layer_indices"] = [0]
+    route["qualified_layer_count"] = 1
+    with pytest.raises(
+        attestation.CacheAttestationError,
+        match="does not match its exact bucket policy",
+    ):
+        attestation._validate_fused_mlp_route_attestation(
+            route,
+            enabled=True,
+            bucket=256,
         )
 
 

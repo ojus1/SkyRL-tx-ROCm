@@ -123,6 +123,14 @@ SKYRL_QWEN35_PREWARM_BUCKETS=64 \
 SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1 \
 SKYRL_ROCM_PALLAS_ATTENTION=1 \
   ./rocm/start_qwen35.sh attest-t64-engine-hit
+
+# Qualify the default-off contiguous BF16 T64 MLP-up fusion, bind it to the
+# prewarm/cache/server attestations, and require the exact in-engine cache hit.
+SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS=1 \
+SKYRL_QWEN35_PREWARM_BUCKETS=64 \
+SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST=1 \
+SKYRL_ROCM_PALLAS_ATTENTION=0 \
+  ./rocm/start_qwen35.sh attest-t64-contiguous-mlp-up
 ```
 
 Buckets at 512 or above additionally require the explicitly enabled Pallas
@@ -138,6 +146,15 @@ This operation is independent of sequence length. The compiled handle is only
 inspected for memory metadata and then discarded; it is never called, so no
 Adam update, gradient reset, or model-state mutation through an optimizer step
 occurs.
+
+`SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS` is also strict
+default-off and accepts only literal `0` or `1`. Enabling it is qualified only
+for the pinned BF16 Qwen3.5-4B geometry, a one-by-one-by-one mesh, batch one,
+rank-8/two-slot LoRA-only training, gradient checkpointing, and the exact
+64-token bucket. It is mutually exclusive with the older experimental down
+fusion. Other sequence buckets retain the ordinary model path; the T64
+compile artifact must prove that all 32 decoder layers selected the fused
+static route before the cache seed can be consumed by the server.
 
 `SKYRL_QWEN35_PREWARM_ONLY=1` is also default-off, accepts only literal `0` or
 `1`, and requires a nonempty bucket list. It does not weaken or skip any
@@ -216,7 +233,7 @@ perform ordinary setup array work. Compilation can initialize ROCm, allocate
 representative buffers, and run XLA autotuning kernels, so allow a much longer
 startup. The launcher now wraps this child in `profile_rocm.py`, with a default
 3600-second timeout configurable only from 600 through 14400 seconds, a 90 C
-junction limit, 315 W power limit, 24 GiB VRAM limit, no positive host-RAM
+junction limit, 400 W power limit, 24 GiB VRAM limit, no positive host-RAM
 floor, and an 8 GiB swap limit. It preserves only the already-held global lock
 descriptor, records `prewarm.telemetry.jsonl` plus its private summary, and
 captures an exact idle handoff baseline before the child. On success, failure,
@@ -919,12 +936,13 @@ server_pid="$(fuser 8001/tcp 2>/dev/null | xargs)"
 TINKER_API_KEY=tml-dummy .venv/bin/python rocm/profile_rocm.py \
   --output /tmp/qwen35-profile.jsonl \
   --include-pid "server=$server_pid" \
-  --terminate-included-on-safety \
+  --terminate-included-on-abort \
   --sensor-grace-seconds 60 \
   --max-junction-temp-c 90 \
-  --max-gpu-power-watts 315 \
-  --max-vram-gib 23 \
-  --min-host-available-gib 4 \
+  --max-gpu-power-watts 400 \
+  --max-vram-gib 24 \
+  --min-host-available-gib 0 \
+  --max-swap-gib 8 \
   --timeout 900 \
   -- ../tinker-cookbook/.venv/bin/python rocm/bench_sft.py \
        --context 64 --warmup-steps 1 --measured-steps 5 \

@@ -46,6 +46,10 @@ bounded work estimate and an independently measured duration.
   `LoRAMixin.apply_lora` (currently around line 111).
 - Generic multi-adapter sorting: `skyrl/tx/layers/util.py:66`,
   `prepare_routing`.
+- Exact default-off T64 contiguous RMS/gate-up/LoRA/SwiGLU boundary:
+  `skyrl/tx/kernels/rocm/bf16_rms_gate_up_lora_swiglu_contiguous.py`. Its
+  two bounded Pallas stages and explicit LoRA-only VJP are isolated-numerics
+  and isolated-speed qualified; model end-to-end qualification is pending.
 - Full QKV, gate, attention, and O projection:
   `skyrl/tx/models/qwen3_5.py:296-377`, `Qwen3_5Attention`.
 - Chunked FP32 GDN: `skyrl/tx/models/qwen3_5.py:101-255`,
@@ -971,9 +975,10 @@ an unsafe compute dispatch acceptable. GPU experiments must remain serialized.
    only if true mixed-adapter batches become important.
 2. Complete and qualify the watchdog-bounded native-GQA Pallas custom VJP.
 3. Split-vocabulary tied linear-logprob Pallas prototype.
-4. Replace the measured-no-go gate/up+SwiGLU Pallas VJP with an exact backward
-   that does not recompute the dense forward; use larger Pallas N tiles only as
-   bounded diagnostics.
+4. Integrate and end-to-end qualify the completed contiguous T64
+   RMS/gate-up+SwiGLU successor. Its exact backward no longer recomputes the
+   dense forward and its isolated full benchmark passes the speed gates; keep
+   the older strided implementation as a historical no-go.
 5. Minimal typed HIP/FFI reference handler and CPU fallback.
 6. Production BF16 dense epilogues, including input RMS and exact LoRA VJPs.
 7. Production GDN preparation/state kernels.

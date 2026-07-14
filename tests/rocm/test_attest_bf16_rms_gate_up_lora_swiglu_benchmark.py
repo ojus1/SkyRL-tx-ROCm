@@ -242,6 +242,274 @@ def _public_stub_data(tmp_path: Path, mode: str, smoke: Any = None):
     return {}, result_file, gated, smoke, validated
 
 
+def _file_manifest(path: str, *, inode: int, digest_digit: str) -> dict[str, Any]:
+    return {
+        "path": path,
+        "bytes": 100 + inode,
+        "sha256": digest_digit * 64,
+        "mode": "0600",
+        "device": 7,
+        "inode": inode,
+        "mtime_ns": 1_000 + inode,
+    }
+
+
+def _determinism_run_fixture(run_id: int) -> dict[str, Any]:
+    base = 100 * run_id
+    hashes = {
+        f"{program}/{name}": attest.hashlib.sha256(f"{program}/{name}".encode()).hexdigest()
+        for program, name in attest._CANDIDATE_HASH_POSITIONS
+    }
+    primal_hash = attest.hashlib.sha256(b"candidate_primal/output").hexdigest()
+    hashes["candidate_forward/output"] = primal_hash
+    hashes["candidate_forward_and_vjp/output"] = primal_hash
+    return {
+        "result": _file_manifest(
+            f"/private/run-{run_id}/result.json",
+            inode=base + 1,
+            digest_digit=str(run_id),
+        ),
+        "progress": {
+            "file": _file_manifest(
+                f"/private/run-{run_id}/progress.jsonl",
+                inode=base + 2,
+                digest_digit=str(run_id + 2),
+            ),
+            "record_count": 10,
+            "probe_pid": 1_000 + run_id,
+            "watchdog_pids": [2_000 + 10 * run_id + index for index in range(4)],
+        },
+        "profile": {
+            "summary": _file_manifest(
+                f"/private/run-{run_id}/telemetry.jsonl.summary.json",
+                inode=base + 3,
+                digest_digit=str(run_id + 4),
+            ),
+            "telemetry": _file_manifest(
+                f"/private/run-{run_id}/telemetry.jsonl",
+                inode=base + 4,
+                digest_digit=str(run_id + 6),
+            ),
+            "runtime": {"python": "test", "rocm": "7.1.1"},
+            "gpu": {"card": "card1", "pci_bdf": "0000:03:00.0"},
+            "profiler_pid": 3_000 + run_id,
+            "profiler_command_sha256": f"{run_id + 6:x}" * 64,
+        },
+        "source": {"probe": {"path": "/repo/probe.py", "sha256": "a" * 64}},
+        "git": {"commit": "b" * 40, "clean": True},
+        "packages": {"jax": "test"},
+        "device": {"architecture": "gfx1100", "platform_version": "ROCm test"},
+        "geometry": attest._exact_geometry(),
+        "host_inputs": {"x": {"sha256": "c" * 64}},
+        "candidate_hashes": hashes,
+        "stable_preflight": {
+            "environment": {"XLA_FLAGS_effective": attest._DISABLE_COMMAND_BUFFERS},
+            "hardware": {"amdgpu_boot_clean": True},
+            "card_identity": {"pci_bdf": "0000:03:00.0"},
+            "safety_source": {"sha256": "d" * 64},
+        },
+        "profiler_timings": {
+            "timeout_seconds": 600.0,
+            "interval_seconds": 0.05,
+            "baseline_seconds": 5.0,
+            "sensor_grace_seconds": 15.0,
+        },
+        "scope": {
+            "scope_unit": f"skyrl-bf16-numerics-123-run{run_id}.scope",
+            "cgroup_kill_device": 9,
+            "cgroup_kill_inode": 4_000 + run_id,
+        },
+    }
+
+
+def _determinism_benchmark_gated(first: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "numerics_evidence": {
+            **first["result"],
+            "progress": dict(first["progress"]["file"]),
+        },
+        "numerics_profile_summary": {
+            **first["profile"]["summary"],
+            "telemetry": dict(first["profile"]["telemetry"]),
+        },
+    }
+
+
+def _host_results_fixture() -> dict[str, Any]:
+    return {
+        program: {
+            name: {
+                "shape": list(shape),
+                "device_dtype": "bfloat16",
+                "host_dtype": "float32",
+                "element_count": attest.math.prod(shape),
+                "bf16_bytes": 2 * attest.math.prod(shape),
+                "bf16_sha256": attest.hashlib.sha256(f"{program}/{name}".encode()).hexdigest(),
+                "finite": True,
+            }
+            for name, shape in specs
+        }
+        for program, specs in attest._RESULT_SPECS.items()
+    }
+
+
+def _watchdog_fixture() -> dict[str, Any]:
+    armed = 1_000_000_000
+    return {
+        "dispatch_ordinal": 1,
+        "program": "reference_forward",
+        "external_process": True,
+        "watchdog_pid": 1234,
+        "timeout_action": "cgroup.kill_then_pidfd_SIGKILL_fallback",
+        "cgroup_wide_timeout_kill": True,
+        "timeout_seconds": 5.0,
+        "armed_monotonic_ns": armed,
+        "deadline_monotonic_ns": armed + attest._WATCHDOG_NS,
+        "armed_ack_received_monotonic_ns": armed + 1,
+        "dispatch_completed": True,
+    }
+
+
+def _numerics_profile_fixture(tmp_path: Path) -> dict[str, Any]:
+    private = _private_dir(tmp_path)
+    result_path = _write_private_json(private / "result.json", {})
+    os.utime(result_path, ns=(100, 100))
+    _, result_file = attest._read_private_json(result_path)
+    packages = {
+        "jax": "test-jax",
+        "jaxlib": "test-jaxlib",
+        "jax-rocm7-plugin": "test-plugin",
+        "jax-rocm7-pjrt": "test-pjrt",
+    }
+    result = {
+        "preflight": {
+            "profiler_parent": {
+                "parent_command_python": "/private/python",
+                "interval_seconds": 0.05,
+                "baseline_seconds": 2.0,
+                "timeout_seconds": 600.0,
+                "sensor_grace_seconds": 15.0,
+                "parent_pid": 987,
+                "parent_command_sha256": "9" * 64,
+            },
+            "card_identity": {"pci_bdf": "0000:03:00.0"},
+        },
+        "source": {
+            "probe": {"path": "/repo/probe.py"},
+            "profiler": {"sha256": "e" * 64},
+            "packages": packages,
+        },
+        "numerics_once": {
+            "progress": {"path": str(private / "progress.jsonl")},
+            "compile_evidence": {"path": "/private/compile.json"},
+            "compile_profile_summary": {"path": "/private/compile-summary.json"},
+        },
+    }
+    progress = {"probe_pid": 1234}
+    command = attest._expected_numerics_profile_command(
+        result_path=result_path,
+        result=result,
+    )
+    manifest = {
+        "record_type": "manifest",
+        "interval_seconds": 0.05,
+        "baseline_seconds": 2.0,
+        "duration_seconds": None,
+        "timeout_seconds": 600.0,
+        "sensor_grace_seconds": 15.0,
+        "terminate_included_on_safety": False,
+        "terminate_included_on_abort": False,
+        "explicit_processes": {},
+        "safety_limits": {
+            "max_junction_temp_c": 90.0,
+            "max_gpu_power_watts": 400.0,
+            "max_vram_bytes": float(24 * 1024**3),
+            "min_host_available_bytes": 0.0,
+            "max_swap_bytes": float(8 * 1024**3),
+        },
+        "command_recorded": True,
+        "passed_file_descriptor_count": 0,
+        "command": command,
+        "runtime": {
+            "python": attest.sys.version,
+            "platform": attest.platform.platform(),
+            "rocm": "test-rocm",
+            "jax": packages["jax"],
+            "jaxlib": packages["jaxlib"],
+            "jax_rocm_plugin": packages["jax-rocm7-plugin"],
+            "jax_rocm_pjrt": packages["jax-rocm7-pjrt"],
+            "script_sha256": result["source"]["profiler"]["sha256"],
+            "accelerator_environment": {
+                "HIP_VISIBLE_DEVICES": "0",
+                "JAX_PLATFORMS": "rocm",
+                "XLA_FLAGS": attest._DISABLE_COMMAND_BUFFERS,
+            },
+        },
+        "gpu": {
+            "card": "card1",
+            "pci_bdf": "0000:03:00.0",
+            "vendor_id": "0x1002",
+            "device_id": "0x744c",
+            "hwmon_name": "amdgpu",
+        },
+    }
+    measured = {
+        "record_type": "sample",
+        "phase": "measured",
+        "wall_time_ns": 3,
+        "gpu_junction_temp_c": 70.0,
+        "gpu_power_watts": 300.0,
+        "vram_used_bytes": float(23 * 1024**3),
+        "host_swap_used_bytes": float(2 * 1024**3),
+        "processes": {"command": {"root_pid": progress["probe_pid"], "process_count": 1}},
+    }
+    samples = [
+        {
+            **measured,
+            "phase": "baseline",
+            "wall_time_ns": 1,
+        },
+        {
+            **measured,
+            "phase": "preflight",
+            "wall_time_ns": 2,
+        },
+        measured,
+    ]
+    telemetry_path = private / "telemetry.jsonl"
+    telemetry_path.write_text("\n".join(json.dumps(item, sort_keys=True) for item in (manifest, *samples)) + "\n")
+    telemetry_path.chmod(0o600)
+    os.utime(telemetry_path, ns=(200, 200))
+    summary = {
+        "record_type": "summary",
+        "status": "completed",
+        "samples": 3,
+        "baseline_samples": 1,
+        "measured_samples": 1,
+        "returncode": 0,
+        "received_signal": None,
+        "kernel_log_available": True,
+        "metrics": {name: {"measured_max": measured[name]} for name in attest._SAFETY_METRIC_LIMITS},
+        "processes": {"command": {"pid": progress["probe_pid"]}},
+    }
+    summary_path = _write_private_json(
+        private / "telemetry.jsonl.summary.json",
+        summary,
+    )
+    os.utime(summary_path, ns=(300, 300))
+    return {
+        "result_path": result_path,
+        "result_file": result_file,
+        "result": result,
+        "progress": progress,
+        "manifest": manifest,
+        "samples": samples,
+        "telemetry_path": telemetry_path,
+        "summary": summary,
+        "summary_path": summary_path,
+    }
+
+
 def test_contract_matches_probe_and_import_does_not_load_jax() -> None:
     contract = attest._expected_contract()
     assert attest._EVIDENCE_SCHEMA_VERSION == 2
@@ -397,6 +665,334 @@ def test_measurement_derives_exact_speedups_and_thresholds(mode: str) -> None:
         attest._validate_measurement(mode=mode, raw_result=raw, progress=progress)
 
 
+def test_candidate_bf16_hashes_cover_exact_five_result_positions() -> None:
+    host_results = _host_results_fixture()
+    hashes = attest._candidate_result_hashes(host_results)
+    assert list(hashes) == [f"{program}/{name}" for program, name in attest._CANDIDATE_HASH_POSITIONS]
+    assert len(hashes) == 5
+
+    wrong_shape = json.loads(json.dumps(host_results))
+    wrong_shape["candidate_forward_and_vjp"]["dx"]["shape"][-1] += 1
+    with pytest.raises(RuntimeError, match="candidate_forward_and_vjp/dx result manifest"):
+        attest._candidate_result_hashes(wrong_shape)
+
+    missing = json.loads(json.dumps(host_results))
+    del missing["candidate_forward_and_vjp"]["d_lora_b"]
+    with pytest.raises(RuntimeError, match="candidate_forward_and_vjp result set"):
+        attest._candidate_result_hashes(missing)
+
+    malformed_hash = json.loads(json.dumps(host_results))
+    malformed_hash["candidate_forward"]["output"]["bf16_sha256"] = "A" * 64
+    with pytest.raises(RuntimeError, match="lowercase SHA-256"):
+        attest._candidate_result_hashes(malformed_hash)
+
+
+def test_numerics_watchdog_requires_completed_exact_deadline_binding() -> None:
+    watchdog = _watchdog_fixture()
+    assert (
+        attest._validate_numerics_watchdog(
+            watchdog,
+            ordinal=1,
+            program="reference_forward",
+        )
+        is watchdog
+    )
+
+    incomplete = {**watchdog, "dispatch_completed": False}
+    with pytest.raises(RuntimeError, match="watchdog 1 is not exact"):
+        attest._validate_numerics_watchdog(
+            incomplete,
+            ordinal=1,
+            program="reference_forward",
+        )
+
+    wrong_deadline = {
+        **watchdog,
+        "deadline_monotonic_ns": watchdog["deadline_monotonic_ns"] + 1,
+    }
+    with pytest.raises(RuntimeError, match="watchdog 1 ordering"):
+        attest._validate_numerics_watchdog(
+            wrong_deadline,
+            ordinal=1,
+            program="reference_forward",
+        )
+
+
+def test_numerics_profile_requires_safe_completion_and_abort_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _numerics_profile_fixture(tmp_path)
+    monkeypatch.setattr(attest, "_current_rocm_version", lambda: "test-rocm")
+    profile = attest._validate_numerics_profile(
+        profile_summary_path=fixture["summary_path"],
+        result_path=fixture["result_path"],
+        result_file=fixture["result_file"],
+        result=fixture["result"],
+        progress=fixture["progress"],
+    )
+    assert profile["observed_maxima"]["gpu_power_watts"] == 300.0
+    assert profile["profiler_pid"] == 987
+    assert profile["probe_pid"] == 1234
+
+    fixture["manifest"]["terminate_included_on_abort"] = True
+    fixture["telemetry_path"].write_text(
+        "\n".join(json.dumps(item, sort_keys=True) for item in (fixture["manifest"], *fixture["samples"])) + "\n"
+    )
+    fixture["telemetry_path"].chmod(0o600)
+    os.utime(fixture["telemetry_path"], ns=(200, 200))
+    with pytest.raises(RuntimeError, match="telemetry manifest is not exact"):
+        attest._validate_numerics_profile(
+            profile_summary_path=fixture["summary_path"],
+            result_path=fixture["result_path"],
+            result_file=fixture["result_file"],
+            result=fixture["result"],
+            progress=fixture["progress"],
+        )
+
+    fixture["manifest"]["terminate_included_on_abort"] = False
+    fixture["samples"][-1]["gpu_power_watts"] = 401.0
+    fixture["summary"]["metrics"]["gpu_power_watts"]["measured_max"] = 401.0
+    fixture["telemetry_path"].write_text(
+        "\n".join(json.dumps(item, sort_keys=True) for item in (fixture["manifest"], *fixture["samples"])) + "\n"
+    )
+    fixture["telemetry_path"].chmod(0o600)
+    os.utime(fixture["telemetry_path"], ns=(200, 200))
+    _write_private_json(fixture["summary_path"], fixture["summary"])
+    os.utime(fixture["summary_path"], ns=(300, 300))
+    with pytest.raises(RuntimeError, match="gpu_power_watts is unsafe"):
+        attest._validate_numerics_profile(
+            profile_summary_path=fixture["summary_path"],
+            result_path=fixture["result_path"],
+            result_file=fixture["result_file"],
+            result=fixture["result"],
+            progress=fixture["progress"],
+        )
+
+
+def test_cross_process_determinism_compares_five_hashes_and_emits_run_evidence() -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    benchmark_gated = _determinism_benchmark_gated(first)
+    result = attest._compare_determinism_runs(
+        (first, second),
+        benchmark_gated=benchmark_gated,
+    )
+    assert result["provided"] is True
+    assert result["passed"] is True
+    assert result["attested"] is True
+    assert result["candidate_hash_positions"] == [
+        f"{program}/{name}" for program, name in attest._CANDIDATE_HASH_POSITIONS
+    ]
+    assert len(result["candidate_bf16_sha256"]) == 5
+    assert [run["probe_pid"] for run in result["runs"]] == [1001, 1002]
+
+
+@pytest.mark.parametrize("ordinal", (1, 2))
+def test_cross_process_determinism_rejects_within_run_candidate_primal_mismatch(ordinal: int) -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    runs = (first, second)
+    runs[ordinal - 1]["candidate_hashes"]["candidate_forward_and_vjp/output"] = "f" * 64
+    benchmark_gated = _determinism_benchmark_gated(first)
+
+    with pytest.raises(RuntimeError, match=rf"run {ordinal} candidate primal BF16 outputs differ"):
+        attest._compare_determinism_runs(
+            runs,
+            benchmark_gated=benchmark_gated,
+        )
+
+
+@pytest.mark.parametrize(
+    "stable_field",
+    (
+        "source",
+        "git",
+        "packages",
+        "device",
+        "geometry",
+        "host_inputs",
+        "stable_preflight",
+    ),
+)
+def test_cross_process_determinism_rejects_stable_manifest_changes(stable_field: str) -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    second[stable_field] = {"tampered": True}
+    benchmark_gated = _determinism_benchmark_gated(first)
+    with pytest.raises(RuntimeError, match=rf"differ in {stable_field}"):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=benchmark_gated,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (
+        ("runtime", "profiler runtime"),
+        ("gpu", "profiler GPU identity"),
+    ),
+)
+def test_cross_process_determinism_rejects_profile_identity_changes(
+    field: str,
+    message: str,
+) -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    second["profile"][field] = {"tampered": True}
+    benchmark_gated = _determinism_benchmark_gated(first)
+    with pytest.raises(RuntimeError, match=message):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=benchmark_gated,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "interval_seconds",
+        "baseline_seconds",
+        "timeout_seconds",
+        "sensor_grace_seconds",
+    ),
+)
+def test_cross_process_determinism_rejects_profiler_timing_changes(field: str) -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    second["profiler_timings"][field] += 1.0
+    benchmark_gated = _determinism_benchmark_gated(first)
+
+    with pytest.raises(RuntimeError, match="differ in profiler_timings"):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=benchmark_gated,
+        )
+
+
+def test_cross_process_determinism_rejects_hash_change_and_wrong_first_pair() -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    benchmark_gated = _determinism_benchmark_gated(first)
+    key = "candidate_forward_and_vjp/d_lora_b"
+    second["candidate_hashes"][key] = "f" * 64
+    with pytest.raises(RuntimeError, match="candidate BF16 result hashes"):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=benchmark_gated,
+        )
+
+    second = _determinism_run_fixture(2)
+    wrong_prior = json.loads(json.dumps(benchmark_gated))
+    wrong_prior["numerics_evidence"]["sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="first determinism result compact manifest"):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=wrong_prior,
+        )
+
+    wrong_progress = json.loads(json.dumps(benchmark_gated))
+    wrong_progress["numerics_evidence"]["progress"]["sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="first determinism progress compact manifest"):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=wrong_progress,
+        )
+
+
+@pytest.mark.parametrize(
+    "reuse",
+    (
+        "artifact_path",
+        "artifact_identity",
+        "probe_pid",
+        "profiler_pid",
+        "cross_role_pid",
+        "profiler_command_sha256",
+        "scope_unit",
+        "scope_identity",
+    ),
+)
+def test_cross_process_determinism_rejects_reused_artifact_or_process_evidence(
+    reuse: str,
+) -> None:
+    first = _determinism_run_fixture(1)
+    second = _determinism_run_fixture(2)
+    if reuse == "artifact_path":
+        second["progress"]["file"]["path"] = first["result"]["path"]
+    elif reuse == "artifact_identity":
+        second["progress"]["file"]["device"] = first["result"]["device"]
+        second["progress"]["file"]["inode"] = first["result"]["inode"]
+    elif reuse in {"probe_pid", "profiler_pid", "profiler_command_sha256"}:
+        owner = "progress" if reuse == "probe_pid" else "profile"
+        second[owner][reuse] = first[owner][reuse]
+    elif reuse == "cross_role_pid":
+        second["progress"]["probe_pid"] = first["progress"]["watchdog_pids"][0]
+    elif reuse == "scope_unit":
+        second["scope"]["scope_unit"] = first["scope"]["scope_unit"]
+    else:
+        second["scope"]["cgroup_kill_device"] = first["scope"]["cgroup_kill_device"]
+        second["scope"]["cgroup_kill_inode"] = first["scope"]["cgroup_kill_inode"]
+    benchmark_gated = _determinism_benchmark_gated(first)
+    message = "artifacts are not distinct" if reuse.startswith("artifact") else "process/scope evidence"
+    with pytest.raises(RuntimeError, match=message):
+        attest._compare_determinism_runs(
+            (first, second),
+            benchmark_gated=benchmark_gated,
+        )
+
+
+def test_cli_requires_exactly_two_complete_determinism_pairs() -> None:
+    base = [
+        "--result",
+        "/private/result.json",
+        "--profile-summary",
+        "/private/summary.json",
+        "--output",
+        "/private/attestation.json",
+        "--expected-mode",
+        "benchmark",
+    ]
+    assert attest._parse_args(base).determinism_pairs is None
+    paired = base + [
+        "--determinism-result",
+        "/private/run-1/result.json",
+        "--determinism-profile-summary",
+        "/private/run-1/summary.json",
+        "--determinism-result",
+        "/private/run-2/result.json",
+        "--determinism-profile-summary",
+        "/private/run-2/summary.json",
+    ]
+    assert attest._parse_args(paired).determinism_pairs == (
+        (Path("/private/run-1/result.json"), Path("/private/run-1/summary.json")),
+        (Path("/private/run-2/result.json"), Path("/private/run-2/summary.json")),
+    )
+    with pytest.raises(SystemExit) as incomplete:
+        attest._parse_args(
+            base
+            + [
+                "--determinism-result",
+                "/private/run-1/result.json",
+                "--determinism-profile-summary",
+                "/private/run-1/summary.json",
+            ]
+        )
+    assert incomplete.value.code == 2
+    with pytest.raises(SystemExit) as unpaired:
+        attest._parse_args(
+            base
+            + [
+                "--determinism-result",
+                "/private/run-1/result.json",
+                "--determinism-result",
+                "/private/run-2/result.json",
+            ]
+        )
+    assert unpaired.value.code == 2
+
+
 def test_profile_recomputes_maxima_and_allows_telemetry_before_result(
     tmp_path: Path,
 ) -> None:
@@ -440,6 +1036,7 @@ def test_profile_recomputes_maxima_and_allows_telemetry_before_result(
         "timeout_seconds": 600.0,
         "sensor_grace_seconds": 15.0,
         "terminate_included_on_safety": False,
+        "terminate_included_on_abort": False,
         "safety_limits": {
             "max_junction_temp_c": 90.0,
             "max_gpu_power_watts": 400.0,
@@ -563,6 +1160,7 @@ def test_public_callable_is_only_passing_artifact_and_recurses_smoke(
 ) -> None:
     private = _private_dir(tmp_path)
     state: dict[str, Any] = {"smoke": None}
+    performance_passes = {"value": True}
 
     def fake_raw(**kwargs):
         mode = kwargs["expected_mode"]
@@ -582,7 +1180,7 @@ def test_public_callable_is_only_passing_artifact_and_recurses_smoke(
         attest,
         "_validate_measurement",
         lambda **kwargs: {
-            "performance_gates_passed": True,
+            "performance_gates_passed": (performance_passes["value"] if kwargs["mode"] == "benchmark" else True),
             "qualifying_mode": kwargs["mode"] == "benchmark",
         },
     )
@@ -599,6 +1197,8 @@ def test_public_callable_is_only_passing_artifact_and_recurses_smoke(
     assert smoke["passed"] is True
     assert smoke["attestation_passed"] is True
     assert smoke["performance_qualified"] is False
+    assert smoke["determinism_attested"] is False
+    assert smoke["determinism"]["provided"] is False
     assert smoke["profile_attested"] is True
     assert smoke["recommend_for_opt_in_integration"] is False
 
@@ -614,10 +1214,58 @@ def test_public_callable_is_only_passing_artifact_and_recurses_smoke(
     assert full["passed"] is True
     assert full["timing_qualified"] is True
     assert full["performance_qualified"] is False
+    assert full["determinism_attested"] is False
+    assert full["determinism"]["provided"] is False
     assert full["smoke_attestation"] == smoke
     assert full["recommend_for_opt_in_integration"] is False
     assert json.loads(output.read_text()) == full
     assert output.stat().st_mode & 0o777 == 0o600
+
+    determinism = {
+        "provided": True,
+        "passed": True,
+        "attested": True,
+        "protocol": "test",
+    }
+    monkeypatch.setattr(
+        attest,
+        "_validate_cross_process_determinism",
+        lambda **_kwargs: determinism,
+    )
+    promoted = attest.validate_and_attest_benchmark(
+        private / "full.json",
+        private / "full-summary.json",
+        output_path=None,
+        expected_mode="benchmark",
+        write_output=False,
+        determinism_pairs=(
+            (private / "numerics-1.json", private / "numerics-1-summary.json"),
+            (private / "numerics-2.json", private / "numerics-2-summary.json"),
+        ),
+    )
+    assert promoted["timing_qualified"] is True
+    assert promoted["determinism_attested"] is True
+    assert promoted["performance"]["determinism_attested"] is True
+    assert promoted["performance_qualified"] is True
+    assert promoted["recommend_for_opt_in_integration"] is True
+    assert promoted["determinism"] == determinism
+
+    performance_passes["value"] = False
+    timing_failed = attest.validate_and_attest_benchmark(
+        private / "full.json",
+        private / "full-summary.json",
+        output_path=None,
+        expected_mode="benchmark",
+        write_output=False,
+        determinism_pairs=(
+            (private / "numerics-1.json", private / "numerics-1-summary.json"),
+            (private / "numerics-2.json", private / "numerics-2-summary.json"),
+        ),
+    )
+    assert timing_failed["determinism_attested"] is True
+    assert timing_failed["timing_qualified"] is False
+    assert timing_failed["performance_qualified"] is False
+    assert timing_failed["recommend_for_opt_in_integration"] is False
 
     state["smoke"] = {**smoke, "passed": False}
     with pytest.raises(RuntimeError, match="embedded smoke attestation changed"):

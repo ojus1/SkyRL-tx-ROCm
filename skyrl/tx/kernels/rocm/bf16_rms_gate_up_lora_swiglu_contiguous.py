@@ -18,8 +18,12 @@ GEMMs without recomputing either forward projection. Smaller full-tile
 geometries are accepted exclusively by Pallas's CPU interpreter for focused
 semantic tests; non-interpreted calls require the exact production shapes.
 
-This module is not wired into model code and makes no GPU compilation or
-performance claim.
+The default-off Qwen3.5 model integration uses this only in SkyRL's LoRA-only
+training path. Its differentiation contract intentionally returns cotangents
+for ``x`` and the selected LoRA A/B matrices only; ``rms_delta``, the base
+projection, and LoRA scaling are frozen. Isolated gfx1100 evidence qualifies
+the exact production geometry, but unsupported model calls retain the ordinary
+path until end-to-end promotion is complete.
 """
 
 from __future__ import annotations
@@ -708,7 +712,9 @@ def bf16_rms_gate_up_lora_swiglu_contiguous(
 ) -> jax.Array:
     """Run the isolated two-stage forward after an explicit opt-in.
 
-    All tensor inputs, including scalar ``lora_scaling``, must be BF16.  A
+    All tensor inputs, including scalar ``lora_scaling``, must be BF16. Only
+    ``x`` and the selected rank-eight LoRA A/B matrices are differentiable;
+    ``rms_delta``, ``frozen_weight``, and ``lora_scaling`` are frozen. A
     non-interpreted call accepts only the exact production tensor shapes;
     smaller full tiles exist solely for ``interpret=True`` CPU semantics.
     """

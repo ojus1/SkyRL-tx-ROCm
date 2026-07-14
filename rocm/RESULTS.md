@@ -809,13 +809,86 @@ profile summary `1e0fbca1b14c3594afb573c4d5a3e7bc23095b57dec619453042cecfaa54298
 and CPU attestation
 `3cd6e6391dcb2632e3dbcba146f6cb03cce0db0f2e24919b1d3e2c2864e56eff`.
 
+## Contiguous BF16 RMS/gate-up/LoRA/SwiGLU successor
+
+Revision `a135780c89a6ec701fc996e830a21890c97d4fd4` replaced the strided
+no-go above with an exact, still default-off contiguous-layout candidate for
+`B1/T64/M64/K2560/physical-N18432/product-N9216/rank8`. It preserves the
+checkpoint's adjacent `(gate0, up0, gate1, up1, ...)` columns. One bounded
+Pallas call materializes normalized BF16 X, rank-8 LoRA-A output, and the FP32
+RMS vectors; a second consumes contiguous physical-N tiles and writes the BF16
+SwiGLU product. The custom VJP saves the fused BF16 projection and uses five
+library GEMMs without replaying the dense forward. This is a two-dispatch
+operation boundary, not a literal single GPU megakernel.
+
+The guarded compile-only rung lowered and compiled the reference and candidate
+forward and forward-plus-VJP programs exactly once, with zero returned
+executable invocations. The candidate forward contained the two expected
+Pallas calls and one library dot; its forward-plus-VJP contained those two
+Pallas calls and six total dots. The reference contained no Pallas call and
+three/eight dots respectively.
+
+The next fresh process invoked each of those four programs exactly once under
+an independent five-second cgroup watchdog. Against the BF16 JAX boundary, all
+candidate results passed the user-authorized 3% gradient gate and the output
+cosine gate:
+
+| Result | Relative L2 | Cosine where gated |
+|---|---:|---:|
+| Forward output | 0.0002374 | 0.999999972 |
+| VJP output | 0.0002811 | 0.999999960 |
+| dX | 0.0005684 | report-only |
+| dLoRA-A | 0.0012808 | report-only |
+| dLoRA-B | 0.0007217 | report-only |
+
+The full guarded benchmark then completed 8 warmup and 32 measured
+supercycles. All 160 program dispatches, setup, and teardown completed their
+independent watchdogs, and every one of the 32 paired cycles favored the
+candidate:
+
+| Boundary | BF16 JAX reference | Contiguous candidate | Speedup / latency reduction |
+|---|---:|---:|---:|
+| Forward | 0.584814 ms | 0.450090 ms | 1.2993x / 23.04% |
+| Forward + VJP | 0.902324 ms | 0.652571 ms | 1.3827x / 27.68% |
+| Rematerialized stage | 1.487138 ms | 1.102660 ms | 1.3487x / 25.85% |
+
+The profile peaked at 64 C, 161 W, and 20,053,565,440 B physical VRAM, with
+24,576 B swap and no driver error. The shared fixed-BFC process plateau cannot
+separate candidate from reference residency, so this run makes no comparative
+memory-saving claim. Explicit saved backward state is 2,360,832 B, which is a
+logical state inventory rather than a measured allocation delta.
+
+This clears isolated speed and numerical promotion for opt-in model
+integration. It does **not** authorize default enablement: a second independent
+numerics process, integrated route proof, and paired end-to-end T64 learner run
+are still required. The older strided candidate remains a historical no-go;
+its result must not be used to reject this different contiguous schedule.
+
+Private evidence directories are
+`/tmp/skyrl-bf16-contiguous-compile.rJ1qDQ7A`,
+`/tmp/skyrl-bf16-contiguous-numerics.MnNEQzTf`,
+`/tmp/skyrl-bf16-contiguous-benchmark-smoke.5UHStzBC`, and
+`/tmp/skyrl-bf16-contiguous-benchmark.BITmwSRv`. The full benchmark SHA-256
+bindings are raw result
+`0c3e19901160d4f25242794364c4dd112446244281dfd2e98244101050566684`,
+progress
+`3be8cd180c94a7503e88ef90f1e93943a1031a4713e3f06fea548e443d67a077`,
+telemetry
+`0bf1c7780f8faf57488c820c1675bc9542a3c8e9137e9444fd56f7e97d7f6eaa`,
+profile summary
+`9927f1b58663f671b9e6da420baffeb57fb6d1a8c469e7ffae46ef7c7da0968d`,
+and CPU attestation
+`784225620db7dce86a733aa88886154629b94544783cf24cf390a31c799285c3`.
+
 ## Validation frontier
 
 The post-fix full-model SFT validation frontier is currently context 1,024. A
 fixed-rollout GRPO learner control is verified at context 64; real sampling,
 fixed-real-rollout replay, KL/reward comparison, and end-to-end GRPO remain
-unverified. Contexts above 1,024, quantized model execution, and fused-kernel
-execution also remain unverified. The isolated Pallas numerical blocker is
+unverified. The contiguous T64 MLP-up operation is isolated-speed/numerics
+qualified but not yet end-to-end qualified. Contexts above 1,024, quantized
+model execution, and all other fused-kernel model execution remain unverified.
+The isolated Pallas numerical blocker is
 cleared through 2,048 tokens: the user-authorized outer gradient gate requires
 strictly below 3% (`<3%`), and the forward-output gate remains strictly below
 1% (`<1%`). The current guarded FP32-delta path's worst observed dK result,

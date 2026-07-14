@@ -8,6 +8,9 @@ from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
 from skyrl.tx.kernels.rocm.bf16_lora_residual import bf16_lora_residual
+from skyrl.tx.kernels.rocm.bf16_rms_gate_up_lora_swiglu_contiguous import (
+    bf16_rms_gate_up_lora_swiglu_contiguous,
+)
 from skyrl.tx.layers.attention import dot_product_attention
 from skyrl.tx.layers.lora import FusedLoRALinear, LoRAEmbed, LoRALinear
 from skyrl.tx.layers.rotary_embedding import apply_rope
@@ -58,9 +61,7 @@ def recurrent_gated_delta_rule(
     # Match the Transformers/FLA reference: normalize in the input dtype, then
     # keep the recurrent state and all delta-rule arithmetic in FP32. The
     # output is cast back, while the cache remains FP32 across decode steps.
-    query, key, value, g, beta = (
-        item.astype(jnp.float32) for item in (query, key, value, g, beta)
-    )
+    query, key, value, g, beta = (item.astype(jnp.float32) for item in (query, key, value, g, beta))
 
     query = query * (1.0 / math.sqrt(query.shape[-1]))
 
@@ -150,9 +151,7 @@ def chunk_gated_delta_rule(
 
     # The reference fallback and the optimized FLA contract accumulate the
     # delta rule/state in FP32 even for BF16 model inputs.
-    query, key, value, g, beta = (
-        item.astype(jnp.float32) for item in (query, key, value, g, beta)
-    )
+    query, key, value, g, beta = (item.astype(jnp.float32) for item in (query, key, value, g, beta))
 
     # [B, T, H, D] -> [B, H, T, D] for easier chunk processing
     query = jnp.transpose(query, (0, 2, 1, 3))
@@ -616,6 +615,15 @@ class Qwen3_5MLP(nnx.Module):
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
         self.qwen35_bf16_down_lora_residual = bool(config.qwen35_bf16_down_lora_residual)
+        self.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = bool(
+            config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous
+        )
+        if self.qwen35_bf16_down_lora_residual and self.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous:
+            raise ValueError(
+                "the Qwen3.5 BF16 MLP-up and MLP-down experimental fusions "
+                "cannot be enabled together until their composed custom-VJP "
+                "path is qualified"
+            )
 
         self.gate_up_proj = FusedLoRALinear(
             hidden_size,
@@ -670,20 +678,95 @@ class Qwen3_5MLP(nnx.Module):
             and get_abstract_mesh().shape.get("tp", 1) == 1
         )
 
-    def __call__(
+    def _can_use_bf16_rms_gate_up_lora_swiglu_contiguous(
         self,
         x: jax.Array,
-        adapter_indices: jax.Array | None = None,
-        *,
-        residual: jax.Array | None = None,
+        rms_delta: jax.Array,
+        rms_eps: float,
+        adapter_indices: jax.Array | None,
+        residual: jax.Array | None,
+    ) -> bool:
+        mesh_shape = get_abstract_mesh().shape
+        return bool(
+            self.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous
+            and adapter_indices is not None
+            and adapter_indices.shape == (1,)
+            and adapter_indices.dtype == jnp.int32
+            and x.shape == (1, 64, 2560)
+            and x.dtype == jnp.bfloat16
+            and residual is not None
+            and residual.shape == (1, 64, 2560)
+            and residual.dtype == jnp.bfloat16
+            and rms_delta.shape == (2560,)
+            and rms_delta.dtype == jnp.bfloat16
+            and rms_eps == 1e-6
+            and self.gate_up_proj.components == ("gate_proj", "up_proj")
+            and self.gate_up_proj.group_sizes == (1, 1)
+            and self.gate_up_proj.bias is None
+            and self.gate_up_proj.kernel.shape == (2560, 18432)
+            and self.gate_up_proj.kernel.dtype == jnp.bfloat16
+            and self.gate_up_proj.max_lora_rank == 8
+            and self.gate_up_proj.lora_A is not None
+            and self.gate_up_proj.lora_B is not None
+            and self.gate_up_proj.lora_scaling is not None
+            and self.gate_up_proj.max_lora_adapters > 0
+            and len(self.gate_up_proj.lora_A.shape) == 3
+            and len(self.gate_up_proj.lora_B.shape) == 3
+            and len(self.gate_up_proj.lora_scaling.shape) == 1
+            and self.gate_up_proj.lora_A.shape[1:] == (2560, 8)
+            and self.gate_up_proj.lora_B.shape[1:] == (8, 18432)
+            and self.gate_up_proj.lora_A.shape[0]
+            == self.gate_up_proj.lora_B.shape[0]
+            == self.gate_up_proj.max_lora_adapters
+            and self.gate_up_proj.lora_scaling.shape == (self.gate_up_proj.max_lora_adapters,)
+            and self.gate_up_proj.lora_A.dtype == jnp.bfloat16
+            and self.gate_up_proj.lora_B.dtype == jnp.bfloat16
+            and self.gate_up_proj.lora_scaling.dtype == jnp.bfloat16
+            and all(mesh_shape.get(axis, 1) == 1 for axis in ("fsdp", "ep", "tp"))
+        )
+
+    def _bf16_rms_gate_up_lora_swiglu_contiguous(
+        self,
+        x: jax.Array,
+        rms_delta: jax.Array,
+        rms_eps: float,
+        adapter_indices: jax.Array,
+        residual: jax.Array,
     ) -> jax.Array:
-        gate_out, up_out = self.gate_up_proj(x, adapter_indices=adapter_indices)
-        product = nnx.silu(gate_out) * up_out
+        """Run the exact frozen-base stage for one selected LoRA adapter.
+
+        The custom VJP differentiates only ``x`` and the selected LoRA A/B
+        matrices. RMSNorm weights, the base projection, and LoRA scaling stay
+        frozen, matching the JAX backend's LoRA-only optimizer contract.
+        """
+        if not self._can_use_bf16_rms_gate_up_lora_swiglu_contiguous(x, rms_delta, rms_eps, adapter_indices, residual):
+            raise RuntimeError(
+                "the exact contiguous BF16 Qwen3.5 MLP-up path was selected " "outside its qualified geometry"
+            )
+        lora_a, lora_b, scaling = self.gate_up_proj._select_single_adapter_lora(adapter_indices[0])
+        return bf16_rms_gate_up_lora_swiglu_contiguous(
+            x,
+            rms_delta,
+            self.gate_up_proj.kernel[...],
+            lora_a,
+            lora_b,
+            scaling,
+            enabled=True,
+            eps=rms_eps,
+            block_m=16,
+            block_physical_n=64,
+            block_k=32,
+        )
+
+    def _apply_down(
+        self,
+        product: jax.Array,
+        residual: jax.Array | None,
+        adapter_indices: jax.Array | None,
+    ) -> jax.Array:
         if self._can_use_bf16_down_lora_residual(product, residual, adapter_indices):
             assert adapter_indices is not None and residual is not None
-            lora_a, lora_b, scaling = self.down_proj._select_single_adapter_lora(
-                adapter_indices[0]
-            )
+            lora_a, lora_b, scaling = self.down_proj._select_single_adapter_lora(adapter_indices[0])
             return bf16_lora_residual(
                 product,
                 self.down_proj.kernel[...],
@@ -699,6 +782,48 @@ class Qwen3_5MLP(nnx.Module):
             )
         output = self.down_proj(product, adapter_indices=adapter_indices)
         return output if residual is None else residual + output
+
+    def forward_with_post_attention_rms(
+        self,
+        x: jax.Array,
+        rms_norm: Qwen3_5RMSNorm,
+        adapter_indices: jax.Array | None = None,
+        *,
+        residual: jax.Array | None = None,
+    ) -> jax.Array:
+        rms_delta = rms_norm.weight[...]
+        if self._can_use_bf16_rms_gate_up_lora_swiglu_contiguous(
+            x,
+            rms_delta,
+            rms_norm.eps,
+            adapter_indices,
+            residual,
+        ):
+            assert adapter_indices is not None and residual is not None
+            product = self._bf16_rms_gate_up_lora_swiglu_contiguous(
+                x,
+                rms_delta,
+                rms_norm.eps,
+                adapter_indices,
+                residual,
+            )
+            return self._apply_down(product, residual, adapter_indices)
+        return self(
+            rms_norm(x),
+            adapter_indices=adapter_indices,
+            residual=residual,
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        adapter_indices: jax.Array | None = None,
+        *,
+        residual: jax.Array | None = None,
+    ) -> jax.Array:
+        gate_out, up_out = self.gate_up_proj(x, adapter_indices=adapter_indices)
+        product = nnx.silu(gate_out) * up_out
+        return self._apply_down(product, residual, adapter_indices)
 
 
 class Qwen3_5DecoderLayer(nnx.Module):
@@ -727,6 +852,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
         kv_cache: tuple[jax.Array, jax.Array] | None = None,
         conv_state: jax.Array | None = None,
         recurrent_state: jax.Array | None = None,
+        allow_bf16_rms_gate_up_lora_swiglu_contiguous: bool = False,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array] | None, jax.Array | None, jax.Array | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -754,8 +880,20 @@ class Qwen3_5DecoderLayer(nnx.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, adapter_indices=adapter_indices, residual=residual)
+        if allow_bf16_rms_gate_up_lora_swiglu_contiguous:
+            hidden_states = self.mlp.forward_with_post_attention_rms(
+                hidden_states,
+                self.post_attention_layernorm,
+                adapter_indices=adapter_indices,
+                residual=residual,
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(
+                hidden_states,
+                adapter_indices=adapter_indices,
+                residual=residual,
+            )
 
         return hidden_states, updated_kv, new_conv_state, new_recurrent_state
 
@@ -773,6 +911,7 @@ def _run_training_decoder_layer(
         attention_mask=attention_mask,
         positions=positions,
         adapter_indices=adapter_indices,
+        allow_bf16_rms_gate_up_lora_swiglu_contiguous=True,
     )
     return hidden_states
 
@@ -850,9 +989,7 @@ class Qwen3_5TextModel(nnx.Module):
             # Prefill/decode inference stays on the cache-producing path.
             if is_training and not has_cache:
                 training_layer = (
-                    _remat_training_decoder_layer
-                    if self.config.gradient_checkpointing
-                    else _run_training_decoder_layer
+                    _remat_training_decoder_layer if self.config.gradient_checkpointing else _run_training_decoder_layer
                 )
                 hidden_states = training_layer(
                     layer,

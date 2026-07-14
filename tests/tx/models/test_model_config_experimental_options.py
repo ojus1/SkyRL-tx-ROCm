@@ -24,6 +24,7 @@ def test_tied_logprob_option_is_default_off() -> None:
     )
     assert config.tied_logprob_vocab_superblock_size == 0
     assert config.qwen35_bf16_down_lora_residual is False
+    assert config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous is False
 
 
 def test_tied_logprob_option_propagates_to_nested_text_config() -> None:
@@ -35,10 +36,12 @@ def test_tied_logprob_option_propagates_to_nested_text_config() -> None:
         loss_chunk_size=256,
         tied_logprob_vocab_superblock_size=4096,
         qwen35_bf16_down_lora_residual=True,
+        qwen35_bf16_rms_gate_up_lora_swiglu_contiguous=True,
     )
 
     text_config = config.get_text_config()
     assert text_config.loss_chunk_size == 256
     assert text_config.tied_logprob_vocab_superblock_size == 4096
     assert text_config.qwen35_bf16_down_lora_residual is True
+    assert text_config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous is True
     assert text_config.vocab_size == 41

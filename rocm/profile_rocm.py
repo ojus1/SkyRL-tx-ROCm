@@ -14,7 +14,8 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
@@ -26,6 +27,17 @@ import psutil
 _SENSITIVE_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH", "COOKIE")
 _SENSITIVE_ARGUMENT_FLAGS = ("--header", "--proxy-header", "--user", "--proxy-user", "-u")
 _GIB = 1024**3
+_INCLUDED_SAFETY_STOP_STATUSES = frozenset({"safety_limit", "driver_error"})
+_INCLUDED_ABORT_STOP_STATUSES = frozenset(
+    {
+        "safety_limit",
+        "driver_error",
+        "timeout",
+        "signal",
+        "command_failed",
+        "error",
+    }
+)
 try:
     from rocm.amdgpu_safety import AMDGPU_FATAL_PATTERN as _AMDGPU_FATAL_PATTERN
 except ModuleNotFoundError:
@@ -72,11 +84,7 @@ def _redact_argv(values: list[str]) -> list[str]:
             continue
         lowered = value.lower()
         sensitive_flag = next(
-            (
-                flag
-                for flag in _SENSITIVE_ARGUMENT_FLAGS
-                if lowered == flag or lowered.startswith(f"{flag}=")
-            ),
+            (flag for flag in _SENSITIVE_ARGUMENT_FLAGS if lowered == flag or lowered.startswith(f"{flag}=")),
             None,
         )
         if sensitive_flag is not None:
@@ -124,9 +132,7 @@ def _write_private_text(path: Path, value: str) -> None:
         output.write(value)
 
 
-def _validated_pass_fds(
-    values: list[int], *, fstat_fn: Callable[[int], os.stat_result] = os.fstat
-) -> tuple[int, ...]:
+def _validated_pass_fds(values: list[int], *, fstat_fn: Callable[[int], os.stat_result] = os.fstat) -> tuple[int, ...]:
     """Validate the narrow descriptor set inherited by a wrapped command."""
     if len(set(values)) != len(values):
         raise ValueError("duplicate --pass-fd values are not allowed")
@@ -183,21 +189,13 @@ def _kernel_driver_errors_since(epoch_seconds: float) -> list[str] | None:
 def _find_gpu(card_name: str | None) -> tuple[Path, Path | None, dict[str, Any]]:
     if card_name is not None and re.fullmatch(r"card\d+", card_name) is None:
         raise RuntimeError(f"Invalid DRM card name: {card_name!r}")
-    candidates = (
-        [Path("/sys/class/drm") / card_name]
-        if card_name
-        else sorted(Path("/sys/class/drm").glob("card*"))
-    )
+    candidates = [Path("/sys/class/drm") / card_name] if card_name else sorted(Path("/sys/class/drm").glob("card*"))
     for card in candidates:
         if not re.fullmatch(r"card\d+", card.name):
             continue
         device = card / "device"
         vendor_id = _read_text(device / "vendor")
-        if (
-            vendor_id is None
-            or vendor_id.lower() != "0x1002"
-            or not (device / "gpu_busy_percent").exists()
-        ):
+        if vendor_id is None or vendor_id.lower() != "0x1002" or not (device / "gpu_busy_percent").exists():
             continue
         hwmons = sorted((device / "hwmon").glob("hwmon*"))
         resolved_device = device.resolve()
@@ -362,10 +360,7 @@ def _sample(
         "host_swap_used_bytes": swap.used,
         "host_cpu_percent": psutil.cpu_percent(interval=None),
         "host_load_1m": os.getloadavg()[0],
-        "processes": {
-            label: _process_metrics(pid, target_create_times.get(label))
-            for label, pid in targets.items()
-        },
+        "processes": {label: _process_metrics(pid, target_create_times.get(label)) for label, pid in targets.items()},
     }
     if hwmon is not None:
         edge = _find_labeled_sensor(hwmon, "temp", "edge", "_input") or hwmon / "temp1_input"
@@ -570,8 +565,7 @@ def _summarize(
         counter_start = baseline_alive[-1] if baseline_alive else (alive_samples[0] if alive_samples else None)
         if counter_start is not None and alive_samples:
             process_summary["counter_deltas"] = {
-                key: float(alive_samples[-1][key]) - float(counter_start[key])
-                for key in ("read_bytes", "write_bytes")
+                key: float(alive_samples[-1][key]) - float(counter_start[key]) for key in ("read_bytes", "write_bytes")
             }
         summary["processes"][label] = process_summary
     return summary
@@ -696,11 +690,7 @@ def _terminate_process_trees(
     for pid in pids:
         try:
             root = psutil.Process(pid)
-            expected_create_time = (
-                expected_create_times.get(pid)
-                if expected_create_times is not None
-                else None
-            )
+            expected_create_time = expected_create_times.get(pid) if expected_create_times is not None else None
             if expected_create_time is not None and root.create_time() != expected_create_time:
                 continue
             if root.pid in protected_ids:
@@ -739,6 +729,40 @@ def _terminate_process_trees(
     return terminated_ids, survivor_ids
 
 
+def _included_termination_required(
+    status: str,
+    *,
+    terminate_on_safety: bool,
+    terminate_on_abort: bool,
+) -> bool:
+    """Return whether an opted-in included process tree must be stopped."""
+    return (terminate_on_abort and status in _INCLUDED_ABORT_STOP_STATUSES) or (
+        terminate_on_safety and status in _INCLUDED_SAFETY_STOP_STATUSES
+    )
+
+
+@contextmanager
+def _guard_included_processes_during_setup(
+    pids: list[int],
+    grace_seconds: float,
+    expected_create_times: Mapping[int, float],
+    *,
+    terminate_on_abort: bool,
+) -> Iterator[None]:
+    """Stop accepted included processes if profiler setup aborts.
+
+    The caller enters this guard only after every explicit PID identity has
+    been validated.  It ends after the initial manifest is durable, before the
+    existing runtime ``finally`` becomes responsible for abort cleanup.
+    """
+    try:
+        yield
+    except BaseException:
+        if terminate_on_abort:
+            _terminate_process_trees(pids, grace_seconds, expected_create_times)
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
@@ -760,6 +784,14 @@ def main() -> int:
         "--terminate-included-on-safety",
         action="store_true",
         help="also terminate every --include-pid tree after a safety limit or driver error",
+    )
+    parser.add_argument(
+        "--terminate-included-on-abort",
+        action="store_true",
+        help=(
+            "also terminate every --include-pid tree after a safety limit, driver "
+            "error, timeout, signal, wrapped-command failure, or profiler error"
+        ),
     )
     parser.add_argument(
         "--sensor-grace-seconds",
@@ -799,9 +831,7 @@ def main() -> int:
         or args.terminate_grace_seconds <= 0
         or args.sensor_grace_seconds < 0
     ):
-        parser.error(
-            "interval and terminate grace must be positive; baseline and sensor grace must be nonnegative"
-        )
+        parser.error("interval and terminate grace must be positive; baseline and sensor grace must be nonnegative")
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error("--duration must be positive")
     if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0):
@@ -836,6 +866,8 @@ def main() -> int:
         parser.error("the --include-pid label 'command' is reserved for the wrapped command")
     if args.terminate_included_on_safety and not explicit_targets:
         parser.error("--terminate-included-on-safety requires at least one --include-pid")
+    if args.terminate_included_on_abort and not explicit_targets:
+        parser.error("--terminate-included-on-abort requires at least one --include-pid")
 
     explicit_pid_create_times: dict[int, float] = {}
     for label, pid in explicit_targets.items():
@@ -849,57 +881,58 @@ def main() -> int:
         except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
             parser.error(f"--include-pid target {label}={pid} does not exist or is inaccessible")
 
-    device, hwmon, gpu_identity = _find_gpu(args.card)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    summary_path = args.output.with_suffix(args.output.suffix + ".summary.json")
-    if args.output.exists() or summary_path.exists():
-        parser.error("refusing to overwrite an existing telemetry or summary file")
+    with _guard_included_processes_during_setup(
+        list(explicit_targets.values()),
+        args.terminate_grace_seconds,
+        explicit_pid_create_times,
+        terminate_on_abort=args.terminate_included_on_abort,
+    ):
+        process: subprocess.Popen | None = None
+        samples: list[dict[str, Any]] = []
+        targets = dict(explicit_targets)
+        target_create_times = {label: explicit_pid_create_times[pid] for label, pid in explicit_targets.items()}
+        returncode: int | None = None
+        status = "running"
+        received_signal: int | None = None
+        safety_violation: dict[str, Any] | None = None
+        kernel_driver_errors: list[str] | None = None
+        terminated_explicit_pids: list[int] = []
+        surviving_explicit_pids: list[int] = []
+        explicit_termination_attempted = False
+        stop_requested = False
+        kernel_log_start = time.time()
+        start = time.monotonic()
+        measured_start: float | None = None
+        safety_limits = {
+            "max_junction_temp_c": args.max_junction_temp_c,
+            "max_gpu_power_watts": args.max_gpu_power_watts,
+            "max_vram_bytes": args.max_vram_gib * _GIB if args.max_vram_gib is not None else None,
+            "min_host_available_bytes": (
+                args.min_host_available_gib * _GIB if args.min_host_available_gib is not None else None
+            ),
+            "max_swap_bytes": args.max_swap_gib * _GIB if args.max_swap_gib is not None else None,
+        }
 
-    process: subprocess.Popen | None = None
-    samples: list[dict[str, Any]] = []
-    targets = dict(explicit_targets)
-    target_create_times = {
-        label: explicit_pid_create_times[pid]
-        for label, pid in explicit_targets.items()
-    }
-    returncode: int | None = None
-    status = "running"
-    received_signal: int | None = None
-    safety_violation: dict[str, Any] | None = None
-    kernel_driver_errors: list[str] | None = None
-    terminated_explicit_pids: list[int] = []
-    surviving_explicit_pids: list[int] = []
-    explicit_termination_attempted = False
-    stop_requested = False
-    kernel_log_start = time.time()
-    start = time.monotonic()
-    measured_start: float | None = None
-    safety_limits = {
-        "max_junction_temp_c": args.max_junction_temp_c,
-        "max_gpu_power_watts": args.max_gpu_power_watts,
-        "max_vram_bytes": args.max_vram_gib * _GIB if args.max_vram_gib is not None else None,
-        "min_host_available_bytes": (
-            args.min_host_available_gib * _GIB if args.min_host_available_gib is not None else None
-        ),
-        "max_swap_bytes": args.max_swap_gib * _GIB if args.max_swap_gib is not None else None,
-    }
+        def handle_signal(signum, _frame):
+            nonlocal received_signal, stop_requested
+            received_signal = signum
+            stop_requested = True
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signum)
+                except ProcessLookupError:
+                    pass
 
-    def handle_signal(signum, _frame):
-        nonlocal received_signal, stop_requested
-        received_signal = signum
-        stop_requested = True
-        if process is not None and process.poll() is None:
-            try:
-                os.killpg(process.pid, signum)
-            except ProcessLookupError:
-                pass
+        error: BaseException | None = None
+        device, hwmon, gpu_identity = _find_gpu(args.card)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        summary_path = args.output.with_suffix(args.output.suffix + ".summary.json")
+        if args.output.exists() or summary_path.exists():
+            parser.error("refusing to overwrite an existing telemetry or summary file")
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
 
-    error: BaseException | None = None
-    output_descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(output_descriptor, "w", encoding="utf-8") as output:
         manifest = {
             "record_type": "manifest",
             "timestamp": datetime.now(UTC).isoformat(),
@@ -911,6 +944,7 @@ def main() -> int:
             "safety_limits": safety_limits,
             "sensor_grace_seconds": args.sensor_grace_seconds,
             "terminate_included_on_safety": args.terminate_included_on_safety,
+            "terminate_included_on_abort": args.terminate_included_on_abort,
             "gpu": gpu_identity,
             "runtime": {
                 "python": sys.version,
@@ -939,8 +973,20 @@ def main() -> int:
             "command_recorded": args.record_command,
             "passed_file_descriptor_count": len(pass_fds),
         }
-        output.write(_json_dumps(manifest, separators=(",", ":")) + "\n")
-        output.flush()
+        output_descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            output = os.fdopen(output_descriptor, "w", encoding="utf-8")
+        except BaseException:
+            os.close(output_descriptor)
+            raise
+        try:
+            output.write(_json_dumps(manifest, separators=(",", ":")) + "\n")
+            output.flush()
+        except BaseException:
+            output.close()
+            raise
+
+    with output:
 
         def record(phase: str) -> dict[str, Any] | None:
             sample = _sample(device, hwmon, targets, target_create_times, start, phase)
@@ -1037,8 +1083,12 @@ def main() -> int:
             }:
                 status = "signal"
             # Do not delay termination of an explicitly opted-in server tree
-            # behind a journal query after an already-known guardrail stop.
-            if status in {"safety_limit", "driver_error"} and args.terminate_included_on_safety:
+            # behind a journal query after an already-known abort.
+            if _included_termination_required(
+                status,
+                terminate_on_safety=args.terminate_included_on_safety,
+                terminate_on_abort=args.terminate_included_on_abort,
+            ):
                 explicit_termination_attempted = True
                 terminated_explicit_pids, surviving_explicit_pids = _terminate_process_trees(
                     list(explicit_targets.values()),
@@ -1055,15 +1105,16 @@ def main() -> int:
             if kernel_driver_errors and status not in {"safety_limit", "error"}:
                 status = "driver_error"
             if status in {"completed", "targets_exited"}:
-                unobserved_sensor = _unobserved_required_sensor_violation(
-                    samples, safety_limits
-                )
+                unobserved_sensor = _unobserved_required_sensor_violation(samples, safety_limits)
                 if unobserved_sensor is not None:
                     safety_violation = unobserved_sensor
                     status = "safety_limit"
             if (
-                status in {"safety_limit", "driver_error"}
-                and args.terminate_included_on_safety
+                _included_termination_required(
+                    status,
+                    terminate_on_safety=args.terminate_included_on_safety,
+                    terminate_on_abort=args.terminate_included_on_abort,
+                )
                 and not explicit_termination_attempted
             ):
                 explicit_termination_attempted = True

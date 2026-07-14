@@ -256,6 +256,17 @@ def test_runtime_t64_cache_attestation_public_mode_is_exact(value: str) -> None:
     assert "must be exactly 0 or 1" in result.stderr
 
 
+@pytest.mark.parametrize("value", ["", "true", "2", "01"])
+def test_contiguous_fused_mlp_public_mode_is_exact(value: str) -> None:
+    result = _run_launcher_policy_only(
+        SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS=value
+    )
+
+    assert result.returncode == 2
+    assert "SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS" in result.stderr
+    assert "must be exactly 0 or 1" in result.stderr
+
+
 @pytest.mark.parametrize("buckets", ["", "640", "32,640", "164"])
 def test_runtime_t64_cache_attestation_requires_exact_bucket_64(
     buckets: str,
@@ -318,4 +329,16 @@ def test_cache_claim_is_formed_only_after_all_prewarm_release_gates() -> None:
     assert '"abstract_model_load":true' in source
     assert source.count('"qwen35_bf16_down_lora_residual":false') == 2
     assert '"qwen35_bf16_down_lora_residual":true' not in source
+    assert (
+        'bf16_rms_gate_up_lora_swiglu_contiguous="${SKYRL_QWEN35_'
+        'BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS-0}"'
+    ) in source
+    assert (
+        source.count(
+            '"qwen35_bf16_rms_gate_up_lora_swiglu_contiguous":'
+            "'\"$bf16_rms_gate_up_lora_swiglu_contiguous_json\"'"
+        )
+        == 2
+    )
+    assert "--qwen35-bf16-rms-gate-up-lora-swiglu-contiguous" in source
     assert source.count("--max-gpu-power-watts 400") == 1

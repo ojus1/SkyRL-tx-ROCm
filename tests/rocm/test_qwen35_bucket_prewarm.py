@@ -380,6 +380,14 @@ def test_optimizer_compile_requires_literal_cli_flag_and_stays_plan_only() -> No
     assert "ignored explicit argument" in malformed.stderr
 
 
+def test_contiguous_fused_mlp_requires_operational_rocm_acknowledgements() -> None:
+    result = _run("--qwen35-bf16-rms-gate-up-lora-swiglu-contiguous")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "only valid with --execute-rocm and --allow-gpu" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -1514,6 +1522,163 @@ class _FakeCompiled:
         raise AssertionError("compiled executable was invoked")
 
 
+class _RouteWeight:
+    shape = (2560,)
+    dtype = "bf16"
+
+    def __getitem__(self, _key: object) -> _RouteWeight:
+        return self
+
+
+class _RouteMlp:
+    def __init__(self, jax: _RouteJax, *, enabled: bool) -> None:
+        self.jax = jax
+        self.enabled = enabled
+        self.calls: list[tuple[object, ...]] = []
+
+    def _can_use_bf16_rms_gate_up_lora_swiglu_contiguous(
+        self,
+        x: object,
+        rms_delta: object,
+        rms_eps: float,
+        adapter_indices: object,
+        residual: object,
+    ) -> bool:
+        assert self.jax.active_mesh == "mesh"
+        self.calls.append((x, rms_delta, rms_eps, adapter_indices, residual))
+        return bool(
+            self.enabled
+            and x.shape == (1, 64, 2560)
+            and x.dtype == "bf16"
+            and residual.shape == (1, 64, 2560)
+            and residual.dtype == "bf16"
+            and rms_delta.shape == (2560,)
+            and rms_delta.dtype == "bf16"
+            and rms_eps == 1e-6
+            and adapter_indices.shape == (1,)
+            and adapter_indices.dtype == "int32"
+        )
+
+
+class _RouteJax:
+    def __init__(self) -> None:
+        self.active_mesh: object | None = None
+
+    @staticmethod
+    def ShapeDtypeStruct(shape: tuple[int, ...], dtype: object) -> object:
+        return SimpleNamespace(shape=shape, dtype=dtype)
+
+    @contextmanager
+    def set_mesh(self, mesh: object):
+        assert self.active_mesh is None
+        self.active_mesh = mesh
+        try:
+            yield mesh
+        finally:
+            self.active_mesh = None
+
+
+def _route_backend(
+    jax: _RouteJax,
+    *,
+    enabled: bool,
+    layer_count: int = 32,
+    failed_layer: int | None = None,
+) -> tuple[SimpleNamespace, list[_RouteMlp]]:
+    mlps = [
+        _RouteMlp(jax, enabled=enabled and layer_index != failed_layer)
+        for layer_index in range(layer_count)
+    ]
+    layers = [
+        SimpleNamespace(
+            post_attention_layernorm=SimpleNamespace(
+                weight=_RouteWeight(), eps=1e-6
+            ),
+            mlp=mlp,
+        )
+        for mlp in mlps
+    ]
+    backend = SimpleNamespace(
+        mesh="mesh",
+        model=SimpleNamespace(
+            model=SimpleNamespace(
+                language_model=SimpleNamespace(layers=layers)
+            )
+        ),
+    )
+    return backend, mlps
+
+
+@pytest.mark.parametrize(
+    ("enabled", "bucket", "status", "qualified_count"),
+    [
+        (True, 64, "qualified", 32),
+        (True, 256, "disabled-for-bucket", 0),
+        (False, 64, "disabled-globally", 0),
+    ],
+)
+def test_fused_mlp_route_qualification_uses_all_real_layer_predicates(
+    enabled: bool,
+    bucket: int,
+    status: str,
+    qualified_count: int,
+) -> None:
+    jax = _RouteJax()
+    backend, mlps = _route_backend(jax, enabled=enabled)
+
+    result = prewarm._qualify_fused_mlp_route(
+        jax,
+        SimpleNamespace(bfloat16="bf16", int32="int32"),
+        backend,
+        bucket=bucket,
+        enabled=enabled,
+    )
+
+    assert result["kind"] == (
+        prewarm.cache_attestation.FUSED_MLP_ROUTE_KIND
+    )
+    assert result["enabled"] is enabled
+    assert result["bucket"] == bucket
+    assert result["status"] == status
+    assert result["expected_layer_count"] == qualified_count
+    assert result["qualified_layer_count"] == qualified_count
+    assert result["qualified_layer_indices"] == result["expected_layer_indices"]
+    assert all(len(mlp.calls) == 1 for mlp in mlps)
+    assert jax.active_mesh is None
+
+
+def test_fused_mlp_route_qualification_fails_if_one_t64_layer_misses() -> None:
+    jax = _RouteJax()
+    backend, mlps = _route_backend(jax, enabled=True, failed_layer=17)
+
+    with pytest.raises(RuntimeError, match="did not match its exact bucket policy"):
+        prewarm._qualify_fused_mlp_route(
+            jax,
+            SimpleNamespace(bfloat16="bf16", int32="int32"),
+            backend,
+            bucket=64,
+            enabled=True,
+        )
+
+    assert all(len(mlp.calls) == 1 for mlp in mlps)
+
+
+def test_fused_mlp_route_qualification_requires_exact_decoder_depth() -> None:
+    jax = _RouteJax()
+    backend, mlps = _route_backend(jax, enabled=True, layer_count=31)
+
+    with pytest.raises(RuntimeError, match="exactly 32 decoder layers"):
+        prewarm._qualify_fused_mlp_route(
+            jax,
+            SimpleNamespace(bfloat16="bf16", int32="int32"),
+            backend,
+            bucket=64,
+            enabled=True,
+        )
+
+    assert not any(mlp.calls for mlp in mlps)
+
+
 class _FakeLowered:
     def __init__(self) -> None:
         self.compile_calls = 0
@@ -1811,6 +1976,10 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
 
     opt_in = 'prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"'
     optimizer_opt_in = 'prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"'
+    fused_mlp_opt_in = (
+        'bf16_rms_gate_up_lora_swiglu_contiguous="${SKYRL_QWEN35_'
+        'BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS-0}"'
+    )
     prewarm_only_opt_in = 'prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"'
     invocation = "--module rocm.prewarm_qwen35_buckets"
     final_journal_gate = "if run_amdgpu_safety >/dev/null; then"
@@ -1818,6 +1987,7 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     stable_api_exec = "  exec /usr/bin/env -i \\\n"
     assert opt_in in source
     assert optimizer_opt_in in source
+    assert fused_mlp_opt_in in source
     assert prewarm_only_opt_in in source
     assert "0|1) ;;" in source
     assert "PYTHON*|UV_*|__PYVENV_LAUNCHER__|VIRTUAL_ENV|VIRTUAL_ENV_PROMPT)" in (
@@ -1831,6 +2001,8 @@ def test_launcher_integration_is_default_off_and_after_cache_graph_policy() -> N
     ) in source
     assert "prewarm_optimizer_args=(--compile-optimizer)" in source
     assert '"${prewarm_optimizer_args[@]}"' in source
+    assert '"${prewarm_bf16_rms_gate_up_args[@]}"' in source
+    assert "--qwen35-bf16-rms-gate-up-lora-swiglu-contiguous" in source
     assert "export JAX_ENABLE_PGLE=false" in source
     assert "export JAX_COMPILATION_CACHE_EXPECT_PGLE=false" in source
     assert source.count("export JAX_ENABLE_PGLE=") == 1

@@ -30,6 +30,7 @@ class ModelConfig(PretrainedConfig):
     gradient_checkpointing: bool
     mhc_expansion_rate: int
     qwen35_bf16_down_lora_residual: bool
+    qwen35_bf16_rms_gate_up_lora_swiglu_contiguous: bool
 
     def __init__(
         self,
@@ -43,6 +44,7 @@ class ModelConfig(PretrainedConfig):
         gradient_checkpointing: bool = False,
         mhc_expansion_rate: int = 1,
         qwen35_bf16_down_lora_residual: bool = False,
+        qwen35_bf16_rms_gate_up_lora_swiglu_contiguous: bool = False,
     ):
         # Preserve the source config's attribute_map (e.g. Qwen3MoeConfig's
         # num_experts -> num_local_experts alias) — transformers v5.4 made
@@ -60,6 +62,9 @@ class ModelConfig(PretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.mhc_expansion_rate = mhc_expansion_rate
         self.qwen35_bf16_down_lora_residual = qwen35_bf16_down_lora_residual
+        self.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = (
+            qwen35_bf16_rms_gate_up_lora_swiglu_contiguous
+        )
 
         # super().__init__ setattrs every key from config_dict, which would
         # silently overwrite the attributes set above on any overlap.
@@ -103,6 +108,9 @@ class ModelConfig(PretrainedConfig):
             gradient_checkpointing=self.gradient_checkpointing,
             mhc_expansion_rate=self.mhc_expansion_rate,
             qwen35_bf16_down_lora_residual=self.qwen35_bf16_down_lora_residual,
+            qwen35_bf16_rms_gate_up_lora_swiglu_contiguous=(
+                self.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous
+            ),
         )
 
     def get_num_experts(self):

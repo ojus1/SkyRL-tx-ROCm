@@ -13,6 +13,7 @@ from skyrl.tinker.types import LoraConfig
 from skyrl.tx.layers.lora import init_lora_adapter
 from skyrl.tx.models.configs import Qwen3_5Config
 from skyrl.tx.models.qwen3_5 import (
+    Qwen3_5DecoderLayer,
     Qwen3_5ForCausalLM,
     Qwen3_5GatedDeltaNet,
     Qwen3_5MLP,
@@ -95,8 +96,7 @@ def _checkpointing_training_result(use_checkpointing: bool) -> dict:
         (loss, hidden_states), gradients = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))(lora_params)
 
         gradient_leaves = [
-            (jax.tree_util.keystr(path), np.asarray(value))
-            for path, value in jax.tree.leaves_with_path(gradients)
+            (jax.tree_util.keystr(path), np.asarray(value)) for path, value in jax.tree.leaves_with_path(gradients)
         ]
         return {
             "loss": np.asarray(loss),
@@ -240,20 +240,12 @@ def test_gated_delta_rule_matches_transformers_fp32_reference(implementation: st
     values = {name: rng.normal(size=shape).astype(np.float32) for name, shape in shapes.items()}
     values["gate"] = -np.abs(values["gate"]) * 0.03
     beta = rng.uniform(size=shapes["gate"]).astype(np.float32)
-    initial_state = (
-        rng.normal(size=(batch_size, num_heads, key_dim, value_dim)).astype(np.float32) * 0.02
-    )
+    initial_state = rng.normal(size=(batch_size, num_heads, key_dim, value_dim)).astype(np.float32) * 0.02
 
-    jax_inputs = [
-        jnp.asarray(values[name], dtype=jnp.bfloat16)
-        for name in ("query", "key", "value", "gate")
-    ]
+    jax_inputs = [jnp.asarray(values[name], dtype=jnp.bfloat16) for name in ("query", "key", "value", "gate")]
     jax_beta = jnp.asarray(beta, dtype=jnp.bfloat16)
     jax_initial_state = jnp.asarray(initial_state, dtype=jnp.float32)
-    torch_inputs = [
-        torch.tensor(values[name], dtype=torch.bfloat16)
-        for name in ("query", "key", "value", "gate")
-    ]
+    torch_inputs = [torch.tensor(values[name], dtype=torch.bfloat16) for name in ("query", "key", "value", "gate")]
     torch_beta = torch.tensor(beta, dtype=torch.bfloat16)
     torch_initial_state = torch.tensor(initial_state, dtype=torch.float32)
 
@@ -323,9 +315,7 @@ def test_rms_norm_matches_transformers_bf16_reference():
     reference_norm = HFRMSNorm(dim, eps=eps)
     with torch.no_grad():
         reference_norm.weight.copy_(torch.from_numpy(np.asarray(weight, dtype=np.float32)))
-        expected = reference_norm(
-            torch.from_numpy(np.asarray(x, dtype=np.float32)).to(torch.bfloat16)
-        )
+        expected = reference_norm(torch.from_numpy(np.asarray(x, dtype=np.float32)).to(torch.bfloat16))
 
     actual_f32 = np.asarray(actual, dtype=np.float32)
     expected_f32 = expected.float().numpy()
@@ -346,6 +336,15 @@ def test_gated_delta_net_preserves_checkpoint_fp32_parameters_in_bf16_model():
     assert layer.A_log[...].dtype == jnp.float32
     assert layer.norm.weight[...].dtype == jnp.float32
     assert layer.dt_bias[...].dtype == jnp.bfloat16
+
+
+def test_qwen35_mlp_rejects_unqualified_up_down_fusion_composition():
+    config = _tiny_qwen3_5_config(gradient_checkpointing=True)
+    config.qwen35_bf16_down_lora_residual = True
+    config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = True
+
+    with jax.set_mesh(_tiny_mesh()), pytest.raises(ValueError, match="cannot be enabled together"):
+        Qwen3_5MLP(config, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
 
 
 def test_qwen35_bf16_down_fusion_selects_only_exact_t64_single_adapter(
@@ -393,9 +392,7 @@ def test_qwen35_bf16_down_fusion_selects_only_exact_t64_single_adapter(
     fused_calls = []
 
     def fused_spy(product, weight, lora_a, lora_b, scaling, residual, **kwargs):
-        fused_calls.append(
-            (product.shape, weight.shape, lora_a.shape, lora_b.shape, scaling, kwargs)
-        )
+        fused_calls.append((product.shape, weight.shape, lora_a.shape, lora_b.shape, scaling, kwargs))
         return residual + jnp.ones_like(residual)
 
     monkeypatch.setattr(qwen3_5_module, "bf16_lora_residual", fused_spy)
@@ -451,6 +448,343 @@ def test_qwen35_bf16_down_fusion_selects_only_exact_t64_single_adapter(
         assert len(fused_calls) == 1
 
 
+def test_qwen35_bf16_contiguous_mlp_up_selects_only_exact_t64_single_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeParam:
+        def __init__(self, shape, dtype, *, value=None):
+            self.shape = shape
+            self.dtype = dtype
+            self.value = jax.ShapeDtypeStruct(shape, dtype) if value is None else value
+
+        def __getitem__(self, key):
+            assert key is Ellipsis
+            return self.value
+
+    class FakeGateUp:
+        components = ("gate_proj", "up_proj")
+        group_sizes = (1, 1)
+        bias = None
+        max_lora_adapters = 2
+        max_lora_rank = 8
+
+        def __init__(self):
+            self.kernel = FakeParam((2560, 18432), jnp.bfloat16)
+            self.lora_A = FakeParam((2, 2560, 8), jnp.bfloat16)
+            self.lora_B = FakeParam((2, 8, 18432), jnp.bfloat16)
+            self.lora_scaling = FakeParam((2,), jnp.bfloat16)
+            self.fallback_calls = 0
+            self.selected_adapter_indices = []
+
+        def _select_single_adapter_lora(self, adapter_index):
+            assert adapter_index.shape == ()
+            self.selected_adapter_indices.append(np.asarray(adapter_index).item())
+            return (
+                jax.ShapeDtypeStruct((2560, 8), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8, 18432), jnp.bfloat16),
+                jnp.asarray(2.0, dtype=jnp.bfloat16),
+            )
+
+        def __call__(self, x, adapter_indices=None):
+            del adapter_indices
+            self.fallback_calls += 1
+            values = jnp.ones((*x.shape[:-1], 9216), dtype=jnp.bfloat16)
+            return values, values
+
+    class FakeDown:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, product, adapter_indices=None):
+            del adapter_indices
+            self.calls += 1
+            return product[..., :2560]
+
+    class FakeRMS:
+        eps = 1e-6
+
+        def __init__(self):
+            self.weight = FakeParam(
+                (2560,),
+                jnp.bfloat16,
+                value=jnp.zeros((2560,), dtype=jnp.bfloat16),
+            )
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            return x
+
+    fused_calls = []
+
+    def fused_spy(x, rms_delta, weight, lora_a, lora_b, scaling, **kwargs):
+        fused_calls.append(
+            (
+                x.shape,
+                rms_delta.shape,
+                weight.shape,
+                lora_a.shape,
+                lora_b.shape,
+                scaling,
+                kwargs,
+            )
+        )
+        return jnp.ones((1, 64, 9216), dtype=jnp.bfloat16)
+
+    monkeypatch.setattr(
+        qwen3_5_module,
+        "bf16_rms_gate_up_lora_swiglu_contiguous",
+        fused_spy,
+    )
+    config = _tiny_qwen3_5_config(gradient_checkpointing=False)
+    with jax.set_mesh(_tiny_mesh()):
+        mlp = Qwen3_5MLP(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        mlp.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = True
+        gate_up = FakeGateUp()
+        down = FakeDown()
+        norm = FakeRMS()
+        mlp.gate_up_proj = gate_up
+        mlp.down_proj = down
+
+        x = jnp.zeros((1, 64, 2560), dtype=jnp.bfloat16)
+        residual = jnp.zeros_like(x)
+        adapter_indices = jnp.asarray([1], dtype=jnp.int32)
+        actual = mlp.forward_with_post_attention_rms(
+            x,
+            norm,
+            adapter_indices=adapter_indices,
+            residual=residual,
+        )
+
+        np.testing.assert_array_equal(actual, jnp.ones_like(residual))
+        assert norm.calls == 0
+        assert gate_up.fallback_calls == 0
+        assert gate_up.selected_adapter_indices == [1]
+        assert down.calls == 1
+        assert len(fused_calls) == 1
+        assert fused_calls[0][:5] == (
+            (1, 64, 2560),
+            (2560,),
+            (2560, 18432),
+            (2560, 8),
+            (8, 18432),
+        )
+        assert fused_calls[0][-1] == {
+            "enabled": True,
+            "eps": 1e-6,
+            "block_m": 16,
+            "block_physical_n": 64,
+            "block_k": 32,
+        }
+
+        short = x[:, :-1]
+        fallback = mlp.forward_with_post_attention_rms(
+            short,
+            norm,
+            adapter_indices=adapter_indices,
+            residual=residual[:, :-1],
+        )
+        np.testing.assert_array_equal(
+            fallback,
+            nnx.silu(jnp.ones_like(fallback)),
+        )
+        assert norm.calls == 1
+        assert gate_up.fallback_calls == 1
+        assert len(fused_calls) == 1
+
+        mlp.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = False
+        disabled_fallback = mlp.forward_with_post_attention_rms(
+            x,
+            norm,
+            adapter_indices=adapter_indices,
+            residual=residual,
+        )
+        np.testing.assert_array_equal(
+            disabled_fallback,
+            nnx.silu(jnp.ones_like(disabled_fallback)),
+        )
+        assert norm.calls == 2
+        assert gate_up.fallback_calls == 2
+        assert len(fused_calls) == 1
+        mlp.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = True
+
+        norm.eps = 1e-5
+        epsilon_fallback = mlp.forward_with_post_attention_rms(
+            x,
+            norm,
+            adapter_indices=adapter_indices,
+            residual=residual,
+        )
+        np.testing.assert_array_equal(
+            epsilon_fallback,
+            nnx.silu(jnp.ones_like(epsilon_fallback)),
+        )
+        assert norm.calls == 3
+        assert gate_up.fallback_calls == 3
+        assert len(fused_calls) == 1
+        norm.eps = 1e-6
+
+        def can_use(
+            *,
+            x_arg=x,
+            rms_delta=norm.weight[...],
+            eps=norm.eps,
+            indices=adapter_indices,
+            residual_arg=residual,
+        ):
+            return mlp._can_use_bf16_rms_gate_up_lora_swiglu_contiguous(
+                x_arg,
+                rms_delta,
+                eps,
+                indices,
+                residual_arg,
+            )
+
+        assert can_use()
+        assert not can_use(indices=None)
+        assert not can_use(indices=jnp.asarray([1], dtype=jnp.float32))
+        assert not can_use(indices=jnp.asarray([0, 1], dtype=jnp.int32))
+        assert not can_use(x_arg=jax.ShapeDtypeStruct(x.shape, jnp.float32))
+        assert not can_use(rms_delta=jax.ShapeDtypeStruct((2560,), jnp.float32))
+        assert not can_use(rms_delta=jax.ShapeDtypeStruct((2048,), jnp.bfloat16))
+        assert not can_use(residual_arg=jax.ShapeDtypeStruct(residual.shape, jnp.float32))
+
+        for attribute, invalid in (
+            ("components", ("up_proj", "gate_proj")),
+            ("group_sizes", (9216, 9216)),
+            ("bias", FakeParam((18432,), jnp.bfloat16)),
+            ("max_lora_rank", 4),
+            ("max_lora_adapters", 0),
+        ):
+            original = getattr(gate_up, attribute)
+            setattr(gate_up, attribute, invalid)
+            assert not can_use(), attribute
+            setattr(gate_up, attribute, original)
+
+        gate_up.kernel.dtype = jnp.float32
+        assert not can_use()
+        gate_up.kernel.dtype = jnp.bfloat16
+        gate_up.kernel.shape = (2560, 9216)
+        assert not can_use()
+        gate_up.kernel.shape = (2560, 18432)
+        gate_up.lora_A.dtype = jnp.float32
+        assert not can_use()
+        gate_up.lora_A.dtype = jnp.bfloat16
+        gate_up.lora_A.shape = (2, 2560, 4)
+        assert not can_use()
+        gate_up.lora_A.shape = (2, 2560, 8)
+        gate_up.lora_B.shape = (2, 4, 18432)
+        assert not can_use()
+        gate_up.lora_B.shape = (2, 8, 18432)
+        gate_up.lora_B.dtype = jnp.float32
+        assert not can_use()
+        gate_up.lora_B.dtype = jnp.bfloat16
+        gate_up.lora_scaling.dtype = jnp.float32
+        assert not can_use()
+        gate_up.lora_scaling.dtype = jnp.bfloat16
+        gate_up.lora_scaling = FakeParam((), jnp.bfloat16)
+        assert not can_use()
+
+
+def test_qwen35_decoder_allows_contiguous_mlp_up_only_in_training_wrapper():
+    class IdentityNorm:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            return x
+
+    class FakeAttention:
+        def __call__(
+            self,
+            hidden_states,
+            *,
+            attention_mask,
+            positions,
+            adapter_indices,
+            kv_cache,
+        ):
+            del attention_mask, positions, adapter_indices, kv_cache
+            return jnp.ones_like(hidden_states), (hidden_states, hidden_states)
+
+    class FakeMLP:
+        def __init__(self):
+            self.fused_calls = []
+            self.ordinary_calls = []
+
+        def __call__(self, x, adapter_indices=None, *, residual=None):
+            self.ordinary_calls.append((x, adapter_indices, residual))
+            assert residual is not None
+            return residual + jnp.asarray(4.0, dtype=residual.dtype)
+
+        def forward_with_post_attention_rms(
+            self,
+            x,
+            rms_norm,
+            adapter_indices=None,
+            *,
+            residual=None,
+        ):
+            self.fused_calls.append((x, rms_norm, adapter_indices, residual))
+            assert residual is not None
+            return residual + jnp.asarray(2.0, dtype=residual.dtype)
+
+    config = _tiny_qwen3_5_config(gradient_checkpointing=False)
+    config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous = True
+    with jax.set_mesh(_tiny_mesh()):
+        layer = Qwen3_5DecoderLayer(
+            config,
+            layer_idx=1,
+            dtype=jnp.float32,
+            rngs=nnx.Rngs(0),
+        )
+        input_norm = IdentityNorm()
+        post_attention_norm = IdentityNorm()
+        attention = FakeAttention()
+        mlp = FakeMLP()
+        layer.input_layernorm = input_norm
+        layer.post_attention_layernorm = post_attention_norm
+        layer.self_attn = attention
+        layer.mlp = mlp
+
+        hidden_states = jnp.zeros((1, 64, 2560), dtype=jnp.bfloat16)
+        adapter_indices = jnp.asarray([0], dtype=jnp.int32)
+        attention_mask = jnp.ones((1, 64), dtype=jnp.int32)
+        positions = jnp.arange(64, dtype=jnp.int32)[None, :]
+        inference_actual, updated_kv, _, _ = layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            positions=positions,
+            adapter_indices=adapter_indices,
+        )
+        training_actual = qwen3_5_module._run_training_decoder_layer(
+            layer,
+            hidden_states,
+            attention_mask,
+            positions,
+            adapter_indices,
+        )
+
+    np.testing.assert_array_equal(inference_actual, jnp.full_like(hidden_states, 5.0))
+    assert updated_kv is not None
+    assert input_norm.calls == 2
+    assert post_attention_norm.calls == 1
+    assert len(mlp.ordinary_calls) == 1
+    ordinary_x, ordinary_indices, ordinary_residual = mlp.ordinary_calls[0]
+    np.testing.assert_array_equal(ordinary_x, jnp.ones_like(hidden_states))
+    np.testing.assert_array_equal(ordinary_residual, ordinary_x)
+    np.testing.assert_array_equal(ordinary_indices, adapter_indices)
+
+    np.testing.assert_array_equal(training_actual, jnp.full_like(hidden_states, 3.0))
+    assert len(mlp.fused_calls) == 1
+    routed_x, routed_norm, routed_indices, routed_residual = mlp.fused_calls[0]
+    np.testing.assert_array_equal(routed_x, jnp.ones_like(hidden_states))
+    np.testing.assert_array_equal(routed_residual, routed_x)
+    assert routed_norm is post_attention_norm
+    np.testing.assert_array_equal(routed_indices, adapter_indices)
+
+
 def test_qwen3_5_gradient_checkpointing_preserves_training_outputs_and_lora_gradients():
     """Per-layer remat must preserve a compiled hybrid-model training step."""
     without_checkpointing = _checkpointing_training_result(False)
@@ -458,9 +792,7 @@ def test_qwen3_5_gradient_checkpointing_preserves_training_outputs_and_lora_grad
 
     assert without_checkpointing["remat_count"] == 0
     assert with_checkpointing["remat_count"] == with_checkpointing["num_hidden_layers"]
-    np.testing.assert_allclose(
-        with_checkpointing["loss"], without_checkpointing["loss"], rtol=1e-6, atol=1e-6
-    )
+    np.testing.assert_allclose(with_checkpointing["loss"], without_checkpointing["loss"], rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(
         with_checkpointing["hidden_states"],
         without_checkpointing["hidden_states"],
@@ -483,9 +815,7 @@ def test_qwen3_5_gradient_checkpointing_preserves_training_outputs_and_lora_grad
     # Both the GDN layer and full-attention layer must contribute trainable LoRA gradients.
     for layer_idx in range(with_checkpointing["num_hidden_layers"]):
         layer_lora_b_gradients = [
-            gradient
-            for path, gradient in gradients_with
-            if f"['layers'][{layer_idx}]" in path and "['lora_B']" in path
+            gradient for path, gradient in gradients_with if f"['layers'][{layer_idx}]" in path and "['lora_B']" in path
         ]
         assert layer_lora_b_gradients
         assert any(np.any(gradient != 0) for gradient in layer_lora_b_gradients)
@@ -500,9 +830,7 @@ def test_qwen3_5_gradient_checkpointing_is_training_only(monkeypatch: pytest.Mon
 
     def remat_spy(layer, hidden_states, mask, positions, adapter_indices):
         rematerialized_layer_types.append(layer.layer_type)
-        return qwen3_5_module._run_training_decoder_layer(
-            layer, hidden_states, mask, positions, adapter_indices
-        )
+        return qwen3_5_module._run_training_decoder_layer(layer, hidden_states, mask, positions, adapter_indices)
 
     monkeypatch.setattr(qwen3_5_module, "_remat_training_decoder_layer", remat_spy)
 

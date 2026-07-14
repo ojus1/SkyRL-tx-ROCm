@@ -62,8 +62,8 @@ prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"
 prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"
 prewarm_timeout_seconds="${SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS:-3600}"
 engine_t64_cache_attest="${SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST-0}"
+bf16_rms_gate_up_lora_swiglu_contiguous="${SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS-0}"
 runtime_cache_attestation_environment=()
-backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"qwen35_bf16_down_lora_residual":false,"abstract_model_load":false}'
 
 case "$prewarm_optimizer" in
   0|1) ;;
@@ -86,6 +86,15 @@ case "$engine_t64_cache_attest" in
     exit 2
     ;;
 esac
+case "$bf16_rms_gate_up_lora_swiglu_contiguous" in
+  0) bf16_rms_gate_up_lora_swiglu_contiguous_json=false ;;
+  1) bf16_rms_gate_up_lora_swiglu_contiguous_json=true ;;
+  *)
+    echo "SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS must be exactly 0 or 1." >&2
+    exit 2
+    ;;
+esac
+backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"qwen35_bf16_down_lora_residual":false,"qwen35_bf16_rms_gate_up_lora_swiglu_contiguous":'"$bf16_rms_gate_up_lora_swiglu_contiguous_json"',"abstract_model_load":false}'
 if [[ "$prewarm_optimizer" == "1" && -z "$prewarm_buckets" ]]; then
   echo "SKYRL_QWEN35_PREWARM_OPTIMIZER=1 requires nonempty SKYRL_QWEN35_PREWARM_BUCKETS." >&2
   exit 2
@@ -164,7 +173,7 @@ case "$memory_mode" in
     require_unset_or_exact ROCR_VISIBLE_DEVICES 0
     require_unset_or_exact HIP_VISIBLE_DEVICES 0
     require_unset_or_exact GPU_DEVICE_ORDINAL 0
-    backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"qwen35_bf16_down_lora_residual":false,"abstract_model_load":true}'
+    backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"qwen35_bf16_down_lora_residual":false,"qwen35_bf16_rms_gate_up_lora_swiglu_contiguous":'"$bf16_rms_gate_up_lora_swiglu_contiguous_json"',"abstract_model_load":true}'
     ;;
   *)
     echo "SKYRL_QWEN35_MEMORY_MODE must be growth or preallocate85." >&2
@@ -920,6 +929,12 @@ if [[ -n "$prewarm_buckets" ]]; then
   if [[ "$prewarm_optimizer" == "1" ]]; then
     prewarm_optimizer_args=(--compile-optimizer)
   fi
+  prewarm_bf16_rms_gate_up_args=()
+  if [[ "$bf16_rms_gate_up_lora_swiglu_contiguous" == "1" ]]; then
+    prewarm_bf16_rms_gate_up_args=(
+      --qwen35-bf16-rms-gate-up-lora-swiglu-contiguous
+    )
+  fi
   prewarm_construction=eager
   if [[ "$memory_mode" == "preallocate85" ]]; then
     prewarm_construction=abstract-load
@@ -963,6 +978,7 @@ if [[ -n "$prewarm_buckets" ]]; then
         --execute-rocm \
         --allow-gpu \
         "${prewarm_optimizer_args[@]}" \
+        "${prewarm_bf16_rms_gate_up_args[@]}" \
         --buckets "$prewarm_buckets" \
         --model-path "$model_path" \
         --construction "$prewarm_construction" \

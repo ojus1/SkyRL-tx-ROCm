@@ -17,6 +17,7 @@ import importlib.metadata
 import json
 import math
 import os
+import platform
 import re
 import stat
 import statistics
@@ -55,6 +56,29 @@ _RESULT_LEAF_COUNTS = {
     "reference_forward_and_vjp": 4,
     "candidate_forward_and_vjp": 4,
 }
+_RESULT_SPECS = {
+    "reference_forward": (("output", (1, 64, 9216)),),
+    "candidate_forward": (("output", (1, 64, 9216)),),
+    "reference_forward_and_vjp": (
+        ("output", (1, 64, 9216)),
+        ("dx", (1, 64, 2560)),
+        ("d_lora_a", (2560, 8)),
+        ("d_lora_b", (8, 18432)),
+    ),
+    "candidate_forward_and_vjp": (
+        ("output", (1, 64, 9216)),
+        ("dx", (1, 64, 2560)),
+        ("d_lora_a", (2560, 8)),
+        ("d_lora_b", (8, 18432)),
+    ),
+}
+_CANDIDATE_HASH_POSITIONS = (
+    ("candidate_forward", "output"),
+    ("candidate_forward_and_vjp", "output"),
+    ("candidate_forward_and_vjp", "dx"),
+    ("candidate_forward_and_vjp", "d_lora_a"),
+    ("candidate_forward_and_vjp", "d_lora_b"),
+)
 _BENCHMARK_WARMUP_ORDERS = (
     (
         "reference_forward",
@@ -504,6 +528,13 @@ def _current_package_versions() -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             result[name] = None
     return result
+
+
+def _current_rocm_version() -> str:
+    try:
+        return Path("/opt/rocm/.info/version").read_text().strip()
+    except OSError as error:
+        raise RuntimeError("determinism ROCm runtime version is unavailable") from error
 
 
 def _benchmark_schedule(mode: str) -> tuple[dict[str, Any], ...]:
@@ -1599,6 +1630,7 @@ def _validate_profile(
         or manifest.get("timeout_seconds") != profiler["timeout_seconds"]
         or manifest.get("sensor_grace_seconds") != profiler["sensor_grace_seconds"]
         or manifest.get("terminate_included_on_safety") is not False
+        or manifest.get("terminate_included_on_abort") is not False
         or not _json_exact(manifest.get("safety_limits"), expected_limits)
         or manifest.get("command_recorded") is not True
         or manifest.get("passed_file_descriptor_count") != 0
@@ -1694,6 +1726,904 @@ def _validate_profile(
         "safety_violation": None,
         "kernel_driver_errors": None,
     }
+
+
+def _validate_host_result_manifest(host_results: Any) -> dict[str, Any]:
+    if not isinstance(host_results, dict) or set(host_results) != set(_RESULT_SPECS):
+        raise RuntimeError("determinism host-result program set is not exact")
+    for program, specs in _RESULT_SPECS.items():
+        result = host_results.get(program)
+        if not isinstance(result, dict) or set(result) != {name for name, _shape in specs}:
+            raise RuntimeError(f"determinism {program} result set is not exact")
+        for name, shape in specs:
+            manifest = result[name]
+            element_count = math.prod(shape)
+            if (
+                not isinstance(manifest, dict)
+                or set(manifest)
+                != {
+                    "shape",
+                    "device_dtype",
+                    "host_dtype",
+                    "element_count",
+                    "bf16_bytes",
+                    "bf16_sha256",
+                    "finite",
+                }
+                or not _json_exact(manifest.get("shape"), list(shape))
+                or manifest.get("device_dtype") != "bfloat16"
+                or manifest.get("host_dtype") != "float32"
+                or type(manifest.get("element_count")) is not int
+                or manifest["element_count"] != element_count
+                or type(manifest.get("bf16_bytes")) is not int
+                or manifest["bf16_bytes"] != 2 * element_count
+                or manifest.get("finite") is not True
+            ):
+                raise RuntimeError(f"determinism {program}/{name} result manifest is not exact")
+            _require_sha256(
+                manifest.get("bf16_sha256"),
+                label=f"determinism {program}/{name} BF16 digest",
+            )
+    return host_results
+
+
+def _candidate_result_hashes(host_results: dict[str, Any]) -> dict[str, str]:
+    _validate_host_result_manifest(host_results)
+    return {
+        f"{program}/{name}": host_results[program][name]["bf16_sha256"] for program, name in _CANDIDATE_HASH_POSITIONS
+    }
+
+
+def _expected_numerics_progress_binding(result: dict[str, Any]) -> dict[str, Any]:
+    source = result["source"]
+    gated = result["numerics_once"]
+    return {
+        "contract": result["contract"],
+        "geometry": result["geometry"],
+        "preflight": result["preflight"],
+        "source": {name: source[name] for name in ("kernel", "probe", "profiler")},
+        "git": source["git"],
+        "compile_evidence": gated["compile_evidence"],
+        "compile_profile_summary": gated["compile_profile_summary"],
+        "numerics_evidence": None,
+        "numerics_profile_summary": None,
+    }
+
+
+def _validate_numerics_watchdog(
+    watchdog: Any,
+    *,
+    ordinal: int,
+    program: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(watchdog, dict)
+        or set(watchdog)
+        != {
+            "dispatch_ordinal",
+            "program",
+            "external_process",
+            "watchdog_pid",
+            "timeout_action",
+            "cgroup_wide_timeout_kill",
+            "timeout_seconds",
+            "armed_monotonic_ns",
+            "deadline_monotonic_ns",
+            "armed_ack_received_monotonic_ns",
+            "dispatch_completed",
+        }
+        or watchdog.get("dispatch_ordinal") != ordinal
+        or watchdog.get("program") != program
+        or watchdog.get("external_process") is not True
+        or watchdog.get("timeout_action") != "cgroup.kill_then_pidfd_SIGKILL_fallback"
+        or watchdog.get("cgroup_wide_timeout_kill") is not True
+        or watchdog.get("timeout_seconds") != _WATCHDOG_SECONDS
+        or watchdog.get("dispatch_completed") is not True
+    ):
+        raise RuntimeError(f"determinism watchdog {ordinal} is not exact")
+    _require_int(
+        watchdog.get("watchdog_pid"),
+        label=f"determinism watchdog {ordinal} PID",
+        minimum=1,
+    )
+    armed = _require_int(
+        watchdog.get("armed_monotonic_ns"),
+        label=f"determinism watchdog {ordinal} armed time",
+        minimum=1,
+    )
+    deadline = _require_int(
+        watchdog.get("deadline_monotonic_ns"),
+        label=f"determinism watchdog {ordinal} deadline",
+        minimum=1,
+    )
+    ack = _require_int(
+        watchdog.get("armed_ack_received_monotonic_ns"),
+        label=f"determinism watchdog {ordinal} acknowledgement",
+        minimum=1,
+    )
+    if deadline - armed != _WATCHDOG_NS or not armed <= ack < deadline:
+        raise RuntimeError(f"determinism watchdog {ordinal} ordering is not exact")
+    return watchdog
+
+
+def _validate_numerics_progress(
+    *,
+    result: dict[str, Any],
+    result_file: dict[str, Any],
+    host_inputs: dict[str, Any],
+    host_results: dict[str, Any],
+    errors: dict[str, Any],
+) -> dict[str, Any]:
+    gated = result["numerics_once"]
+    progress = gated.get("progress")
+    if (
+        not isinstance(progress, dict)
+        or set(progress)
+        != {
+            "path",
+            "protocol",
+            "record_count",
+            "bytes",
+            "sha256",
+            "mode",
+            "directory_fsynced",
+        }
+        or progress.get("protocol") != "durable_fsync_jsonl_v1"
+        or progress.get("record_count") != 10
+        or progress.get("mode") != "0600"
+        or progress.get("directory_fsynced") is not True
+        or not isinstance(progress.get("path"), str)
+    ):
+        raise RuntimeError("determinism progress manifest is not exact")
+    progress_path = Path(progress["path"])
+    if progress_path.parent != Path(result_file["path"]).parent or progress_path.name != "progress.jsonl":
+        raise RuntimeError("determinism progress is not the exact result sibling")
+    progress_raw, progress_file = _read_private_bytes(progress_path, maximum_bytes=16 << 20)
+    if (
+        not progress_raw.endswith(b"\n")
+        or progress.get("bytes") != len(progress_raw)
+        or progress.get("sha256") != hashlib.sha256(progress_raw).hexdigest()
+        or progress_file["mtime_ns"] >= result_file["mtime_ns"]
+    ):
+        raise RuntimeError("determinism progress bytes/digest/order are not exact")
+    try:
+        records = [_strict_json_loads(line) for line in progress_raw.splitlines()]
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("determinism progress is not strict JSONL") from error
+    expected_events = ["host_inputs_ready"]
+    for _program in _PROGRAM_ORDER:
+        expected_events.extend(("dispatch_started", "dispatch_completed"))
+    expected_events.append("numerics_completed")
+    if (
+        len(records) != 10
+        or any(not isinstance(record, dict) for record in records)
+        or [record.get("event") for record in records] != expected_events
+    ):
+        raise RuntimeError("determinism progress event protocol is not exact")
+
+    common_keys = {
+        "schema_version",
+        "event",
+        "mode",
+        "probe_pid",
+        "wall_time_ns",
+        "monotonic_time_ns",
+        "binding",
+        "invocation_attempt_counts",
+        "invocation_completion_counts",
+    }
+    zero = dict.fromkeys(_PROGRAM_ORDER, 0)
+    attempts = dict(zero)
+    completions = dict(zero)
+    expected_binding = _expected_numerics_progress_binding(result)
+    probe_pid = _require_int(records[0].get("probe_pid"), label="determinism probe PID", minimum=1)
+    previous_wall = 0
+    previous_monotonic = 0
+
+    def validate_common(record: dict[str, Any]) -> None:
+        nonlocal previous_wall, previous_monotonic
+        if (
+            type(record.get("schema_version")) is not int
+            or record["schema_version"] != _EVIDENCE_SCHEMA_VERSION
+            or record.get("mode") != "numerics_once"
+            or record.get("probe_pid") != probe_pid
+            or not _json_exact(record.get("binding"), expected_binding)
+            or not _json_exact(record.get("invocation_attempt_counts"), attempts)
+            or not _json_exact(record.get("invocation_completion_counts"), completions)
+        ):
+            raise RuntimeError("determinism progress common binding/counts are not exact")
+        wall = _require_int(record.get("wall_time_ns"), label="determinism progress wall time", minimum=1)
+        monotonic = _require_int(
+            record.get("monotonic_time_ns"),
+            label="determinism progress monotonic time",
+            minimum=1,
+        )
+        if wall <= previous_wall or monotonic <= previous_monotonic:
+            raise RuntimeError("determinism progress ordering is not strict")
+        previous_wall = wall
+        previous_monotonic = monotonic
+
+    first = records[0]
+    if set(first) != common_keys | {
+        "compiled_programs",
+        "program_order",
+        "host_inputs",
+        "watchdog_seconds_per_program",
+    }:
+        raise RuntimeError("determinism host-input progress schema is not exact")
+    validate_common(first)
+    if (
+        not _json_exact(first.get("compiled_programs"), list(_PROGRAM_ORDER))
+        or not _json_exact(first.get("program_order"), list(_PROGRAM_ORDER))
+        or not _json_exact(first.get("host_inputs"), host_inputs)
+        or first.get("watchdog_seconds_per_program") != _WATCHDOG_SECONDS
+    ):
+        raise RuntimeError("determinism host-input progress values are not exact")
+
+    watchdogs = gated.get("watchdogs")
+    if not isinstance(watchdogs, list) or len(watchdogs) != len(_PROGRAM_ORDER):
+        raise RuntimeError("determinism watchdog count is not exact")
+    validated_watchdogs: list[dict[str, Any]] = []
+    record_index = 1
+    for ordinal, program in enumerate(_PROGRAM_ORDER, start=1):
+        watchdog = _validate_numerics_watchdog(
+            watchdogs[ordinal - 1],
+            ordinal=ordinal,
+            program=program,
+        )
+        validated_watchdogs.append(watchdog)
+        attempts[program] += 1
+        started = records[record_index]
+        record_index += 1
+        if set(started) != common_keys | {
+            "dispatch_ordinal",
+            "program",
+            "watchdog_seconds",
+            "watchdog_armed_monotonic_ns",
+            "watchdog_deadline_monotonic_ns",
+            "watchdog_armed_ack_received_monotonic_ns",
+        }:
+            raise RuntimeError(f"determinism dispatch {ordinal} start schema is not exact")
+        validate_common(started)
+        if (
+            started.get("dispatch_ordinal") != ordinal
+            or started.get("program") != program
+            or started.get("watchdog_seconds") != _WATCHDOG_SECONDS
+            or not watchdog["armed_monotonic_ns"]
+            <= watchdog["armed_ack_received_monotonic_ns"]
+            <= started["monotonic_time_ns"]
+            < watchdog["deadline_monotonic_ns"]
+            or started.get("watchdog_armed_monotonic_ns") != watchdog["armed_monotonic_ns"]
+            or started.get("watchdog_deadline_monotonic_ns") != watchdog["deadline_monotonic_ns"]
+            or started.get("watchdog_armed_ack_received_monotonic_ns") != watchdog["armed_ack_received_monotonic_ns"]
+        ):
+            raise RuntimeError(f"determinism dispatch {ordinal} watchdog binding changed")
+
+        completions[program] += 1
+        completed = records[record_index]
+        record_index += 1
+        if set(completed) != common_keys | {
+            "dispatch_ordinal",
+            "program",
+            "invocation_started_monotonic_ns",
+            "invocation_completed_monotonic_ns",
+            "invocation_elapsed_seconds",
+            "device_results_released_before_completion",
+            "result",
+        }:
+            raise RuntimeError(f"determinism dispatch {ordinal} completion schema is not exact")
+        validate_common(completed)
+        invocation_started = _require_int(
+            completed.get("invocation_started_monotonic_ns"),
+            label=f"determinism dispatch {ordinal} invocation start",
+            minimum=1,
+        )
+        invocation_completed = _require_int(
+            completed.get("invocation_completed_monotonic_ns"),
+            label=f"determinism dispatch {ordinal} invocation completion",
+            minimum=1,
+        )
+        elapsed = _require_number(
+            completed.get("invocation_elapsed_seconds"),
+            label=f"determinism dispatch {ordinal} elapsed time",
+            minimum=0,
+            maximum=_WATCHDOG_SECONDS,
+        )
+        if (
+            completed.get("dispatch_ordinal") != ordinal
+            or completed.get("program") != program
+            or invocation_started < started["monotonic_time_ns"]
+            or invocation_completed < invocation_started
+            or invocation_completed >= watchdog["deadline_monotonic_ns"]
+            or completed["monotonic_time_ns"] < invocation_completed
+            or not math.isclose(
+                elapsed,
+                (invocation_completed - invocation_started) / 1_000_000_000,
+                rel_tol=0,
+                abs_tol=1e-15,
+            )
+            or completed.get("device_results_released_before_completion") is not True
+            or not _json_exact(completed.get("result"), host_results[program])
+        ):
+            raise RuntimeError(f"determinism dispatch {ordinal} completion binding changed")
+
+    terminal = records[record_index]
+    if set(terminal) != common_keys | {
+        "relative_l2_limit_exclusive",
+        "output_cosine_limit_inclusive",
+        "gradient_cosine_similarity_report_only",
+        "errors",
+        "host_inputs_unchanged",
+        "passed",
+    }:
+        raise RuntimeError("determinism terminal progress schema is not exact")
+    validate_common(terminal)
+    exact_one = dict.fromkeys(_PROGRAM_ORDER, 1)
+    if (
+        record_index != len(records) - 1
+        or attempts != exact_one
+        or completions != exact_one
+        or terminal.get("relative_l2_limit_exclusive") != _RELATIVE_L2_LIMIT
+        or terminal.get("output_cosine_limit_inclusive") != _OUTPUT_COSINE_LIMIT
+        or terminal.get("gradient_cosine_similarity_report_only") is not True
+        or not _json_exact(terminal.get("errors"), errors)
+        or terminal.get("host_inputs_unchanged") is not True
+        or terminal.get("passed") is not True
+    ):
+        raise RuntimeError("determinism terminal progress binding is not exact")
+    watchdog_pids = [watchdog["watchdog_pid"] for watchdog in validated_watchdogs]
+    if len(set(watchdog_pids)) != len(watchdog_pids) or probe_pid in watchdog_pids:
+        raise RuntimeError("determinism watchdog process evidence is not distinct")
+    return {
+        "file": progress_file,
+        "record_count": len(records),
+        "probe_pid": probe_pid,
+        "watchdog_pids": watchdog_pids,
+    }
+
+
+def _expected_numerics_profile_command(
+    *,
+    result_path: Path,
+    result: dict[str, Any],
+) -> list[str]:
+    gated = result["numerics_once"]
+    profiler_parent = result["preflight"]["profiler_parent"]
+    return [
+        profiler_parent["parent_command_python"],
+        result["source"]["probe"]["path"],
+        "--allow-gpu",
+        "--numerics-once",
+        "--output",
+        str(result_path),
+        "--progress-output",
+        gated["progress"]["path"],
+        "--compile-evidence",
+        gated["compile_evidence"]["path"],
+        "--compile-profile-summary",
+        gated["compile_profile_summary"]["path"],
+        "--block-m",
+        "16",
+        "--block-physical-n",
+        "64",
+        "--block-k",
+        "32",
+        "--warmups",
+        "0",
+        "--iterations",
+        "0",
+    ]
+
+
+def _validate_numerics_profile(
+    *,
+    profile_summary_path: Path,
+    result_path: Path,
+    result_file: dict[str, Any],
+    result: dict[str, Any],
+    progress: dict[str, Any],
+) -> dict[str, Any]:
+    if profile_summary_path.parent != result_path.parent or profile_summary_path.name != "telemetry.jsonl.summary.json":
+        raise RuntimeError("determinism profile summary is not the exact result sibling")
+    summary, summary_file = _read_private_json(profile_summary_path, maximum_bytes=1 << 20)
+    telemetry_path = profile_summary_path.with_name("telemetry.jsonl")
+    telemetry_raw, telemetry_file = _read_private_bytes(telemetry_path, maximum_bytes=64 << 20)
+    if not telemetry_raw.endswith(b"\n"):
+        raise RuntimeError("determinism telemetry is not complete JSONL")
+    try:
+        telemetry = [_strict_json_loads(line) for line in telemetry_raw.splitlines()]
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("determinism telemetry is not strict JSONL") from error
+    if (
+        not isinstance(summary, dict)
+        or not telemetry
+        or not isinstance(telemetry[0], dict)
+        or not (result_file["mtime_ns"] < telemetry_file["mtime_ns"] < summary_file["mtime_ns"])
+    ):
+        raise RuntimeError("determinism result/telemetry/summary ordering is not exact")
+    manifest = telemetry[0]
+    samples = telemetry[1:]
+    if any(not isinstance(sample, dict) or sample.get("record_type") != "sample" for sample in samples):
+        raise RuntimeError("determinism telemetry sample stream is not exact")
+    profiler_parent = result["preflight"]["profiler_parent"]
+    expected_command = _expected_numerics_profile_command(result_path=result_path, result=result)
+    expected_limits = {
+        "max_junction_temp_c": 90.0,
+        "max_gpu_power_watts": 400.0,
+        "max_vram_bytes": float(24 * 1024**3),
+        "min_host_available_bytes": 0.0,
+        "max_swap_bytes": float(8 * 1024**3),
+    }
+    packages = result["source"]["packages"]
+    runtime = manifest.get("runtime")
+    gpu = manifest.get("gpu")
+    rocm_version = _current_rocm_version()
+    if (
+        manifest.get("record_type") != "manifest"
+        or manifest.get("interval_seconds") != profiler_parent["interval_seconds"]
+        or manifest.get("baseline_seconds") != profiler_parent["baseline_seconds"]
+        or manifest.get("duration_seconds") is not None
+        or manifest.get("timeout_seconds") != profiler_parent["timeout_seconds"]
+        or manifest.get("sensor_grace_seconds") != profiler_parent["sensor_grace_seconds"]
+        or manifest.get("terminate_included_on_safety") is not False
+        or manifest.get("terminate_included_on_abort") is not False
+        or manifest.get("explicit_processes") != {}
+        or not _json_exact(manifest.get("safety_limits"), expected_limits)
+        or manifest.get("command_recorded") is not True
+        or manifest.get("passed_file_descriptor_count") != 0
+        or not _json_exact(manifest.get("command"), expected_command)
+        or not isinstance(runtime, dict)
+        or runtime.get("python") != sys.version
+        or runtime.get("platform") != platform.platform()
+        or runtime.get("rocm") != rocm_version
+        or runtime.get("jax") != packages["jax"]
+        or runtime.get("jaxlib") != packages["jaxlib"]
+        or runtime.get("jax_rocm_plugin") != packages["jax-rocm7-plugin"]
+        or runtime.get("jax_rocm_pjrt") != packages["jax-rocm7-pjrt"]
+        or runtime.get("script_sha256") != result["source"]["profiler"]["sha256"]
+        or not _json_exact(
+            runtime.get("accelerator_environment"),
+            {
+                "HIP_VISIBLE_DEVICES": "0",
+                "JAX_PLATFORMS": "rocm",
+                "XLA_FLAGS": _DISABLE_COMMAND_BUFFERS,
+            },
+        )
+        or not isinstance(gpu, dict)
+        or gpu.get("card") != "card1"
+        or gpu.get("pci_bdf") != result["preflight"]["card_identity"]["pci_bdf"]
+        or gpu.get("vendor_id") != "0x1002"
+        or gpu.get("device_id") != "0x744c"
+        or gpu.get("hwmon_name") != "amdgpu"
+    ):
+        raise RuntimeError("determinism profiler telemetry manifest is not exact")
+
+    phases = [sample.get("phase") for sample in samples]
+    baseline_count = phases.count("baseline")
+    measured_count = phases.count("measured")
+    if (
+        any(phase not in {"baseline", "preflight", "measured"} for phase in phases)
+        or phases.count("preflight") != 1
+        or baseline_count <= 0
+        or measured_count <= 0
+        or summary.get("record_type") != "summary"
+        or summary.get("status") != "completed"
+        or type(summary.get("returncode")) is not int
+        or summary["returncode"] != 0
+        or summary.get("received_signal") is not None
+        or summary.get("safety_violation") is not None
+        or summary.get("kernel_driver_errors") is not None
+        or summary.get("kernel_log_available") is not True
+        or summary.get("baseline_samples") != baseline_count
+        or summary.get("measured_samples") != measured_count
+        or summary.get("samples") != len(samples)
+        or len(samples) != baseline_count + measured_count + 1
+    ):
+        raise RuntimeError("determinism profiler did not complete safely and exactly")
+    previous_wall = 0
+    observed_command_pid = False
+    for sample in samples:
+        wall = _require_int(sample.get("wall_time_ns"), label="determinism telemetry wall time", minimum=1)
+        if wall <= previous_wall:
+            raise RuntimeError("determinism telemetry wall-time order is not strict")
+        previous_wall = wall
+        processes = sample.get("processes")
+        command_process = processes.get("command") if isinstance(processes, dict) else None
+        if isinstance(command_process, dict) and command_process.get("process_count", 0) > 0:
+            if command_process.get("root_pid") != progress["probe_pid"]:
+                raise RuntimeError("determinism telemetry command PID is not the probe PID")
+            observed_command_pid = True
+    summary_processes = summary.get("processes")
+    summary_command = summary_processes.get("command") if isinstance(summary_processes, dict) else None
+    if (
+        not observed_command_pid
+        or not isinstance(summary_command, dict)
+        or summary_command.get("pid") != progress["probe_pid"]
+    ):
+        raise RuntimeError("determinism profiler process evidence is incomplete")
+
+    metrics = summary.get("metrics")
+    if not isinstance(metrics, dict):
+        raise RuntimeError("determinism profiler metrics are missing")
+    maxima: dict[str, float] = {}
+    for name, limit in _SAFETY_METRIC_LIMITS.items():
+        measured_values = [
+            _require_number(sample[name], label=f"determinism telemetry {name}", minimum=0)
+            for sample in samples
+            if sample.get("phase") == "measured" and sample.get(name) is not None
+        ]
+        if not measured_values:
+            raise RuntimeError(f"determinism telemetry has no measured {name}")
+        observed = max(measured_values)
+        metric = metrics.get(name)
+        if (
+            observed > float(limit)
+            or not isinstance(metric, dict)
+            or _require_number(
+                metric.get("measured_max"),
+                label=f"determinism summary {name} maximum",
+                minimum=0,
+            )
+            != observed
+        ):
+            raise RuntimeError(f"determinism telemetry/summary {name} is unsafe")
+        maxima[name] = observed
+    return {
+        "summary": summary_file,
+        "telemetry": {
+            **telemetry_file,
+            "record_count": len(telemetry),
+            "sample_count": len(samples),
+            "command_sha256": hashlib.sha256(
+                json.dumps(expected_command, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        },
+        "runtime": runtime,
+        "gpu": gpu,
+        "observed_maxima": maxima,
+        "probe_pid": progress["probe_pid"],
+        "profiler_pid": profiler_parent["parent_pid"],
+        "profiler_command_sha256": profiler_parent["parent_command_sha256"],
+    }
+
+
+def _validate_numerics_determinism_run(
+    *,
+    result_path: Path,
+    profile_summary_path: Path,
+    repo: Path,
+    benchmark_result: dict[str, Any],
+    benchmark_gated: dict[str, Any],
+) -> dict[str, Any]:
+    result, result_file = _read_private_json(result_path, maximum_bytes=64 << 20)
+    expected_root_keys = {
+        "schema_version",
+        "mode",
+        "qualification_scope",
+        "authorizes_default_model_enablement",
+        "recommend_for_opt_in_model_integration",
+        "passed",
+        "contract",
+        "preflight",
+        "device",
+        "geometry",
+        "invocation_contract",
+        "compilation",
+        "measurement",
+        "performance_gate",
+        "numerics",
+        "determinism",
+        "source",
+        "numerics_once",
+        "postflight",
+    }
+    if (
+        not isinstance(result, dict)
+        or set(result) != expected_root_keys
+        or type(result.get("schema_version")) is not int
+        or result["schema_version"] != _EVIDENCE_SCHEMA_VERSION
+        or result.get("mode") != "numerics_once"
+        or result.get("qualification_scope") != "isolated_stage_only"
+        or result.get("authorizes_default_model_enablement") is not False
+        or result.get("recommend_for_opt_in_model_integration") is not False
+        or result.get("passed") is not True
+        or not _json_exact(result.get("contract"), benchmark_result["contract"])
+        or not _json_exact(result.get("geometry"), benchmark_result["geometry"])
+        or not _json_exact(result.get("device"), benchmark_result["device"])
+        or not _json_exact(
+            result.get("postflight"),
+            {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
+        )
+    ):
+        raise RuntimeError("determinism numerics result is not exact")
+    if not _json_exact(result.get("source"), benchmark_result["source"]):
+        raise RuntimeError("determinism source/runtime manifest changed")
+    source_only, git, packages = _validate_source_and_runtime(result["source"], repo=repo)
+    preflight = _validate_preflight(
+        result.get("preflight"),
+        mode="numerics_once",
+        repo=repo,
+        source_only=source_only,
+    )
+    for name in ("environment", "hardware", "card_identity", "safety_source"):
+        if not _json_exact(result["preflight"].get(name), benchmark_result["preflight"].get(name)):
+            raise RuntimeError(f"determinism {name} preflight changed")
+    _validate_compilation(result.get("compilation"))
+    exact_one = dict.fromkeys(_PROGRAM_ORDER, 1)
+    invocation = result.get("invocation_contract")
+    if (
+        not isinstance(invocation, dict)
+        or not _json_exact(invocation.get("per_program_executable_invocations"), exact_one)
+        or not _json_exact(invocation.get("per_program_executable_completions"), exact_one)
+        or invocation.get("reference_executable_invocations") != 2
+        or invocation.get("candidate_executable_invocations") != 2
+        or invocation.get("total_executable_invocations") != 4
+        or invocation.get("compile_only_zero_candidate_reference_executable_invocations") is not False
+    ):
+        raise RuntimeError("determinism invocation contract is not exact")
+    if (
+        not _json_exact(
+            result.get("measurement"),
+            {
+                "executed": False,
+                "performance_measured": False,
+                "warmups": 0,
+                "iterations": 0,
+                "reason": "numerics-once dispatch durations are safety evidence only",
+            },
+        )
+        or not _json_exact(
+            result.get("performance_gate"),
+            {
+                "executed": False,
+                "passed": None,
+                "reason": "numerics-once is not a performance qualification",
+            },
+        )
+        or not _json_exact(
+            result.get("determinism"),
+            {
+                "executed": False,
+                "passed": None,
+                "reason": "numerics-once invokes each program exactly once",
+            },
+        )
+    ):
+        raise RuntimeError("determinism inherited non-performance gates are not exact")
+
+    numerics = result.get("numerics")
+    errors = numerics.get("errors") if isinstance(numerics, dict) else None
+    host_results = numerics.get("host_results") if isinstance(numerics, dict) else None
+    _validate_error_manifest(errors)
+    _validate_host_result_manifest(host_results)
+    if (
+        not isinstance(numerics, dict)
+        or set(numerics)
+        != {
+            "executed",
+            "reference_compared",
+            "passed",
+            "relative_l2_limit_exclusive",
+            "output_cosine_limit_inclusive",
+            "gradient_cosine_similarity_report_only",
+            "errors",
+            "host_results",
+        }
+        or numerics.get("executed") is not True
+        or numerics.get("reference_compared") is not True
+        or numerics.get("passed") is not True
+        or numerics.get("relative_l2_limit_exclusive") != _RELATIVE_L2_LIMIT
+        or numerics.get("output_cosine_limit_inclusive") != _OUTPUT_COSINE_LIMIT
+        or numerics.get("gradient_cosine_similarity_report_only") is not True
+    ):
+        raise RuntimeError("determinism numerics manifest is not exact")
+
+    gated = result.get("numerics_once")
+    if (
+        not isinstance(gated, dict)
+        or set(gated)
+        != {
+            "compile_evidence",
+            "compile_profile_summary",
+            "progress",
+            "watchdogs",
+            "host_inputs",
+            "host_inputs_unchanged",
+            "host_results",
+            "invocation_attempt_counts",
+            "invocation_completion_counts",
+            "source_and_git_unchanged_across_dispatch",
+        }
+        or not _json_exact(gated.get("compile_evidence"), benchmark_gated["compile_evidence"])
+        or not _json_exact(gated.get("compile_profile_summary"), benchmark_gated["compile_profile_summary"])
+        or gated.get("host_inputs_unchanged") is not True
+        or not _json_exact(gated.get("host_results"), host_results)
+        or not _json_exact(gated.get("invocation_attempt_counts"), exact_one)
+        or not _json_exact(gated.get("invocation_completion_counts"), exact_one)
+        or gated.get("source_and_git_unchanged_across_dispatch") is not True
+    ):
+        raise RuntimeError("determinism guarded numerics manifest is not exact")
+    host_inputs = _validate_host_input_manifest(gated.get("host_inputs"))
+    if not _json_exact(host_inputs, benchmark_gated.get("host_inputs")):
+        raise RuntimeError("determinism input manifest changed from benchmark evidence")
+    progress = _validate_numerics_progress(
+        result=result,
+        result_file=result_file,
+        host_inputs=host_inputs,
+        host_results=host_results,
+        errors=errors,
+    )
+    profile = _validate_numerics_profile(
+        profile_summary_path=profile_summary_path,
+        result_path=result_path,
+        result_file=result_file,
+        result=result,
+        progress=progress,
+    )
+    scope = preflight["scope"]
+    return {
+        "result": result_file,
+        "progress": progress,
+        "profile": profile,
+        "source": result["source"],
+        "git": git,
+        "packages": packages,
+        "device": result["device"],
+        "geometry": result["geometry"],
+        "host_inputs": host_inputs,
+        "candidate_hashes": _candidate_result_hashes(host_results),
+        "stable_preflight": {
+            name: result["preflight"][name] for name in ("environment", "hardware", "card_identity", "safety_source")
+        },
+        "profiler_timings": preflight["profiler_timings"],
+        "profiler_parent": result["preflight"]["profiler_parent"],
+        "scope": scope,
+    }
+
+
+def _manifest_matches_file(compact: Any, actual: dict[str, Any], *, label: str) -> None:
+    if not isinstance(compact, dict):
+        raise RuntimeError(f"{label} compact manifest is missing")
+    for name in ("path", "bytes", "sha256", "mode", "device", "inode", "mtime_ns"):
+        if not _json_exact(compact.get(name), actual.get(name)):
+            raise RuntimeError(f"{label} compact manifest changed: {name}")
+
+
+def _compare_determinism_runs(
+    runs: tuple[dict[str, Any], dict[str, Any]],
+    *,
+    benchmark_gated: dict[str, Any],
+) -> dict[str, Any]:
+    first, second = runs
+    _manifest_matches_file(
+        benchmark_gated.get("numerics_evidence"),
+        first["result"],
+        label="first determinism result",
+    )
+    _manifest_matches_file(
+        benchmark_gated.get("numerics_profile_summary"),
+        first["profile"]["summary"],
+        label="first determinism profile",
+    )
+    _manifest_matches_file(
+        benchmark_gated.get("numerics_evidence", {}).get("progress"),
+        first["progress"]["file"],
+        label="first determinism progress",
+    )
+    _manifest_matches_file(
+        benchmark_gated.get("numerics_profile_summary", {}).get("telemetry"),
+        first["profile"]["telemetry"],
+        label="first determinism telemetry",
+    )
+    for name in (
+        "source",
+        "git",
+        "packages",
+        "device",
+        "geometry",
+        "host_inputs",
+        "stable_preflight",
+        "profiler_timings",
+    ):
+        if not _json_exact(first[name], second[name]):
+            raise RuntimeError(f"determinism runs differ in {name}")
+    if not _json_exact(first["profile"]["runtime"], second["profile"]["runtime"]):
+        raise RuntimeError("determinism runs differ in profiler runtime")
+    if not _json_exact(first["profile"]["gpu"], second["profile"]["gpu"]):
+        raise RuntimeError("determinism runs differ in profiler GPU identity")
+    expected_hash_positions = {f"{program}/{name}" for program, name in _CANDIDATE_HASH_POSITIONS}
+    for ordinal, run in enumerate(runs, start=1):
+        candidate_hashes = run.get("candidate_hashes")
+        if not isinstance(candidate_hashes, dict) or set(candidate_hashes) != expected_hash_positions:
+            raise RuntimeError(f"determinism run {ordinal} candidate BF16 result hash positions are not exact")
+        if candidate_hashes["candidate_forward/output"] != candidate_hashes["candidate_forward_and_vjp/output"]:
+            raise RuntimeError(f"determinism run {ordinal} candidate primal BF16 outputs differ")
+    if not _json_exact(first["candidate_hashes"], second["candidate_hashes"]):
+        raise RuntimeError("candidate BF16 result hashes are not deterministic")
+
+    normalized_artifacts = [
+        artifact
+        for run in runs
+        for artifact in (
+            run["result"],
+            run["progress"]["file"],
+            run["profile"]["summary"],
+            run["profile"]["telemetry"],
+        )
+    ]
+    paths = [manifest["path"] for manifest in normalized_artifacts]
+    identities = [(manifest["device"], manifest["inode"]) for manifest in normalized_artifacts]
+    if len(set(paths)) != len(paths) or len(set(identities)) != len(identities):
+        raise RuntimeError("determinism artifacts are not distinct")
+    process_ids = [
+        process_id
+        for run in runs
+        for process_id in (
+            run["profile"]["profiler_pid"],
+            run["progress"]["probe_pid"],
+            *run["progress"]["watchdog_pids"],
+        )
+    ]
+    if (
+        len(set(process_ids)) != len(process_ids)
+        or first["profile"]["profiler_command_sha256"] == second["profile"]["profiler_command_sha256"]
+        or first["scope"]["scope_unit"] == second["scope"]["scope_unit"]
+        or (
+            first["scope"]["cgroup_kill_device"],
+            first["scope"]["cgroup_kill_inode"],
+        )
+        == (
+            second["scope"]["cgroup_kill_device"],
+            second["scope"]["cgroup_kill_inode"],
+        )
+    ):
+        raise RuntimeError("determinism process/scope evidence is not distinct")
+    return {
+        "provided": True,
+        "passed": True,
+        "attested": True,
+        "protocol": "two_guarded_processes_five_candidate_bf16_sha256_v1",
+        "candidate_hash_positions": [f"{program}/{name}" for program, name in _CANDIDATE_HASH_POSITIONS],
+        "candidate_bf16_sha256": first["candidate_hashes"],
+        "runs": [
+            {
+                "result": run["result"],
+                "progress": run["progress"]["file"],
+                "profile_summary": run["profile"]["summary"],
+                "profile_telemetry": run["profile"]["telemetry"],
+                "probe_pid": run["progress"]["probe_pid"],
+                "watchdog_pids": run["progress"]["watchdog_pids"],
+                "profiler_pid": run["profile"]["profiler_pid"],
+                "profiler_command_sha256": run["profile"]["profiler_command_sha256"],
+                "scope_unit": run["scope"]["scope_unit"],
+                "cgroup_kill_device": run["scope"]["cgroup_kill_device"],
+                "cgroup_kill_inode": run["scope"]["cgroup_kill_inode"],
+            }
+            for run in runs
+        ],
+    }
+
+
+def _validate_cross_process_determinism(
+    *,
+    pairs: tuple[tuple[Path, Path], tuple[Path, Path]],
+    repo: Path,
+    benchmark_result: dict[str, Any],
+    benchmark_gated: dict[str, Any],
+) -> dict[str, Any]:
+    if len(pairs) != 2 or any(len(pair) != 2 for pair in pairs):
+        raise ValueError("determinism evidence requires exactly two result/profile pairs")
+    runs = tuple(
+        _validate_numerics_determinism_run(
+            result_path=Path(result_path),
+            profile_summary_path=Path(profile_path),
+            repo=repo,
+            benchmark_result=benchmark_result,
+            benchmark_gated=benchmark_gated,
+        )
+        for result_path, profile_path in pairs
+    )
+    return _compare_determinism_runs((runs[0], runs[1]), benchmark_gated=benchmark_gated)
 
 
 def _validate_raw_result(
@@ -1844,12 +2774,17 @@ def validate_and_attest_benchmark(
     output_path: Path | None = None,
     expected_mode: str | None = None,
     write_output: bool = True,
+    determinism_pairs: tuple[tuple[Path, Path], tuple[Path, Path]] | None = None,
 ) -> dict[str, Any]:
     """Validate one benchmark rung without importing JAX or opening the GPU."""
     result_path = Path(result_path)
     profile_summary_path = Path(profile_summary_path)
     if expected_mode is not None and expected_mode not in _BENCHMARK_MODE_COUNTS:
         raise ValueError("expected_mode is not a guarded benchmark mode")
+    if determinism_pairs is not None and (
+        len(determinism_pairs) != 2 or any(len(pair) != 2 for pair in determinism_pairs)
+    ):
+        raise ValueError("determinism evidence requires exactly two result/profile pairs")
     repo = Path(__file__).resolve(strict=True).parent.parent
     (
         mode,
@@ -1863,6 +2798,8 @@ def validate_and_attest_benchmark(
         expected_mode=expected_mode,
         repo=repo,
     )
+    if determinism_pairs is not None and mode != "benchmark":
+        raise ValueError("cross-process determinism can qualify only the full benchmark")
     smoke_attestation: dict[str, Any] | None = None
     if mode == "benchmark":
         assert embedded_smoke is not None
@@ -1900,6 +2837,27 @@ def validate_and_attest_benchmark(
         raw_result=raw_result,
         progress=validated["progress"],
     )
+    if determinism_pairs is None:
+        determinism = {
+            "provided": False,
+            "passed": None,
+            "attested": False,
+            "reason": "two guarded numerics-once result/profile pairs were not provided",
+        }
+    else:
+        determinism = _validate_cross_process_determinism(
+            pairs=determinism_pairs,
+            repo=repo,
+            benchmark_result=raw_result,
+            benchmark_gated=gated,
+        )
+    determinism_attested = bool(determinism["attested"] is True)
+    timing_qualified = bool(mode == "benchmark" and performance["performance_gates_passed"])
+    performance_qualified = bool(timing_qualified and determinism_attested)
+    performance = {
+        **performance,
+        "determinism_attested": determinism_attested,
+    }
     attestor_path = Path(__file__).resolve(strict=True)
     composite = {
         "schema_version": _EVIDENCE_SCHEMA_VERSION,
@@ -1907,12 +2865,13 @@ def validate_and_attest_benchmark(
         "mode": mode,
         "passed": True,
         "attestation_passed": True,
-        "timing_qualified": bool(mode == "benchmark" and performance["performance_gates_passed"]),
-        "performance_qualified": False,
+        "timing_qualified": timing_qualified,
+        "performance_qualified": performance_qualified,
+        "determinism_attested": determinism_attested,
         "probe_completed": True,
         "profile_attested": True,
         "authorizes_default_model_enablement": False,
-        "recommend_for_opt_in_integration": False,
+        "recommend_for_opt_in_integration": performance_qualified,
         "result": result_file,
         "progress": {
             **validated["progress"]["file"],
@@ -1920,6 +2879,7 @@ def validate_and_attest_benchmark(
         },
         "profile": profile,
         "performance": performance,
+        "determinism": determinism,
         "source": validated["source"],
         "git": validated["git"],
         "packages": validated["packages"],
@@ -1951,7 +2911,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-summary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-mode", choices=tuple(_BENCHMARK_MODE_COUNTS), required=True)
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--determinism-result",
+        action="append",
+        default=[],
+        type=Path,
+        help="guarded numerics-once result; repeat exactly twice, prior evidence first",
+    )
+    parser.add_argument(
+        "--determinism-profile-summary",
+        action="append",
+        default=[],
+        type=Path,
+        help="matching guarded profiler summary; repeat exactly twice",
+    )
+    args = parser.parse_args(argv)
+    if len(args.determinism_result) != len(args.determinism_profile_summary) or len(args.determinism_result) not in {
+        0,
+        2,
+    }:
+        parser.error(
+            "determinism evidence requires exactly two --determinism-result and "
+            "two --determinism-profile-summary arguments"
+        )
+    args.determinism_pairs = (
+        tuple(zip(args.determinism_result, args.determinism_profile_summary, strict=True))
+        if args.determinism_result
+        else None
+    )
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1962,6 +2950,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output,
         expected_mode=args.expected_mode,
         write_output=True,
+        determinism_pairs=args.determinism_pairs,
     )
     print(json.dumps(payload, allow_nan=False, sort_keys=True))
     return 0

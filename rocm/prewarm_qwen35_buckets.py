@@ -460,6 +460,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--qwen35-bf16-rms-gate-up-lora-swiglu-contiguous",
+        action="store_true",
+        help=(
+            "enable the exact default-off BF16 B1/T64 Qwen3.5 post-attention "
+            "RMSNorm, contiguous gate/up LoRA, and SwiGLU path"
+        ),
+    )
+    parser.add_argument(
         "--model-path",
         type=Path,
         help="already-cached pinned Qwen3.5 revision (required for execution)",
@@ -496,6 +504,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         parser.error(
             "model, lock, and output options are only valid with --execute-rocm"
+        )
+    if args.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous and not args.execute_rocm:
+        parser.error(
+            "the experimental Qwen3.5 BF16 fused path is only valid with "
+            "--execute-rocm and --allow-gpu"
         )
     if args.execute_rocm and args.model_path is None:
         parser.error("--execute-rocm requires --model-path")
@@ -950,6 +963,98 @@ def _shape_signature(jax: Any, jnp: Any, backend: Any, bucket: int) -> tuple[Any
     )
 
 
+def _qualify_fused_mlp_route(
+    jax: Any,
+    jnp: Any,
+    backend: Any,
+    *,
+    bucket: int,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Evaluate the exact static MLP route predicate without running or inspecting IR."""
+    if type(bucket) is not int or type(enabled) is not bool:
+        raise RuntimeError("fused-MLP route qualification inputs must be exact")
+    set_mesh = getattr(jax, "set_mesh", None)
+    shape_dtype_struct = getattr(jax, "ShapeDtypeStruct", None)
+    if not callable(set_mesh) or not callable(shape_dtype_struct):
+        raise RuntimeError(
+            "fused-MLP route qualification requires JAX mesh and shape APIs"
+        )
+    try:
+        layers = backend.model.model.language_model.layers
+    except AttributeError as error:
+        raise RuntimeError(
+            "fused-MLP route qualification cannot find Qwen3.5 decoder layers"
+        ) from error
+    if len(layers) != len(cache_attestation.FUSED_MLP_ROUTE_LAYER_INDICES):
+        raise RuntimeError(
+            "fused-MLP route qualification requires exactly 32 decoder layers"
+        )
+
+    x = shape_dtype_struct((1, bucket, 2560), jnp.bfloat16)
+    residual = shape_dtype_struct((1, bucket, 2560), jnp.bfloat16)
+    adapter_indices = shape_dtype_struct((1,), jnp.int32)
+    qualified_layer_indices: list[int] = []
+    with set_mesh(backend.mesh):
+        for layer_index, layer in enumerate(layers):
+            try:
+                rms_norm = layer.post_attention_layernorm
+                rms_delta = rms_norm.weight[...]
+                predicate = (
+                    layer.mlp._can_use_bf16_rms_gate_up_lora_swiglu_contiguous
+                )
+                qualified = predicate(
+                    x,
+                    rms_delta,
+                    rms_norm.eps,
+                    adapter_indices,
+                    residual,
+                )
+            except (AttributeError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "fused-MLP route qualification failed while inspecting "
+                    f"decoder layer {layer_index}"
+                ) from error
+            if type(qualified) is not bool:
+                raise RuntimeError(
+                    "fused-MLP route predicate returned a non-bool for decoder "
+                    f"layer {layer_index}"
+                )
+            if qualified:
+                qualified_layer_indices.append(layer_index)
+
+    if not enabled:
+        status = cache_attestation.FUSED_MLP_ROUTE_STATUS_DISABLED_GLOBAL
+        rationale = cache_attestation.FUSED_MLP_ROUTE_RATIONALE_DISABLED_GLOBAL
+        expected_layer_indices: list[int] = []
+    elif bucket != cache_attestation.BUCKET:
+        status = cache_attestation.FUSED_MLP_ROUTE_STATUS_DISABLED_BUCKET
+        rationale = cache_attestation.FUSED_MLP_ROUTE_RATIONALE_DISABLED_BUCKET
+        expected_layer_indices = []
+    else:
+        status = cache_attestation.FUSED_MLP_ROUTE_STATUS_QUALIFIED
+        rationale = cache_attestation.FUSED_MLP_ROUTE_RATIONALE_QUALIFIED
+        expected_layer_indices = list(
+            cache_attestation.FUSED_MLP_ROUTE_LAYER_INDICES
+        )
+    if qualified_layer_indices != expected_layer_indices:
+        raise RuntimeError(
+            "fused-MLP static route did not match its exact bucket policy: "
+            f"expected {expected_layer_indices!r}, got {qualified_layer_indices!r}"
+        )
+    return {
+        "kind": cache_attestation.FUSED_MLP_ROUTE_KIND,
+        "enabled": enabled,
+        "bucket": bucket,
+        "status": status,
+        "expected_layer_indices": expected_layer_indices,
+        "expected_layer_count": len(expected_layer_indices),
+        "qualified_layer_indices": qualified_layer_indices,
+        "qualified_layer_count": len(qualified_layer_indices),
+        "static_python_routing_rationale": rationale,
+    }
+
+
 def _lower_and_compile(
     jax: Any,
     backend: Any,
@@ -1038,10 +1143,23 @@ def _run_rocm(
         "gradient_checkpointing": True,
         "loss_chunk_size": 64,
         "qwen35_bf16_down_lora_residual": False,
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": (
+            args.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous
+        ),
         "abstract_model_load": args.construction == "abstract-load",
     }
-    if "abstract_model_load" not in JaxBackendConfig.model_fields:
-        raise RuntimeError("SkyRL backend lacks the required abstract_model_load field")
+    required_backend_fields = {
+        "abstract_model_load",
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous",
+    }
+    missing_backend_fields = required_backend_fields.difference(
+        JaxBackendConfig.model_fields
+    )
+    if missing_backend_fields:
+        raise RuntimeError(
+            "SkyRL backend lacks required field(s): "
+            + ", ".join(sorted(missing_backend_fields))
+        )
 
     resolved_backend_config = JaxBackendConfig(**config_values)
     resolved_backend_config_values = resolved_backend_config.model_dump(mode="json")
@@ -1067,6 +1185,16 @@ def _run_rocm(
             optimizer_state,
         )
     )
+    fused_mlp_route_attestations = {
+        bucket: _qualify_fused_mlp_route(
+            jax,
+            jnp,
+            backend,
+            bucket=bucket,
+            enabled=args.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous,
+        )
+        for bucket in args.buckets
+    }
     setup_seconds = time.perf_counter() - setup_start
     _emit_backend_ready(
         {
@@ -1133,6 +1261,9 @@ def _run_rocm(
                 "compile_seconds": compile_seconds,
                 "compiled_memory": memory,
                 "persistent_cache_evidence": cache_evidence,
+                "fused_mlp_route_attestation": fused_mlp_route_attestations[
+                    bucket
+                ],
                 "train_bucket_lower_calls": 1,
                 "train_bucket_compile_calls": 1,
                 "optimizer_lower_calls": 0,

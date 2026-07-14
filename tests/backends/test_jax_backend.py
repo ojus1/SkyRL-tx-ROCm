@@ -12,6 +12,9 @@ from skyrl.backends.jax import (
     JaxBackend,
     JaxBackendConfig,
     _validate_qwen35_bf16_down_lora_residual_devices,
+    _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_devices,
+    _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_environment,
+    _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_model_config,
 )
 from skyrl.tinker import api, types
 from skyrl.tinker.engine import prepare_model_pass_batch, prepare_sample_batch
@@ -23,6 +26,23 @@ MAX_LORA_ADAPTERS = 4
 LORA_RANK = 8
 
 
+def _qualified_qwen35_4b_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_type="qwen3_5",
+        text_config=SimpleNamespace(
+            model_type="qwen3_5_text",
+            dtype="bfloat16",
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            head_dim=256,
+            rms_norm_eps=1e-6,
+        ),
+    )
+
+
 def test_abstract_model_load_is_explicitly_opt_in():
     assert JaxBackendConfig().abstract_model_load is False
     assert JaxBackendConfig(abstract_model_load=True).abstract_model_load is True
@@ -30,6 +50,7 @@ def test_abstract_model_load_is_explicitly_opt_in():
 
 def test_qwen35_bf16_down_fusion_is_default_off_and_exact_geometry_only():
     assert JaxBackendConfig().qwen35_bf16_down_lora_residual is False
+    assert JaxBackendConfig().qwen35_bf16_rms_gate_up_lora_swiglu_contiguous is False
     enabled = JaxBackendConfig(
         qwen35_bf16_down_lora_residual=True,
         max_lora_rank=8,
@@ -62,10 +83,98 @@ def test_qwen35_bf16_down_fusion_is_default_off_and_exact_geometry_only():
             )
 
 
+def test_qwen35_bf16_contiguous_mlp_up_is_exact_geometry_only():
+    option = "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    enabled = JaxBackendConfig(
+        qwen35_bf16_rms_gate_up_lora_swiglu_contiguous=True,
+        max_lora_rank=8,
+        train_micro_batch_size=1,
+        gradient_checkpointing=True,
+    )
+    assert enabled.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous is True
+
+    invalid_overrides = (
+        {"max_lora_rank": 4},
+        {"max_lora_adapters": 1},
+        {"mhc_expansion_rate": 2},
+        {"train_micro_batch_size": 2},
+        {"gradient_checkpointing": False},
+        {"enforce_eager": True},
+        {"tensor_parallel_size": 2},
+        {"fully_sharded_data_parallel_size": 2},
+        {"expert_parallel_size": 2},
+    )
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match=option):
+            JaxBackendConfig(
+                **(
+                    {
+                        option: True,
+                        "max_lora_rank": 8,
+                        "train_micro_batch_size": 1,
+                        "gradient_checkpointing": True,
+                    }
+                    | overrides
+                )
+            )
+
+
+@pytest.mark.parametrize("invalid", (0, 1, "0", "1", "false", "true"))
+def test_qwen35_bf16_contiguous_mlp_up_requires_an_exact_boolean(invalid):
+    with pytest.raises(ValueError, match="valid boolean"):
+        JaxBackendConfig(qwen35_bf16_rms_gate_up_lora_swiglu_contiguous=invalid)
+
+
+def test_qwen35_bf16_fused_mlp_options_reject_unqualified_composition():
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        JaxBackendConfig(
+            qwen35_bf16_down_lora_residual=True,
+            qwen35_bf16_rms_gate_up_lora_swiglu_contiguous=True,
+            max_lora_rank=8,
+            train_micro_batch_size=1,
+            gradient_checkpointing=True,
+        )
+
+
+def test_qwen35_bf16_contiguous_mlp_up_requires_graph_free_xla_policy():
+    option = "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    expected = "--xla_gpu_enable_command_buffer="
+    _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_environment(expected)
+
+    for value in (None, "", "--xla_gpu_enable_command_buffer=true", f"{expected} --x"):
+        with pytest.raises(ValueError, match=option):
+            _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_environment(value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("model_type", "qwen3_5_moe_text"),
+        ("dtype", "float16"),
+        ("hidden_size", 2048),
+        ("intermediate_size", 8192),
+        ("num_hidden_layers", 31),
+        ("num_attention_heads", 8),
+        ("num_key_value_heads", 2),
+        ("head_dim", 128),
+        ("rms_norm_eps", 1e-5),
+    ),
+)
+def test_qwen35_bf16_contiguous_mlp_up_requires_exact_4b_text_config(field, value):
+    option = "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    config = _qualified_qwen35_4b_config()
+    _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_model_config(config)
+
+    setattr(config.text_config, field, value)
+    with pytest.raises(ValueError, match=rf"{option}.*{field}"):
+        _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_model_config(config)
+
+
 @pytest.mark.parametrize("kind", ["gfx1100", "AMD Radeon RX 7900 XTX"])
 def test_qwen35_bf16_down_fusion_accepts_only_target_device(kind):
     device = SimpleNamespace(platform="gpu", device_kind=kind)
     _validate_qwen35_bf16_down_lora_residual_devices([device])
+    _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_devices([device])
 
 
 @pytest.mark.parametrize(
@@ -83,6 +192,11 @@ def test_qwen35_bf16_down_fusion_accepts_only_target_device(kind):
 def test_qwen35_bf16_down_fusion_rejects_unqualified_devices(devices):
     with pytest.raises(ValueError, match="qwen35_bf16_down_lora_residual"):
         _validate_qwen35_bf16_down_lora_residual_devices(devices)
+    with pytest.raises(
+        ValueError,
+        match="qwen35_bf16_rms_gate_up_lora_swiglu_contiguous",
+    ):
+        _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_devices(devices)
 
 
 def test_split_tied_logprob_config_is_default_off_and_single_tp_only():

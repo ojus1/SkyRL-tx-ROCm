@@ -188,6 +188,7 @@ _BACKEND_CONFIG_TYPES = {
     "gradient_checkpointing": bool,
     "loss_chunk_size": int,
     "qwen35_bf16_down_lora_residual": bool,
+    "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": bool,
     "abstract_model_load": bool,
 }
 _BACKEND_CONFIG_FIXED = {
@@ -2832,6 +2833,9 @@ def _collect_contract(
         "qwen35_bf16_down_lora_residual": backend_config[
             "qwen35_bf16_down_lora_residual"
         ],
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": backend_config[
+            "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+        ],
         "abstract_model_load": backend_config["abstract_model_load"],
         "runtime_handoff_sha256": _sha256_bytes(handoff_json.encode("ascii")),
         "runtime_source_sha256": _sha256_bytes(source_json.encode("ascii")),
@@ -2860,6 +2864,9 @@ def _collect_contract(
             "sample_max_num_sequences": 1,
             "qwen35_bf16_down_lora_residual": backend_config[
                 "qwen35_bf16_down_lora_residual"
+            ],
+            "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": backend_config[
+                "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
             ],
             "abstract_model_load": backend_config["abstract_model_load"],
         },

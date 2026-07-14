@@ -21,6 +21,7 @@ Usage:
 """
 
 import json
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ from cloudpathlib import AnyPath
 from flax import nnx
 from flax.training import checkpoints
 from jax.experimental import multihost_utils
-from pydantic import BaseModel, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, Field, StrictBool, TypeAdapter, model_validator
 from transformers import AutoConfig, AutoTokenizer
 
 from skyrl.backends.backend import AbstractBackend
@@ -63,6 +64,8 @@ from skyrl.utils.log import logger
 
 _DEFAULT_PPO_CLIP_LOW_THRESHOLD = 0.8
 _DEFAULT_PPO_CLIP_HIGH_THRESHOLD = 1.2
+_QWEN35_BF16_CONTIGUOUS_OPTION = "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+_QWEN35_BF16_CONTIGUOUS_XLA_FLAGS = "--xla_gpu_enable_command_buffer="
 
 
 class JaxBackendConfig(BaseModel, extra="forbid"):
@@ -127,21 +130,25 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
             "LoRA-residual stage. Unsupported calls retain the ordinary path."
         ),
     )
+    qwen35_bf16_rms_gate_up_lora_swiglu_contiguous: StrictBool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL: fuse the exact BF16 B1/T64 Qwen3.5 post-attention "
+            "RMSNorm, interleaved gate/up LoRA projection, and SwiGLU on gfx1100. "
+            "This frozen-base path supports only cacheless SkyRL LoRA training and requires "
+            "command buffers to be disabled. Unsupported sequence shapes retain "
+            "the ordinary model path."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tied_logprob_geometry(self) -> "JaxBackendConfig":
         if self.tied_logprob_vocab_superblock_size == 0:
             return self
         if self.loss_chunk_size not in (64, 128, 256):
-            raise ValueError(
-                "tied_logprob_vocab_superblock_size requires loss_chunk_size "
-                "in (64, 128, 256)"
-            )
+            raise ValueError("tied_logprob_vocab_superblock_size requires loss_chunk_size " "in (64, 128, 256)")
         if self.tensor_parallel_size != 1:
-            raise ValueError(
-                "the experimental split tied-logprob path is qualified only "
-                "for tensor_parallel_size=1"
-            )
+            raise ValueError("the experimental split tied-logprob path is qualified only " "for tensor_parallel_size=1")
         return self
 
     @model_validator(mode="after")
@@ -155,19 +162,45 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
             or self.fully_sharded_data_parallel_size != 1
             or self.expert_parallel_size != 1
         ):
-            raise ValueError(
-                "qwen35_bf16_down_lora_residual is qualified only for a 1x1x1 mesh"
-            )
+            raise ValueError("qwen35_bf16_down_lora_residual is qualified only for a 1x1x1 mesh")
         if self.max_lora_rank != 8:
             raise ValueError("qwen35_bf16_down_lora_residual requires max_lora_rank=8")
         if self.train_micro_batch_size != 1:
-            raise ValueError(
-                "qwen35_bf16_down_lora_residual requires train_micro_batch_size=1"
-            )
+            raise ValueError("qwen35_bf16_down_lora_residual requires train_micro_batch_size=1")
         if not self.gradient_checkpointing:
+            raise ValueError("qwen35_bf16_down_lora_residual requires gradient_checkpointing")
+        return self
+
+    @model_validator(mode="after")
+    def validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous(
+        self,
+    ) -> "JaxBackendConfig":
+        option = _QWEN35_BF16_CONTIGUOUS_OPTION
+        if not self.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous:
+            return self
+        if self.qwen35_bf16_down_lora_residual:
             raise ValueError(
-                "qwen35_bf16_down_lora_residual requires gradient_checkpointing"
+                f"{option} and qwen35_bf16_down_lora_residual cannot be enabled "
+                "together until the composed custom-VJP path is qualified"
             )
+        if self.enforce_eager:
+            raise ValueError(f"{option} requires JIT execution")
+        if (
+            self.tensor_parallel_size != 1
+            or self.fully_sharded_data_parallel_size != 1
+            or self.expert_parallel_size != 1
+        ):
+            raise ValueError(f"{option} is qualified only for a 1x1x1 mesh")
+        if self.max_lora_rank != 8:
+            raise ValueError(f"{option} requires max_lora_rank=8")
+        if self.max_lora_adapters < 2:
+            raise ValueError(f"{option} requires max_lora_adapters>=2")
+        if self.mhc_expansion_rate != 1:
+            raise ValueError(f"{option} supports LoRA-only training without mHC")
+        if self.train_micro_batch_size != 1:
+            raise ValueError(f"{option} requires train_micro_batch_size=1")
+        if not self.gradient_checkpointing:
+            raise ValueError(f"{option} requires gradient_checkpointing")
         return self
 
     # Multi-node configuration
@@ -197,25 +230,85 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     )
 
 
-def _validate_qwen35_bf16_down_lora_residual_devices(
-    devices: Sequence[jax.Device],
-) -> None:
+def _validate_qwen35_bf16_fused_mlp_devices(devices: Sequence[jax.Device], *, option: str) -> None:
     """Fail closed unless the experimental kernel targets one gfx1100 GPU."""
     if len(devices) != 1:
-        raise ValueError(
-            "qwen35_bf16_down_lora_residual requires exactly one visible JAX device"
-        )
+        raise ValueError(f"{option} requires exactly one visible JAX device")
     device = devices[0]
     platform = str(getattr(device, "platform", ""))
     device_kind = str(getattr(device, "device_kind", "")).strip()
     normalized_kind = device_kind.lower().replace(" ", "")
-    if platform != "gpu" or (
-        "gfx1100" not in normalized_kind and "rx7900xtx" not in normalized_kind
-    ):
+    if platform != "gpu" or ("gfx1100" not in normalized_kind and "rx7900xtx" not in normalized_kind):
         raise ValueError(
-            "qwen35_bf16_down_lora_residual requires the qualified gfx1100/RX "
+            f"{option} requires the qualified gfx1100/RX "
             f"7900 XTX GPU, got platform={platform!r}, device_kind={device_kind!r}"
         )
+
+
+def _config_value(config: Any, name: str) -> Any:
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_environment(
+    xla_flags: str | None,
+) -> None:
+    """Validate the qualified graph-free XLA policy without initializing JAX."""
+    if xla_flags != _QWEN35_BF16_CONTIGUOUS_XLA_FLAGS:
+        raise ValueError(
+            f"{_QWEN35_BF16_CONTIGUOUS_OPTION} requires exact "
+            f"XLA_FLAGS={_QWEN35_BF16_CONTIGUOUS_XLA_FLAGS!r}, got "
+            f"{xla_flags!r}"
+        )
+
+
+def _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_model_config(
+    base_config: Any,
+) -> None:
+    """Fail closed unless a config has the qualified Qwen3.5-4B text contract."""
+    text_config = _config_value(base_config, "text_config")
+    if text_config is None:
+        text_config = base_config
+
+    expected_geometry = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 2560,
+        "intermediate_size": 9216,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+    }
+    mismatches = {
+        name: _config_value(text_config, name)
+        for name, expected in expected_geometry.items()
+        if _config_value(text_config, name) != expected
+    }
+    dtype = _config_value(text_config, "dtype")
+    if str(dtype) not in {"bfloat16", "torch.bfloat16"}:
+        mismatches["dtype"] = dtype
+    epsilon = _config_value(text_config, "rms_norm_eps")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)) or float(epsilon) != 1e-6:
+        mismatches["rms_norm_eps"] = epsilon
+    if mismatches:
+        rendered = ", ".join(f"{name}={value!r}" for name, value in sorted(mismatches.items()))
+        raise ValueError(
+            f"{_QWEN35_BF16_CONTIGUOUS_OPTION} requires the exact BF16 "
+            f"Qwen3.5-4B text geometry with rms_norm_eps=1e-6; got {rendered}"
+        )
+
+
+def _validate_qwen35_bf16_down_lora_residual_devices(
+    devices: Sequence[jax.Device],
+) -> None:
+    _validate_qwen35_bf16_fused_mlp_devices(devices, option="qwen35_bf16_down_lora_residual")
+
+
+def _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_devices(
+    devices: Sequence[jax.Device],
+) -> None:
+    _validate_qwen35_bf16_fused_mlp_devices(devices, option="qwen35_bf16_rms_gate_up_lora_swiglu_contiguous")
 
 
 @jax.tree_util.register_dataclass
@@ -304,19 +397,23 @@ class JaxBackendImpl(AbstractBackend):
         self.process_id = process_id
         self.metrics = types.EngineMetrics()
 
-        if config.qwen35_bf16_down_lora_residual:
-            _validate_qwen35_bf16_down_lora_residual_devices(jax.devices())
+        if config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous:
+            _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_environment(os.environ.get("XLA_FLAGS"))
 
         # Initialize the shared base model with LoRA config
         checkpoint_path = resolve_model_path(base_model)
-        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         base_config = AutoConfig.from_pretrained(checkpoint_path)
-        if config.qwen35_bf16_down_lora_residual and not str(
+        if (config.qwen35_bf16_down_lora_residual or config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous) and not str(
             getattr(base_config, "model_type", "")
         ).startswith("qwen3_5"):
-            raise ValueError(
-                "qwen35_bf16_down_lora_residual requires a Qwen3.5 base model"
-            )
+            raise ValueError("the experimental Qwen3.5 BF16 fused MLP options require a " "Qwen3.5 base model")
+        if config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous:
+            _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_model_config(base_config)
+        if config.qwen35_bf16_down_lora_residual:
+            _validate_qwen35_bf16_down_lora_residual_devices(jax.devices())
+        if config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous:
+            _validate_qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_devices(jax.devices())
+        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         self.model_config = Qwen3Config(
             base_config,
             max_lora_adapters=config.max_lora_adapters,
@@ -327,6 +424,7 @@ class JaxBackendImpl(AbstractBackend):
             gradient_checkpointing=config.gradient_checkpointing,
             mhc_expansion_rate=config.mhc_expansion_rate,
             qwen35_bf16_down_lora_residual=config.qwen35_bf16_down_lora_residual,
+            qwen35_bf16_rms_gate_up_lora_swiglu_contiguous=(config.qwen35_bf16_rms_gate_up_lora_swiglu_contiguous),
         )
 
         model_class = get_model_class(self.model_config)

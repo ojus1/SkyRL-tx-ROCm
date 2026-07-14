@@ -46,6 +46,18 @@ COMPILE_TARGET = "train_bucket_forward_backward_accumulate"
 BUCKET = 64
 BATCH_SIZE = 1
 DISABLE_COMMAND_BUFFERS = "--xla_gpu_enable_command_buffer="
+FUSED_MLP_ROUTE_KIND = (
+    "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous_static_route_v1"
+)
+FUSED_MLP_ROUTE_STATUS_QUALIFIED = "qualified"
+FUSED_MLP_ROUTE_STATUS_DISABLED_BUCKET = "disabled-for-bucket"
+FUSED_MLP_ROUTE_STATUS_DISABLED_GLOBAL = "disabled-globally"
+FUSED_MLP_ROUTE_RATIONALE_QUALIFIED = (
+    "same-mlp-python-predicate-exact-b1-t64-bf16-all-layers"
+)
+FUSED_MLP_ROUTE_RATIONALE_DISABLED_BUCKET = "non-t64-bucket"
+FUSED_MLP_ROUTE_RATIONALE_DISABLED_GLOBAL = "global-opt-in-disabled"
+FUSED_MLP_ROUTE_LAYER_INDICES = tuple(range(32))
 
 _CACHE_SUFFIX = "-cache"
 _ATIME_SUFFIX = "-atime"
@@ -1095,6 +1107,65 @@ def _one_record(
     return matches[0]
 
 
+def _validate_fused_mlp_route_attestation(
+    value: object,
+    *,
+    enabled: bool,
+    bucket: int,
+) -> dict[str, object]:
+    """Require the exact static route proof emitted for one train bucket."""
+    if type(enabled) is not bool or type(bucket) is not int:
+        raise CacheAttestationError("fused-MLP route policy inputs are not exact")
+    fields = {
+        "kind",
+        "enabled",
+        "bucket",
+        "status",
+        "expected_layer_indices",
+        "expected_layer_count",
+        "qualified_layer_indices",
+        "qualified_layer_count",
+        "static_python_routing_rationale",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise CacheAttestationError("fused-MLP route attestation schema is invalid")
+
+    if not enabled:
+        status = FUSED_MLP_ROUTE_STATUS_DISABLED_GLOBAL
+        rationale = FUSED_MLP_ROUTE_RATIONALE_DISABLED_GLOBAL
+        expected_indices: list[int] = []
+    elif bucket != BUCKET:
+        status = FUSED_MLP_ROUTE_STATUS_DISABLED_BUCKET
+        rationale = FUSED_MLP_ROUTE_RATIONALE_DISABLED_BUCKET
+        expected_indices = []
+    else:
+        status = FUSED_MLP_ROUTE_STATUS_QUALIFIED
+        rationale = FUSED_MLP_ROUTE_RATIONALE_QUALIFIED
+        expected_indices = list(FUSED_MLP_ROUTE_LAYER_INDICES)
+
+    qualified_indices = value.get("qualified_layer_indices")
+    if (
+        value.get("kind") != FUSED_MLP_ROUTE_KIND
+        or value.get("enabled") is not enabled
+        or type(value.get("bucket")) is not int
+        or value.get("bucket") != bucket
+        or value.get("status") != status
+        or value.get("static_python_routing_rationale") != rationale
+        or value.get("expected_layer_indices") != expected_indices
+        or type(value.get("expected_layer_count")) is not int
+        or value.get("expected_layer_count") != len(expected_indices)
+        or not isinstance(qualified_indices, list)
+        or any(type(index) is not int for index in qualified_indices)
+        or qualified_indices != expected_indices
+        or type(value.get("qualified_layer_count")) is not int
+        or value.get("qualified_layer_count") != len(qualified_indices)
+    ):
+        raise CacheAttestationError(
+            "fused-MLP route attestation does not match its exact bucket policy"
+        )
+    return dict(value)
+
+
 def validate_prewarm_t64_artifact(
     payload: bytes,
     *,
@@ -1316,6 +1387,13 @@ def validate_prewarm_t64_artifact(
         raise CacheAttestationError(
             "prewarm backend unexpectedly enabled the unpromoted BF16 down fusion"
         )
+    if (
+        type(backend_config.get("qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"))
+        is not bool
+    ):
+        raise CacheAttestationError(
+            "prewarm backend contiguous BF16 fused-MLP policy is not an exact bool"
+        )
     if backend_config.get("abstract_model_load") is not (
         construction == "abstract-load"
     ):
@@ -1326,6 +1404,29 @@ def validate_prewarm_t64_artifact(
     if not isinstance(model_path, str) or not model_path.startswith("/"):
         raise CacheAttestationError("prewarm canonical model path is absent")
     _require_zero_invocations(backend_ready)
+
+    fused_mlp_enabled = backend_config[
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    ]
+    fused_mlp_route_attestations: dict[int, dict[str, object]] = {}
+    for compiled_record in (
+        record
+        for record in records
+        if record.get("record_type") == "bucket_compiled"
+    ):
+        compiled_bucket = compiled_record.get("bucket")
+        assert type(compiled_bucket) is int
+        fused_mlp_route_attestations[compiled_bucket] = (
+            _validate_fused_mlp_route_attestation(
+                compiled_record.get("fused_mlp_route_attestation"),
+                enabled=fused_mlp_enabled,
+                bucket=compiled_bucket,
+            )
+        )
+    if set(fused_mlp_route_attestations) != set(buckets):
+        raise CacheAttestationError(
+            "prewarm fused-MLP route attestations do not cover every bucket"
+        )
 
     postflight = _one_record(records, "bucket_postflight", bucket=BUCKET)
     postflight_fields = {
@@ -1689,6 +1790,7 @@ def validate_prewarm_t64_artifact(
         "compile_seconds",
         "compiled_memory",
         "persistent_cache_evidence",
+        "fused_mlp_route_attestation",
         "train_bucket_lower_calls",
         "train_bucket_compile_calls",
         "optimizer_lower_calls",
@@ -1710,6 +1812,8 @@ def validate_prewarm_t64_artifact(
         or compiled.get("batch_size") != BATCH_SIZE
         or compiled.get("attention_backend") != expected_attention_backend
         or compiled.get("persistent_cache_evidence") != evidence
+        or compiled.get("fused_mlp_route_attestation")
+        != fused_mlp_route_attestations[BUCKET]
         or isinstance(lower_seconds, bool)
         or not isinstance(lower_seconds, (int, float))
         or not math.isfinite(lower_seconds)
@@ -1836,6 +1940,7 @@ def validate_prewarm_t64_artifact(
         "source_git_tree": expected_git_tree,
         "backend_config": backend_config,
         "backend_config_sha256": backend_config_sha256,
+        "fused_mlp_route_attestation": fused_mlp_route_attestations[BUCKET],
         "prewarm_seed_kind": evidence["classification"],
         "target_cache_entry": target_entry,
         "target_atime_transition": target_atime,

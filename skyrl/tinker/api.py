@@ -629,6 +629,16 @@ def _validate_required_startup_cache_engine_config(
     seed = claim.get("seed")
     if not isinstance(seed, dict):
         raise RuntimeError("required runtime startup cache seed is absent")
+    seed_backend_config = seed.get("backend_config")
+    if not isinstance(seed_backend_config, dict):
+        raise RuntimeError("required runtime startup cache backend config is absent")
+    fused_mlp_enabled = seed_backend_config.get(
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"
+    )
+    if type(fused_mlp_enabled) is not bool:
+        raise RuntimeError(
+            "required runtime startup cache fused-MLP policy is not an exact bool"
+        )
     memory_mode = source_attestation.get("memory_mode")
     if memory_mode not in {"growth", "preallocate85"}:
         raise RuntimeError("required runtime memory mode is invalid")
@@ -640,6 +650,7 @@ def _validate_required_startup_cache_engine_config(
         "gradient_checkpointing": True,
         "loss_chunk_size": 64,
         "qwen35_bf16_down_lora_residual": False,
+        "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": fused_mlp_enabled,
         "abstract_model_load": memory_mode == "preallocate85",
     }
     if (

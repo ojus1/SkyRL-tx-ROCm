@@ -86,7 +86,12 @@ def test_generic_engine_has_no_module_scope_rocm_dependency() -> None:
     assert top_level_rocm_imports == []
 
 
-def _api_config(model_path: str, *, abstract_model_load: bool = False) -> EngineConfig:
+def _api_config(
+    model_path: str,
+    *,
+    abstract_model_load: bool = False,
+    fused_mlp: bool = False,
+) -> EngineConfig:
     return EngineConfig(
         base_model=model_path,
         backend="jax",
@@ -98,6 +103,7 @@ def _api_config(model_path: str, *, abstract_model_load: bool = False) -> Engine
             "gradient_checkpointing": True,
             "loss_chunk_size": 64,
             "qwen35_bf16_down_lora_residual": False,
+            "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": fused_mlp,
             "abstract_model_load": abstract_model_load,
         },
     )
@@ -109,7 +115,12 @@ def test_api_required_cache_config_check_is_exact() -> None:
         "memory_mode": "growth",
         "startup_cache_attestation": {
             "status": "required-v1",
-            "seed": {"model_path": "/models/pinned"},
+            "seed": {
+                "model_path": "/models/pinned",
+                "backend_config": {
+                    "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": False
+                },
+            },
         },
     }
 
@@ -129,7 +140,12 @@ def test_api_required_cache_config_binds_abstract_load_to_memory_mode() -> None:
         "memory_mode": "preallocate85",
         "startup_cache_attestation": {
             "status": "required-v1",
-            "seed": {"model_path": "/models/pinned"},
+            "seed": {
+                "model_path": "/models/pinned",
+                "backend_config": {
+                    "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": False
+                },
+            },
         },
     }
 
@@ -139,6 +155,53 @@ def test_api_required_cache_config_binds_abstract_load_to_memory_mode() -> None:
     with pytest.raises(RuntimeError, match="exact JAX engine config"):
         api_module._validate_required_startup_cache_engine_config(
             source, _api_config("/models/pinned", abstract_model_load=False)
+        )
+
+
+def test_api_required_cache_config_binds_fused_mlp_policy_to_seed() -> None:
+    source = {
+        "status": "passed",
+        "memory_mode": "growth",
+        "startup_cache_attestation": {
+            "status": "required-v1",
+            "seed": {
+                "model_path": "/models/pinned",
+                "backend_config": {
+                    "qwen35_bf16_rms_gate_up_lora_swiglu_contiguous": True
+                },
+            },
+        },
+    }
+
+    api_module._validate_required_startup_cache_engine_config(
+        source, _api_config("/models/pinned", fused_mlp=True)
+    )
+    with pytest.raises(RuntimeError, match="exact JAX engine config"):
+        api_module._validate_required_startup_cache_engine_config(
+            source, _api_config("/models/pinned", fused_mlp=False)
+        )
+
+
+@pytest.mark.parametrize("value", [None, 0, "false"])
+def test_api_required_cache_config_requires_exact_fused_mlp_bool(value) -> None:
+    backend_config = {}
+    if value is not None:
+        backend_config["qwen35_bf16_rms_gate_up_lora_swiglu_contiguous"] = value
+    source = {
+        "status": "passed",
+        "memory_mode": "growth",
+        "startup_cache_attestation": {
+            "status": "required-v1",
+            "seed": {
+                "model_path": "/models/pinned",
+                "backend_config": backend_config,
+            },
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="exact bool"):
+        api_module._validate_required_startup_cache_engine_config(
+            source, _api_config("/models/pinned")
         )
 
 
