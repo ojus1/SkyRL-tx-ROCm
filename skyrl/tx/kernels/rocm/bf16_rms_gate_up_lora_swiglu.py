@@ -284,7 +284,12 @@ def _gate_up_swiglu_kernel(
     up = (
         up + (low_rank_up.astype(jnp.bfloat16) * scaling).astype(jnp.bfloat16)
     ).astype(jnp.bfloat16)
-    product = (jax.nn.silu(gate) * up).astype(jnp.bfloat16)
+    # JAX's Triton lowering cannot divide BF16 tensors on this ROCm stack;
+    # BF16 ``silu`` therefore fails before code generation.  Promote only the
+    # elementwise epilogue, then round once at the public BF16 boundary.
+    product = (jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)).astype(
+        jnp.bfloat16
+    )
     plgpu.store(
         product_ref.at[rows[:, None], product_columns[None, :]],
         product.astype(jnp.bfloat16),
