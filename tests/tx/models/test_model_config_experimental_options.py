@@ -23,6 +23,7 @@ def test_tied_logprob_option_is_default_off() -> None:
         shard_attention_heads=True,
     )
     assert config.tied_logprob_vocab_superblock_size == 0
+    assert config.qwen35_bf16_down_lora_residual is False
 
 
 def test_tied_logprob_option_propagates_to_nested_text_config() -> None:
@@ -33,9 +34,11 @@ def test_tied_logprob_option_propagates_to_nested_text_config() -> None:
         shard_attention_heads=True,
         loss_chunk_size=256,
         tied_logprob_vocab_superblock_size=4096,
+        qwen35_bf16_down_lora_residual=True,
     )
 
     text_config = config.get_text_config()
     assert text_config.loss_chunk_size == 256
     assert text_config.tied_logprob_vocab_superblock_size == 4096
+    assert text_config.qwen35_bf16_down_lora_residual is True
     assert text_config.vocab_size == 41

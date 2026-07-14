@@ -187,6 +187,7 @@ _BACKEND_CONFIG_TYPES = {
     "sample_max_num_sequences": int,
     "gradient_checkpointing": bool,
     "loss_chunk_size": int,
+    "qwen35_bf16_down_lora_residual": bool,
     "abstract_model_load": bool,
 }
 _BACKEND_CONFIG_FIXED = {
@@ -196,6 +197,7 @@ _BACKEND_CONFIG_FIXED = {
     "sample_max_num_sequences": 1,
     "gradient_checkpointing": True,
     "loss_chunk_size": 64,
+    "qwen35_bf16_down_lora_residual": True,
 }
 _ENGINE_LAUNCH_SCHEMA = (
     (0, "launch_id", "VARCHAR", 1, None, 1),
@@ -2827,6 +2829,9 @@ def _collect_contract(
         "launch_id_sha256": _sha256_bytes(row["launch_id"].encode("ascii")),
         "processes": process_evidence,
         "backend_config_sha256": _sha256_bytes(backend_config_json.encode("ascii")),
+        "qwen35_bf16_down_lora_residual": backend_config[
+            "qwen35_bf16_down_lora_residual"
+        ],
         "abstract_model_load": backend_config["abstract_model_load"],
         "runtime_handoff_sha256": _sha256_bytes(handoff_json.encode("ascii")),
         "runtime_source_sha256": _sha256_bytes(source_json.encode("ascii")),
@@ -2853,6 +2858,9 @@ def _collect_contract(
             "name": "jax",
             "backend_config_sha256": stable_contract["backend_config_sha256"],
             "sample_max_num_sequences": 1,
+            "qwen35_bf16_down_lora_residual": backend_config[
+                "qwen35_bf16_down_lora_residual"
+            ],
             "abstract_model_load": backend_config["abstract_model_load"],
         },
         "model": {

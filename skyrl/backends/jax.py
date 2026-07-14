@@ -24,7 +24,7 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, get_type_hints
+from typing import Any, Callable, Sequence, get_type_hints
 
 import jax
 import jax.numpy as jnp
@@ -120,6 +120,13 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
             "target-logprob custom VJP. Zero keeps the existing dense chunked head."
         ),
     )
+    qwen35_bf16_down_lora_residual: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL: use the exact BF16 B1/T64 gfx1100 Pallas MLP-down "
+            "LoRA-residual stage. Unsupported calls retain the ordinary path."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tied_logprob_geometry(self) -> "JaxBackendConfig":
@@ -136,6 +143,33 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
                 "for tensor_parallel_size=1"
             )
         return self
+
+    @model_validator(mode="after")
+    def validate_qwen35_bf16_down_lora_residual(self) -> "JaxBackendConfig":
+        if not self.qwen35_bf16_down_lora_residual:
+            return self
+        if self.enforce_eager:
+            raise ValueError("qwen35_bf16_down_lora_residual requires JIT execution")
+        if (
+            self.tensor_parallel_size != 1
+            or self.fully_sharded_data_parallel_size != 1
+            or self.expert_parallel_size != 1
+        ):
+            raise ValueError(
+                "qwen35_bf16_down_lora_residual is qualified only for a 1x1x1 mesh"
+            )
+        if self.max_lora_rank != 8:
+            raise ValueError("qwen35_bf16_down_lora_residual requires max_lora_rank=8")
+        if self.train_micro_batch_size != 1:
+            raise ValueError(
+                "qwen35_bf16_down_lora_residual requires train_micro_batch_size=1"
+            )
+        if not self.gradient_checkpointing:
+            raise ValueError(
+                "qwen35_bf16_down_lora_residual requires gradient_checkpointing"
+            )
+        return self
+
     # Multi-node configuration
     coordinator_address: str | None = Field(
         default=None,
@@ -161,6 +195,27 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         description="Bundles for the Ray placement group (e.g., [{'CPU': 1}] * num_processes)",
         json_schema_extra={"argparse_type": json.loads},
     )
+
+
+def _validate_qwen35_bf16_down_lora_residual_devices(
+    devices: Sequence[jax.Device],
+) -> None:
+    """Fail closed unless the experimental kernel targets one gfx1100 GPU."""
+    if len(devices) != 1:
+        raise ValueError(
+            "qwen35_bf16_down_lora_residual requires exactly one visible JAX device"
+        )
+    device = devices[0]
+    platform = str(getattr(device, "platform", ""))
+    device_kind = str(getattr(device, "device_kind", "")).strip()
+    normalized_kind = device_kind.lower().replace(" ", "")
+    if platform != "gpu" or (
+        "gfx1100" not in normalized_kind and "rx7900xtx" not in normalized_kind
+    ):
+        raise ValueError(
+            "qwen35_bf16_down_lora_residual requires the qualified gfx1100/RX "
+            f"7900 XTX GPU, got platform={platform!r}, device_kind={device_kind!r}"
+        )
 
 
 @jax.tree_util.register_dataclass
@@ -249,10 +304,19 @@ class JaxBackendImpl(AbstractBackend):
         self.process_id = process_id
         self.metrics = types.EngineMetrics()
 
+        if config.qwen35_bf16_down_lora_residual:
+            _validate_qwen35_bf16_down_lora_residual_devices(jax.devices())
+
         # Initialize the shared base model with LoRA config
         checkpoint_path = resolve_model_path(base_model)
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         base_config = AutoConfig.from_pretrained(checkpoint_path)
+        if config.qwen35_bf16_down_lora_residual and not str(
+            getattr(base_config, "model_type", "")
+        ).startswith("qwen3_5"):
+            raise ValueError(
+                "qwen35_bf16_down_lora_residual requires a Qwen3.5 base model"
+            )
         self.model_config = Qwen3Config(
             base_config,
             max_lora_adapters=config.max_lora_adapters,
@@ -262,6 +326,7 @@ class JaxBackendImpl(AbstractBackend):
             tied_logprob_vocab_superblock_size=config.tied_logprob_vocab_superblock_size,
             gradient_checkpointing=config.gradient_checkpointing,
             mhc_expansion_rate=config.mhc_expansion_rate,
+            qwen35_bf16_down_lora_residual=config.qwen35_bf16_down_lora_residual,
         )
 
         model_class = get_model_class(self.model_config)

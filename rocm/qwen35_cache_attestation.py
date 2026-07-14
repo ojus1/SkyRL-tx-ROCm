@@ -1312,6 +1312,10 @@ def validate_prewarm_t64_artifact(
         raise CacheAttestationError("prewarm resolved backend config hash is invalid")
     if backend_config.get("enforce_eager") is not False:
         raise CacheAttestationError("prewarm backend did not use JIT")
+    if backend_config.get("qwen35_bf16_down_lora_residual") is not True:
+        raise CacheAttestationError(
+            "prewarm backend did not enable the qualified BF16 down fusion"
+        )
     if backend_config.get("abstract_model_load") is not (
         construction == "abstract-load"
     ):

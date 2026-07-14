@@ -1,12 +1,18 @@
 """Unit tests for JaxBackend."""
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
-from skyrl.backends.jax import JaxBackend, JaxBackendConfig
+from skyrl.backends.jax import (
+    JaxBackend,
+    JaxBackendConfig,
+    _validate_qwen35_bf16_down_lora_residual_devices,
+)
 from skyrl.tinker import api, types
 from skyrl.tinker.engine import prepare_model_pass_batch, prepare_sample_batch
 from skyrl.tinker.types import LoraConfig, OptimStepInput
@@ -20,6 +26,63 @@ LORA_RANK = 8
 def test_abstract_model_load_is_explicitly_opt_in():
     assert JaxBackendConfig().abstract_model_load is False
     assert JaxBackendConfig(abstract_model_load=True).abstract_model_load is True
+
+
+def test_qwen35_bf16_down_fusion_is_default_off_and_exact_geometry_only():
+    assert JaxBackendConfig().qwen35_bf16_down_lora_residual is False
+    enabled = JaxBackendConfig(
+        qwen35_bf16_down_lora_residual=True,
+        max_lora_rank=8,
+        train_micro_batch_size=1,
+        gradient_checkpointing=True,
+    )
+    assert enabled.qwen35_bf16_down_lora_residual is True
+
+    invalid_overrides = (
+        {"max_lora_rank": 4},
+        {"train_micro_batch_size": 2},
+        {"gradient_checkpointing": False},
+        {"enforce_eager": True},
+        {"tensor_parallel_size": 2},
+        {"fully_sharded_data_parallel_size": 2},
+        {"expert_parallel_size": 2},
+    )
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match="qwen35_bf16_down_lora_residual"):
+            JaxBackendConfig(
+                **(
+                    {
+                        "qwen35_bf16_down_lora_residual": True,
+                        "max_lora_rank": 8,
+                        "train_micro_batch_size": 1,
+                        "gradient_checkpointing": True,
+                    }
+                    | overrides
+                )
+            )
+
+
+@pytest.mark.parametrize("kind", ["gfx1100", "AMD Radeon RX 7900 XTX"])
+def test_qwen35_bf16_down_fusion_accepts_only_target_device(kind):
+    device = SimpleNamespace(platform="gpu", device_kind=kind)
+    _validate_qwen35_bf16_down_lora_residual_devices([device])
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [
+        [],
+        [SimpleNamespace(platform="cpu", device_kind="cpu")],
+        [SimpleNamespace(platform="gpu", device_kind="Radeon VII")],
+        [
+            SimpleNamespace(platform="gpu", device_kind="gfx1100"),
+            SimpleNamespace(platform="gpu", device_kind="gfx1100"),
+        ],
+    ],
+)
+def test_qwen35_bf16_down_fusion_rejects_unqualified_devices(devices):
+    with pytest.raises(ValueError, match="qwen35_bf16_down_lora_residual"):
+        _validate_qwen35_bf16_down_lora_residual_devices(devices)
 
 
 def test_split_tied_logprob_config_is_default_off_and_single_tp_only():

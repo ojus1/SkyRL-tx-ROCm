@@ -359,7 +359,11 @@ def _jsonl(records: list[dict[str, object]]) -> bytes:
 
 
 def _prewarm_records(cache_path: Path) -> list[dict[str, object]]:
-    backend_config = {"abstract_model_load": False, "enforce_eager": False}
+    backend_config = {
+        "abstract_model_load": False,
+        "enforce_eager": False,
+        "qwen35_bf16_down_lora_residual": True,
+    }
     backend_hash = attestation.canonical_json_sha256(
         backend_config, domain="skyrl-qwen35-resolved-jax-backend-config-v1"
     )

@@ -29,6 +29,7 @@ class ModelConfig(PretrainedConfig):
     tied_logprob_vocab_superblock_size: int
     gradient_checkpointing: bool
     mhc_expansion_rate: int
+    qwen35_bf16_down_lora_residual: bool
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class ModelConfig(PretrainedConfig):
         tied_logprob_vocab_superblock_size: int = 0,
         gradient_checkpointing: bool = False,
         mhc_expansion_rate: int = 1,
+        qwen35_bf16_down_lora_residual: bool = False,
     ):
         # Preserve the source config's attribute_map (e.g. Qwen3MoeConfig's
         # num_experts -> num_local_experts alias) — transformers v5.4 made
@@ -57,6 +59,7 @@ class ModelConfig(PretrainedConfig):
         self.tied_logprob_vocab_superblock_size = tied_logprob_vocab_superblock_size
         self.gradient_checkpointing = gradient_checkpointing
         self.mhc_expansion_rate = mhc_expansion_rate
+        self.qwen35_bf16_down_lora_residual = qwen35_bf16_down_lora_residual
 
         # super().__init__ setattrs every key from config_dict, which would
         # silently overwrite the attributes set above on any overlap.
@@ -99,6 +102,7 @@ class ModelConfig(PretrainedConfig):
             tied_logprob_vocab_superblock_size=self.tied_logprob_vocab_superblock_size,
             gradient_checkpointing=self.gradient_checkpointing,
             mhc_expansion_rate=self.mhc_expansion_rate,
+            qwen35_bf16_down_lora_residual=self.qwen35_bf16_down_lora_residual,
         )
 
     def get_num_experts(self):

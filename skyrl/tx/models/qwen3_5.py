@@ -7,6 +7,7 @@ from flax import nnx
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
+from skyrl.tx.kernels.rocm.bf16_lora_residual import bf16_lora_residual
 from skyrl.tx.layers.attention import dot_product_attention
 from skyrl.tx.layers.lora import FusedLoRALinear, LoRAEmbed, LoRALinear
 from skyrl.tx.layers.rotary_embedding import apply_rope
@@ -614,6 +615,7 @@ class Qwen3_5MLP(nnx.Module):
     ) -> None:
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
+        self.qwen35_bf16_down_lora_residual = bool(config.qwen35_bf16_down_lora_residual)
 
         self.gate_up_proj = FusedLoRALinear(
             hidden_size,
@@ -641,9 +643,62 @@ class Qwen3_5MLP(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
+    def _can_use_bf16_down_lora_residual(
+        self,
+        product: jax.Array,
+        residual: jax.Array | None,
+        adapter_indices: jax.Array | None,
+    ) -> bool:
+        return bool(
+            self.qwen35_bf16_down_lora_residual
+            and residual is not None
+            and adapter_indices is not None
+            and adapter_indices.shape == (1,)
+            and product.shape == (1, 64, 9216)
+            and residual.shape == (1, 64, 2560)
+            and product.dtype == jnp.bfloat16
+            and residual.dtype == jnp.bfloat16
+            and self.down_proj.kernel.shape == (9216, 2560)
+            and self.down_proj.kernel.dtype == jnp.bfloat16
+            and self.down_proj.max_lora_rank == 8
+            and self.down_proj.lora_A is not None
+            and self.down_proj.lora_B is not None
+            and self.down_proj.lora_scaling is not None
+            and self.down_proj.lora_A.dtype == jnp.bfloat16
+            and self.down_proj.lora_B.dtype == jnp.bfloat16
+            and self.down_proj.lora_scaling.dtype == jnp.bfloat16
+            and get_abstract_mesh().shape.get("tp", 1) == 1
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        adapter_indices: jax.Array | None = None,
+        *,
+        residual: jax.Array | None = None,
+    ) -> jax.Array:
         gate_out, up_out = self.gate_up_proj(x, adapter_indices=adapter_indices)
-        return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices=adapter_indices)
+        product = nnx.silu(gate_out) * up_out
+        if self._can_use_bf16_down_lora_residual(product, residual, adapter_indices):
+            assert adapter_indices is not None and residual is not None
+            lora_a, lora_b, scaling = self.down_proj._select_single_adapter_lora(
+                adapter_indices[0]
+            )
+            return bf16_lora_residual(
+                product,
+                self.down_proj.kernel[...],
+                lora_a,
+                lora_b,
+                scaling,
+                residual,
+                enabled=True,
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                row_superblock=256,
+            )
+        output = self.down_proj(product, adapter_indices=adapter_indices)
+        return output if residual is None else residual + output
 
 
 class Qwen3_5DecoderLayer(nnx.Module):
@@ -700,8 +755,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, adapter_indices=adapter_indices)
-        hidden_states = residual + hidden_states
+        hidden_states = self.mlp(hidden_states, adapter_indices=adapter_indices, residual=residual)
 
         return hidden_states, updated_kv, new_conv_state, new_recurrent_state
 

@@ -97,16 +97,23 @@ class LoRAMixin:
         twice and gathering it into and out of the ragged-dot layout, which is
         unnecessary for the common batch-size-one training and sampling path.
         """
-        assert self.lora_A is not None and self.lora_B is not None and self.lora_scaling is not None
-
-        lora_A = jax.lax.dynamic_index_in_dim(self.lora_A[...], adapter_index, axis=0, keepdims=False)
-        lora_B = jax.lax.dynamic_index_in_dim(self.lora_B[...], adapter_index, axis=0, keepdims=False)
+        lora_A, lora_B, scaling = self._select_single_adapter_lora(adapter_index)
         intermediate = self._apply_single_lora_weight(lora_A, x_flat)
         lora_output = intermediate @ lora_B
+        return base_output + lora_output.reshape(base_output.shape) * scaling
+
+    def _select_single_adapter_lora(
+        self, adapter_index: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Select one adapter once for a single-batch fused operation."""
+        assert self.lora_A is not None and self.lora_B is not None and self.lora_scaling is not None
+
+        lora_a = jax.lax.dynamic_index_in_dim(self.lora_A[...], adapter_index, axis=0, keepdims=False)
+        lora_b = jax.lax.dynamic_index_in_dim(self.lora_B[...], adapter_index, axis=0, keepdims=False)
         scaling = jax.lax.dynamic_index_in_dim(
             self.lora_scaling[...], adapter_index, axis=0, keepdims=False
         )
-        return base_output + lora_output.reshape(base_output.shape) * scaling
+        return lora_a, lora_b, scaling
 
     def apply_lora(
         self,

@@ -316,3 +316,5 @@ def test_cache_claim_is_formed_only_after_all_prewarm_release_gates() -> None:
     assert source.count('"${runtime_cache_attestation_environment[@]}"') == 1
     assert '"abstract_model_load":false' in source
     assert '"abstract_model_load":true' in source
+    assert source.count('"qwen35_bf16_down_lora_residual":true') == 2
+    assert source.count("--max-gpu-power-watts 400") == 1

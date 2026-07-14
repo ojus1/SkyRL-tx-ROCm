@@ -63,7 +63,7 @@ prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"
 prewarm_timeout_seconds="${SKYRL_QWEN35_PREWARM_TIMEOUT_SECONDS:-3600}"
 engine_t64_cache_attest="${SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST-0}"
 runtime_cache_attestation_environment=()
-backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"abstract_model_load":false}'
+backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"qwen35_bf16_down_lora_residual":true,"abstract_model_load":false}'
 
 case "$prewarm_optimizer" in
   0|1) ;;
@@ -164,7 +164,7 @@ case "$memory_mode" in
     require_unset_or_exact ROCR_VISIBLE_DEVICES 0
     require_unset_or_exact HIP_VISIBLE_DEVICES 0
     require_unset_or_exact GPU_DEVICE_ORDINAL 0
-    backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"abstract_model_load":true}'
+    backend_config='{"max_lora_adapters":2,"max_lora_rank":8,"train_micro_batch_size":1,"sample_max_num_sequences":1,"gradient_checkpointing":true,"loss_chunk_size":64,"qwen35_bf16_down_lora_residual":true,"abstract_model_load":true}'
     ;;
   *)
     echo "SKYRL_QWEN35_MEMORY_MODE must be growth or preallocate85." >&2
@@ -951,7 +951,7 @@ if [[ -n "$prewarm_buckets" ]]; then
       --timeout "$prewarm_timeout_seconds" \
       --sensor-grace-seconds 60 \
       --max-junction-temp-c 90 \
-      --max-gpu-power-watts 315 \
+      --max-gpu-power-watts 400 \
       --max-vram-gib 24 \
       --min-host-available-gib 0 \
       --max-swap-gib 8 \

@@ -15,6 +15,7 @@ from skyrl.tx.models.configs import Qwen3_5Config
 from skyrl.tx.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5GatedDeltaNet,
+    Qwen3_5MLP,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
 )
@@ -345,6 +346,109 @@ def test_gated_delta_net_preserves_checkpoint_fp32_parameters_in_bf16_model():
     assert layer.A_log[...].dtype == jnp.float32
     assert layer.norm.weight[...].dtype == jnp.float32
     assert layer.dt_bias[...].dtype == jnp.bfloat16
+
+
+def test_qwen35_bf16_down_fusion_selects_only_exact_t64_single_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeParam:
+        def __init__(self, shape, dtype):
+            self.shape = shape
+            self.dtype = dtype
+            self.value = jax.ShapeDtypeStruct(shape, dtype)
+
+        def __getitem__(self, key):
+            assert key is Ellipsis
+            return self.value
+
+    class FakeGateUp:
+        def __call__(self, x, adapter_indices=None):
+            del adapter_indices
+            shape = (*x.shape[:-1], 9216)
+            values = jnp.ones(shape, dtype=jnp.bfloat16)
+            return values, values
+
+    class FakeDown:
+        def __init__(self):
+            self.kernel = FakeParam((9216, 2560), jnp.bfloat16)
+            self.max_lora_rank = 8
+            self.lora_A = FakeParam((2, 9216, 8), jnp.bfloat16)
+            self.lora_B = FakeParam((2, 8, 2560), jnp.bfloat16)
+            self.lora_scaling = FakeParam((2,), jnp.bfloat16)
+            self.fallback_calls = 0
+
+        def _select_single_adapter_lora(self, adapter_index):
+            assert adapter_index.shape == ()
+            return (
+                jax.ShapeDtypeStruct((9216, 8), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8, 2560), jnp.bfloat16),
+                jnp.asarray(2.0, dtype=jnp.bfloat16),
+            )
+
+        def __call__(self, product, adapter_indices=None):
+            del adapter_indices
+            self.fallback_calls += 1
+            return jnp.zeros((*product.shape[:-1], 2560), dtype=product.dtype)
+
+    fused_calls = []
+
+    def fused_spy(product, weight, lora_a, lora_b, scaling, residual, **kwargs):
+        fused_calls.append(
+            (product.shape, weight.shape, lora_a.shape, lora_b.shape, scaling, kwargs)
+        )
+        return residual + jnp.ones_like(residual)
+
+    monkeypatch.setattr(qwen3_5_module, "bf16_lora_residual", fused_spy)
+    config = _tiny_qwen3_5_config(gradient_checkpointing=False)
+    with jax.set_mesh(_tiny_mesh()):
+        mlp = Qwen3_5MLP(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        mlp.qwen35_bf16_down_lora_residual = True
+        mlp.gate_up_proj = FakeGateUp()
+        fake_down = FakeDown()
+        mlp.down_proj = fake_down
+
+        x = jnp.zeros((1, 64, 2560), dtype=jnp.bfloat16)
+        residual = jnp.zeros((1, 64, 2560), dtype=jnp.bfloat16)
+        adapter_indices = jnp.asarray([0], dtype=jnp.int32)
+        actual = mlp(x, adapter_indices=adapter_indices, residual=residual)
+
+        np.testing.assert_array_equal(actual, jnp.ones_like(residual))
+        assert fake_down.fallback_calls == 0
+        assert len(fused_calls) == 1
+        assert fused_calls[0][:4] == (
+            (1, 64, 9216),
+            (9216, 2560),
+            (9216, 8),
+            (8, 2560),
+        )
+        assert fused_calls[0][-1] == {
+            "enabled": True,
+            "block_m": 16,
+            "block_n": 64,
+            "block_k": 64,
+            "row_superblock": 256,
+        }
+
+        short_x = x[:, :-1]
+        short_residual = residual[:, :-1]
+        fallback = mlp(
+            short_x,
+            adapter_indices=adapter_indices,
+            residual=short_residual,
+        )
+        np.testing.assert_array_equal(fallback, short_residual)
+        assert fake_down.fallback_calls == 1
+        assert len(fused_calls) == 1
+
+        fake_down.kernel.dtype = jnp.float32
+        mixed_parameter_fallback = mlp(
+            x,
+            adapter_indices=adapter_indices,
+            residual=residual,
+        )
+        np.testing.assert_array_equal(mixed_parameter_fallback, residual)
+        assert fake_down.fallback_calls == 2
+        assert len(fused_calls) == 1
 
 
 def test_qwen3_5_gradient_checkpointing_preserves_training_outputs_and_lora_gradients():

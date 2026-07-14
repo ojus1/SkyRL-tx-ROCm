@@ -97,6 +97,7 @@ def _api_config(model_path: str, *, abstract_model_load: bool = False) -> Engine
             "sample_max_num_sequences": 1,
             "gradient_checkpointing": True,
             "loss_chunk_size": 64,
+            "qwen35_bf16_down_lora_residual": True,
             "abstract_model_load": abstract_model_load,
         },
     )
