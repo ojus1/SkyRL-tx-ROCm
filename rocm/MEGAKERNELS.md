@@ -392,6 +392,24 @@ save the 18,432-wide gate/up tensor. Recompute gate/up one 512-2,048-token block
 at a time, immediately form `dg`/`du`, and run the frozen-base and LoRA
 backward equations.
 
+The first exact-shape BF16 prototype is now a measured no-go. Its two Pallas
+launches use `BM16/BN32/BK64`; the forward hides the normalized activation and
+raw 18,432-wide projection, but its correctness-first custom VJP recomputes the
+complete dense JAX forward before applying library-dot pullbacks. A guarded
+four-sample smoke measurement at `B1/T64` found only `0.695x` forward,
+`0.597x` forward-plus-VJP, and `0.633x` rematerialized-stage speed relative to
+the BF16 JAX boundary. The smoke rung is not a qualifying benchmark, but the
+miss is large enough that the unchanged 160-dispatch confirmation run is not
+justified. This exact implementation remains default-off and must not be wired
+into the decoder.
+
+The next candidate must remove the dense-forward recomputation from the custom
+VJP and own the projection/backward boundary. Larger Pallas N tiles are useful
+only as a bounded diagnostic after that structural fix; the production route
+remains a HIP/typed-FFI dense epilogue with an exact custom VJP. The existing
+smoke telemetry is dominated by JAX BFC preallocation and therefore establishes
+no allocator or model-capacity saving.
+
 Do not fuse the down projection into this stage. It reduces over all 9,216
 product features; recomputing gate/up for each down-output tile would multiply
 the expensive projection work. The SwiGLU product is a required global-memory
@@ -953,7 +971,9 @@ an unsafe compute dispatch acceptable. GPU experiments must remain serialized.
    only if true mixed-adapter batches become important.
 2. Complete and qualify the watchdog-bounded native-GQA Pallas custom VJP.
 3. Split-vocabulary tied linear-logprob Pallas prototype.
-4. Gate/up+SwiGLU Pallas prototype and exact custom VJP.
+4. Replace the measured-no-go gate/up+SwiGLU Pallas VJP with an exact backward
+   that does not recompute the dense forward; use larger Pallas N tiles only as
+   bounded diagnostics.
 5. Minimal typed HIP/FFI reference handler and CPU fallback.
 6. Production BF16 dense epilogues, including input RMS and exact LoRA VJPs.
 7. Production GDN preparation/state kernels.

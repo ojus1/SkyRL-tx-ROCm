@@ -760,6 +760,55 @@ with worst observed dK relative L2 `0.003628` (about 0.363%).
   format and illegal opcode. Disabling all XLA GPU command buffers is therefore
   mandatory on this machine.
 
+## BF16 RMS/gate-up/LoRA/SwiGLU smoke no-go
+
+Revision `60f43fa1ec9340bcd7924d006cbdbb40d59f78c1` completed the fully
+guarded smoke rung for the exact `B1/T64/M64/K2560/N9216/rank8` two-launch
+Pallas candidate using `BM16/BN32/BK64`. Compile-only and one-shot numerics
+evidence were bound into the run before any timed dispatch. The numerical
+comparison passed the user-authorized 3% outer gradient gate: forward relative
+L2/cosine were `0.00021385/0.99999998`, VJP output relative L2/cosine were
+`0.00015202/0.99999999`, and the `x`, LoRA-A, and LoRA-B gradients were
+bit-identical to the BF16 reference in this case.
+
+The smoke schedule completed 2 warmup and 4 measured Latin-rotation
+supercycles. All 24 program dispatches plus guarded setup and teardown had
+fresh external five-second cgroup-wide watchdogs; all 26 operations completed.
+The raw 16 timing samples produced these attested medians:
+
+| Boundary | BF16 JAX reference | Pallas candidate | Reference/candidate |
+|---|---:|---:|---:|
+| Forward | 0.59384 ms | 0.85451 ms | 0.695x |
+| Forward + VJP | 0.89514 ms | 1.49858 ms | 0.597x |
+| Rematerialized stage | 1.48897 ms | 2.35308 ms | 0.633x |
+
+This four-sample smoke rung is deliberately non-qualifying, but every measured
+boundary misses the promotion threshold by a wide margin. The unchanged
+160-dispatch benchmark was therefore not run: more repetitions cannot
+reasonably turn these approximately 30--40% throughput deficits into the required
+`1.10x` forward-plus-VJP and `1.15x` rematerialized-stage gains. The current
+custom VJP also recomputes the complete dense reference forward, so decoder
+integration and deterministic end-to-end testing would measure a structurally
+noncompetitive path. The exact candidate remains default-off and is a no-go
+for model integration.
+
+The profile completed in 40.411 s with return code zero, no signal, no safety
+violation, no kernel/driver error, and a clean current-boot postflight. Peaks
+were 62 C junction, 158 W, 20,053,643,264 B physical VRAM, and 24,576 B swap;
+the scope was collected successfully and `/dev/kfd` returned idle. Because
+fixed JAX BFC preallocation dominates the roughly 18.68 GiB VRAM reading, this
+run makes no memory-saving claim. A separate fresh-process growth-allocator
+A/B experiment is required for such a claim.
+
+Private mode-0600 evidence is in
+`/tmp/skyrl-bf16-benchmark-smoke.lMmiKTzu`. SHA-256 bindings are raw result
+`847ca8f17c98e3daae0f143ac60579c1e0b568647c739b37336e74ca62740f59`,
+progress `b1db049d37449d828d84a986729d72adeeb0890bdffc888d221ad33592745139`,
+telemetry `3eb4f1779a19db36b1adbd36c83b5fd7092924ffd2f6a4e889413992e71d2d2a`,
+profile summary `1e0fbca1b14c3594afb573c4d5a3e7bc23095b57dec619453042cecfaa542989`,
+and CPU attestation
+`3cd6e6391dcb2632e3dbcba146f6cb03cce0db0f2e24919b1d3e2c2864e56eff`.
+
 ## Validation frontier
 
 The post-fix full-model SFT validation frontier is currently context 1,024. A
