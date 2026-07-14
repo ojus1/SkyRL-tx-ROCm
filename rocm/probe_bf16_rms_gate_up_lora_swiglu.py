@@ -3,15 +3,17 @@
 The compile-only mode proves that the exact production forward and
 forward-plus-VJP programs compile without invoking either executable.
 Forward-once proves candidate liveness, while numerics-once performs exactly
-one guarded reference/candidate forward and VJP comparison.  The legacy
-multi-call execute mode remains disabled until it has per-dispatch containment.
-No mode authorizes default model enablement; that still requires a separate
-end-to-end gate.
+one guarded reference/candidate forward and VJP comparison.  Benchmark-smoke
+and benchmark run fixed, independently watched supercycles from device-resident
+inputs only after a guarded, hash-checked host/device round trip.  The legacy
+execute mode remains disabled.  No mode authorizes default model enablement;
+that still requires a separate end-to-end gate.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib
 import importlib.metadata
@@ -57,6 +59,59 @@ _STEP_RESULT_SPECS = (
     ("d_lora_a", (2560, 8)),
     ("d_lora_b", (8, 18432)),
 )
+_INPUT_SPECS = (
+    ("x", (1, 64, 2560)),
+    ("rms_delta", (2560,)),
+    ("weight", (2560, 18432)),
+    ("lora_a", (2560, 8)),
+    ("lora_b", (8, 18432)),
+    ("scale", ()),
+    ("cotangent", (1, 64, 9216)),
+)
+_BENCHMARK_WARMUP_ORDERS = (
+    (
+        "reference_forward",
+        "candidate_forward",
+        "candidate_forward_and_vjp",
+        "reference_forward_and_vjp",
+    ),
+    (
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+        "candidate_forward",
+        "reference_forward",
+    ),
+)
+_BENCHMARK_MEASUREMENT_ROTATION = (
+    (
+        "reference_forward",
+        "candidate_forward",
+        "candidate_forward_and_vjp",
+        "reference_forward_and_vjp",
+    ),
+    (
+        "candidate_forward_and_vjp",
+        "reference_forward_and_vjp",
+        "reference_forward",
+        "candidate_forward",
+    ),
+    (
+        "candidate_forward",
+        "reference_forward",
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+    ),
+    (
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+        "candidate_forward",
+        "reference_forward",
+    ),
+)
+_BENCHMARK_MODE_COUNTS = {
+    "benchmark_smoke": (2, 4),
+    "benchmark": (8, 32),
+}
 _GUARDED_SCOPE_PATTERNS = {
     "forward_once": (
         r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
@@ -65,6 +120,14 @@ _GUARDED_SCOPE_PATTERNS = {
     "numerics_once": (
         r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
         r"(skyrl-bf16-numerics-[0-9]+-[0-9a-f]+\.scope)"
+    ),
+    "benchmark_smoke": (
+        r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
+        r"(skyrl-bf16-benchmark-smoke-[0-9]+-[0-9a-f]+\.scope)"
+    ),
+    "benchmark": (
+        r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
+        r"(skyrl-bf16-benchmark-[0-9]+-[0-9a-f]+\.scope)"
     ),
 }
 _EXACT_PROFILE_LIMITS = {
@@ -141,6 +204,40 @@ def _exact_contract() -> dict[str, Any]:
             "iterations": 0,
             "performance_qualification": False,
         },
+        "benchmark_smoke": {
+            "compiled_programs": list(_PROGRAM_ORDER),
+            "warmup_supercycles": 2,
+            "measured_supercycles": 4,
+            "programs_per_supercycle": 4,
+            "total_program_invocations": 24,
+            "executable_invocations_per_program": 6,
+            "watchdog_seconds_per_operation": _FORWARD_ONCE_WATCHDOG_SECONDS,
+            "independent_dispatch_watchdogs": 24,
+            "independent_operation_watchdogs": 26,
+            "guarded_device_input_setup": True,
+            "guarded_device_input_teardown": True,
+            "requires_prior_numerics_evidence": True,
+            "requires_prior_smoke_profile_attestation": False,
+            "raw_samples_only": True,
+            "performance_qualification": False,
+        },
+        "benchmark": {
+            "compiled_programs": list(_PROGRAM_ORDER),
+            "warmup_supercycles": 8,
+            "measured_supercycles": 32,
+            "programs_per_supercycle": 4,
+            "total_program_invocations": 160,
+            "executable_invocations_per_program": 40,
+            "watchdog_seconds_per_operation": _FORWARD_ONCE_WATCHDOG_SECONDS,
+            "independent_dispatch_watchdogs": 160,
+            "independent_operation_watchdogs": 162,
+            "guarded_device_input_setup": True,
+            "guarded_device_input_teardown": True,
+            "requires_prior_numerics_evidence": True,
+            "requires_prior_smoke_profile_attestation": True,
+            "raw_samples_only": True,
+            "performance_qualification": False,
+        },
         "execute_gates": {
             "relative_l2_limit_exclusive": _RELATIVE_L2_LIMIT,
             "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
@@ -166,11 +263,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument(
         "--numerics-once", dest="mode", action="store_const", const="numerics_once"
     )
+    mode.add_argument(
+        "--benchmark-smoke",
+        dest="mode",
+        action="store_const",
+        const="benchmark_smoke",
+    )
+    mode.add_argument(
+        "--benchmark", dest="mode", action="store_const", const="benchmark"
+    )
     mode.add_argument("--execute", dest="mode", action="store_const", const="execute")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--progress-output", type=Path)
     parser.add_argument("--compile-evidence", type=Path)
     parser.add_argument("--compile-profile-summary", type=Path)
+    parser.add_argument("--numerics-evidence", type=Path)
+    parser.add_argument("--numerics-profile-summary", type=Path)
+    parser.add_argument("--smoke-evidence", type=Path)
+    parser.add_argument("--smoke-profile-summary", type=Path)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--rows", type=int, default=64)
@@ -192,7 +302,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"refusing to overwrite existing output: {args.output}")
     if not args.output.is_absolute():
         parser.error("--output must be an absolute path")
-    guarded_mode = args.mode in ("forward_once", "numerics_once")
+    guarded_mode = args.mode in _GUARDED_SCOPE_PATTERNS
+    benchmark_mode = args.mode in _BENCHMARK_MODE_COUNTS
     mode_label = args.mode.replace("_", "-")
     if guarded_mode:
         if args.progress_output is None:
@@ -218,6 +329,55 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--compile-profile-summary must be an absolute path")
         if not args.compile_profile_summary.is_file():
             parser.error("--compile-profile-summary must be an existing regular file")
+        if benchmark_mode:
+            if args.numerics_evidence is None:
+                parser.error(f"{mode_label} mode requires --numerics-evidence")
+            if not args.numerics_evidence.is_absolute():
+                parser.error("--numerics-evidence must be an absolute path")
+            if not args.numerics_evidence.is_file():
+                parser.error("--numerics-evidence must be an existing regular file")
+            if args.numerics_profile_summary is None:
+                parser.error(
+                    f"{mode_label} mode requires --numerics-profile-summary"
+                )
+            if not args.numerics_profile_summary.is_absolute():
+                parser.error("--numerics-profile-summary must be an absolute path")
+            if not args.numerics_profile_summary.is_file():
+                parser.error(
+                    "--numerics-profile-summary must be an existing regular file"
+                )
+            if args.mode == "benchmark":
+                if args.smoke_evidence is None:
+                    parser.error("benchmark mode requires --smoke-evidence")
+                if not args.smoke_evidence.is_absolute():
+                    parser.error("--smoke-evidence must be an absolute path")
+                if not args.smoke_evidence.is_file():
+                    parser.error("--smoke-evidence must be an existing regular file")
+                if args.smoke_profile_summary is None:
+                    parser.error("benchmark mode requires --smoke-profile-summary")
+                if not args.smoke_profile_summary.is_absolute():
+                    parser.error("--smoke-profile-summary must be an absolute path")
+                if not args.smoke_profile_summary.is_file():
+                    parser.error(
+                        "--smoke-profile-summary must be an existing regular file"
+                    )
+            elif (
+                args.smoke_evidence is not None
+                or args.smoke_profile_summary is not None
+            ):
+                parser.error(
+                    "smoke evidence/profile inputs are only valid with --benchmark"
+                )
+        elif (
+            args.numerics_evidence is not None
+            or args.numerics_profile_summary is not None
+            or args.smoke_evidence is not None
+            or args.smoke_profile_summary is not None
+        ):
+            parser.error(
+                "numerics/smoke evidence inputs require their exact guarded "
+                "benchmark mode"
+            )
     elif args.progress_output is not None:
         parser.error(
             "--progress-output is only valid with --forward-once or --numerics-once"
@@ -229,7 +389,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif args.compile_profile_summary is not None:
         parser.error(
             "--compile-profile-summary is only valid with --forward-once or "
-            "--numerics-once"
+            "--numerics-once, --benchmark-smoke, or --benchmark"
+        )
+    elif (
+        args.numerics_evidence is not None
+        or args.numerics_profile_summary is not None
+        or args.smoke_evidence is not None
+        or args.smoke_profile_summary is not None
+    ):
+        parser.error(
+            "numerics/smoke evidence inputs require their exact guarded benchmark mode"
         )
 
     geometry = (
@@ -286,7 +455,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.warmups < 0 or args.iterations < 0:
         parser.error("--warmups and --iterations cannot be negative")
     if guarded_mode and (args.warmups, args.iterations) != (0, 0):
-        parser.error(f"{mode_label} mode requires --warmups 0 --iterations 0")
+        if not benchmark_mode:
+            parser.error(f"{mode_label} mode requires --warmups 0 --iterations 0")
+    if benchmark_mode:
+        expected_counts = _BENCHMARK_MODE_COUNTS[args.mode]
+        if (args.warmups, args.iterations) != expected_counts:
+            parser.error(
+                f"{mode_label} mode requires exact --warmups {expected_counts[0]} "
+                f"--iterations {expected_counts[1]}"
+            )
     return args
 
 
@@ -1422,6 +1599,554 @@ def _run_numerics_once_workload(
     }
 
 
+def _benchmark_schedule(mode: str) -> tuple[dict[str, Any], ...]:
+    if mode not in _BENCHMARK_MODE_COUNTS:
+        raise ValueError(f"unsupported guarded benchmark mode: {mode}")
+    warmups, iterations = _BENCHMARK_MODE_COUNTS[mode]
+    schedule: list[dict[str, Any]] = []
+    for supercycle in range(warmups):
+        schedule.append(
+            {
+                "phase": "warmup",
+                "phase_supercycle": supercycle,
+                "global_supercycle": supercycle,
+                "order": _BENCHMARK_WARMUP_ORDERS[
+                    supercycle % len(_BENCHMARK_WARMUP_ORDERS)
+                ],
+            }
+        )
+    for supercycle in range(iterations):
+        schedule.append(
+            {
+                "phase": "measurement",
+                "phase_supercycle": supercycle,
+                "global_supercycle": warmups + supercycle,
+                "order": _BENCHMARK_MEASUREMENT_ROTATION[
+                    supercycle % len(_BENCHMARK_MEASUREMENT_ROTATION)
+                ],
+            }
+        )
+    return tuple(schedule)
+
+
+def _validate_staged_device_inputs(
+    device_arguments: Any,
+    *,
+    expected_device: Any,
+    host_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    if type(device_arguments) is not tuple or len(device_arguments) != len(
+        _INPUT_SPECS
+    ):
+        raise RuntimeError("guarded benchmark staged input tree is not exact")
+    manifests: dict[str, Any] = {}
+    for (name, expected_shape), value in zip(
+        _INPUT_SPECS, device_arguments, strict=True
+    ):
+        devices_method = getattr(value, "devices", None)
+        if not callable(devices_method):
+            raise RuntimeError(f"guarded benchmark {name} has no device placement")
+        placements = devices_method()
+        if type(placements) not in (set, frozenset) or len(placements) != 1:
+            raise RuntimeError(f"guarded benchmark {name} placement is not exact")
+        placed_device = next(iter(placements))
+        if placed_device is not expected_device and placed_device != expected_device:
+            raise RuntimeError(f"guarded benchmark {name} is on the wrong device")
+        shape = tuple(getattr(value, "shape", ()))
+        dtype = str(getattr(value, "dtype", ""))
+        if shape != expected_shape or dtype != "bfloat16":
+            raise RuntimeError(
+                f"guarded benchmark {name} staged contract is not exact: "
+                f"shape={shape}, dtype={dtype!r}"
+            )
+        manifests[name] = {
+            "shape": list(shape),
+            "dtype": dtype,
+            "element_count": host_manifest[name]["element_count"],
+            "bytes": host_manifest[name]["bytes"],
+            "host_sha256": host_manifest[name]["sha256"],
+            "exact_device": True,
+        }
+    return manifests
+
+
+def _validate_device_input_roundtrip(
+    roundtrip_arguments: Any, host_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    if type(roundtrip_arguments) is not tuple or len(roundtrip_arguments) != len(
+        _INPUT_SPECS
+    ):
+        raise RuntimeError("guarded benchmark input roundtrip tree is not exact")
+    manifests: dict[str, Any] = {}
+    for (name, expected_shape), value in zip(
+        _INPUT_SPECS, roundtrip_arguments, strict=True
+    ):
+        host = np.asarray(value)
+        if (
+            type(host) is not np.ndarray
+            or tuple(host.shape) != expected_shape
+            or str(host.dtype) != "bfloat16"
+            or not host.flags.c_contiguous
+        ):
+            raise RuntimeError(
+                f"guarded benchmark {name} roundtrip contract is not exact"
+            )
+        raw = host.tobytes(order="C")
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) != host_manifest[name]["bytes"] or digest != host_manifest[name][
+            "sha256"
+        ]:
+            raise RuntimeError(f"guarded benchmark {name} roundtrip hash changed")
+        manifests[name] = {
+            "shape": list(host.shape),
+            "dtype": "bfloat16",
+            "bytes": len(raw),
+            "sha256": digest,
+            "matches_host_input": True,
+        }
+    return manifests
+
+
+def _exact_program_result_leaves(program: str, blocked: Any) -> tuple[Any, ...]:
+    if program not in _PROGRAM_ORDER:
+        raise ValueError(f"unsupported guarded benchmark program: {program}")
+    specs = (
+        _FORWARD_RESULT_SPECS
+        if program in ("reference_forward", "candidate_forward")
+        else _STEP_RESULT_SPECS
+    )
+    if len(specs) == 1:
+        leaves = (blocked,)
+    elif type(blocked) is tuple and len(blocked) == len(specs):
+        leaves = blocked
+    else:
+        raise RuntimeError(f"guarded benchmark {program} result tree is not exact")
+    for (name, expected_shape), leaf in zip(specs, leaves, strict=True):
+        shape = tuple(getattr(leaf, "shape", ()))
+        dtype = str(getattr(leaf, "dtype", ""))
+        if shape != expected_shape or dtype != "bfloat16":
+            raise RuntimeError(
+                f"guarded benchmark {program}/{name} result is not exact: "
+                f"shape={shape}, dtype={dtype!r}"
+            )
+    return leaves
+
+
+def _delete_unique_device_leaves(leaves: tuple[Any, ...], *, label: str) -> int:
+    unique: list[Any] = []
+    seen: set[int] = set()
+    for leaf in leaves:
+        identity = id(leaf)
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(leaf)
+    for leaf in unique:
+        delete = getattr(leaf, "delete", None)
+        is_deleted = getattr(leaf, "is_deleted", None)
+        if not callable(delete) or not callable(is_deleted):
+            raise RuntimeError(f"{label} leaf does not support explicit deletion")
+        delete()
+        if is_deleted() is not True:
+            raise RuntimeError(f"{label} leaf deletion was not confirmed")
+    return len(unique)
+
+
+def _benchmark_watchdog_manifest(
+    watchdog: dict[str, Any], **fields: Any
+) -> dict[str, Any]:
+    return {
+        **fields,
+        "external_process": True,
+        "watchdog_pid": getattr(watchdog.get("process"), "pid", None),
+        "timeout_action": "cgroup.kill_then_pidfd_SIGKILL_fallback",
+        "cgroup_wide_timeout_kill": watchdog["cgroup_wide_timeout_kill"],
+        "timeout_seconds": watchdog["timeout_seconds"],
+        "armed_monotonic_ns": watchdog["armed_monotonic_ns"],
+        "deadline_monotonic_ns": watchdog["deadline_monotonic_ns"],
+        "armed_ack_received_monotonic_ns": watchdog[
+            "armed_ack_received_monotonic_ns"
+        ],
+        "operation_completed": True,
+    }
+
+
+def _run_guarded_benchmark_workload(
+    *,
+    mode: str,
+    jax: Any,
+    device: Any,
+    executables: dict[str, Any],
+    host_step_arguments: tuple[Any, ...],
+    host_forward_arguments: tuple[Any, ...],
+    progress_output: Path,
+    binding: dict[str, Any],
+    cgroup_kill_fd: int,
+) -> dict[str, Any]:
+    if mode not in _BENCHMARK_MODE_COUNTS:
+        raise ValueError(f"unsupported guarded benchmark mode: {mode}")
+    if tuple(executables) != _PROGRAM_ORDER or set(executables) != set(_PROGRAM_ORDER):
+        raise RuntimeError("guarded benchmark executable order/set is not exact")
+    warmup_supercycles, measured_supercycles = _BENCHMARK_MODE_COUNTS[mode]
+    schedule = _benchmark_schedule(mode)
+    expected_dispatches = 4 * (warmup_supercycles + measured_supercycles)
+    expected_records = 2 * expected_dispatches + 6
+    counts = dict.fromkeys(_PROGRAM_ORDER, 0)
+    completion_counts = dict(counts)
+    progress_digest = hashlib.sha256()
+    progress_byte_count = 0
+    progress_record_count = 0
+    device_setup_counts = {"attempts": 0, "completions": 0}
+    device_teardown_counts = {"attempts": 0, "completions": 0}
+    dispatch_watchdogs: list[dict[str, Any]] = []
+    raw_samples: list[dict[str, Any]] = []
+    samples_by_program: dict[str, list[float]] = {
+        program: [] for program in _PROGRAM_ORDER
+    }
+    host_inputs = _host_input_manifest(
+        host_forward_arguments, host_step_arguments
+    )
+
+    def progress_record(event: str, **fields: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "event": event,
+            "mode": mode,
+            "probe_pid": os.getpid(),
+            "wall_time_ns": time.time_ns(),
+            "monotonic_time_ns": time.monotonic_ns(),
+            "binding": binding,
+            "invocation_attempt_counts": dict(counts),
+            "invocation_completion_counts": dict(completion_counts),
+            "device_input_setup_counts": dict(device_setup_counts),
+            "device_input_teardown_counts": dict(device_teardown_counts),
+            **fields,
+        }
+
+    def write_progress(output: Any, payload: dict[str, Any]) -> None:
+        nonlocal progress_byte_count, progress_record_count
+        encoded = _durable_progress_record(output, payload)
+        progress_digest.update(encoded)
+        progress_byte_count += len(encoded)
+        progress_record_count += 1
+
+    device_step_arguments: tuple[Any, ...] | None = None
+    device_forward_arguments: tuple[Any, ...] | None = None
+    setup_manifest: dict[str, Any] | None = None
+    teardown_manifest: dict[str, Any] | None = None
+    with _open_private_progress(progress_output) as progress:
+        write_progress(
+            progress,
+            progress_record(
+                "host_inputs_ready",
+                host_inputs=host_inputs,
+                warmup_supercycles=warmup_supercycles,
+                measured_supercycles=measured_supercycles,
+                total_program_invocations=expected_dispatches,
+                watchdog_seconds_per_operation=_FORWARD_ONCE_WATCHDOG_SECONDS,
+            ),
+        )
+
+        setup_watchdog = _start_forward_once_watchdog(cgroup_kill_fd)
+        setup_completed = False
+        try:
+            _arm_forward_once_watchdog(setup_watchdog)
+            device_setup_counts["attempts"] += 1
+            write_progress(
+                progress,
+                progress_record(
+                    "device_input_setup_started",
+                    watchdog_armed_monotonic_ns=setup_watchdog[
+                        "armed_monotonic_ns"
+                    ],
+                    watchdog_deadline_monotonic_ns=setup_watchdog[
+                        "deadline_monotonic_ns"
+                    ],
+                ),
+            )
+            staged = jax.device_put(host_step_arguments, device=device)
+            device_step_arguments = _block_tree(staged)
+            if device_step_arguments is not staged:
+                del staged
+            device_manifest = _validate_staged_device_inputs(
+                device_step_arguments,
+                expected_device=device,
+                host_manifest=host_inputs,
+            )
+            roundtrip = jax.device_get(device_step_arguments)
+            roundtrip_manifest = _validate_device_input_roundtrip(
+                roundtrip, host_inputs
+            )
+            del roundtrip
+            device_forward_arguments = device_step_arguments[:-1]
+            setup_completed_ns = time.monotonic_ns()
+            if setup_completed_ns >= setup_watchdog["deadline_monotonic_ns"]:
+                raise RuntimeError(
+                    "guarded benchmark input setup completed at/after its deadline"
+                )
+            device_setup_counts["completions"] += 1
+            write_progress(
+                progress,
+                progress_record(
+                    "device_input_setup_completed",
+                    completed_monotonic_ns=setup_completed_ns,
+                    one_device_put_call=True,
+                    one_device_get_roundtrip_call=True,
+                    all_input_leaves_blocked=True,
+                    device_inputs=device_manifest,
+                    roundtrip=roundtrip_manifest,
+                ),
+            )
+            setup_completed = True
+        finally:
+            _settle_forward_once_watchdog(
+                setup_watchdog, invocation_completed=setup_completed
+            )
+        setup_manifest = _benchmark_watchdog_manifest(
+            setup_watchdog,
+            operation="device_input_setup",
+            guarded_device_put=True,
+            guarded_block=True,
+            guarded_device_get_roundtrip=True,
+        )
+
+        if device_step_arguments is None or device_forward_arguments is None:
+            raise RuntimeError("guarded benchmark device inputs are unavailable")
+        dispatch_ordinal = 0
+        for supercycle_manifest in schedule:
+            for position, program in enumerate(supercycle_manifest["order"]):
+                dispatch_ordinal += 1
+                watchdog = _start_forward_once_watchdog(cgroup_kill_fd)
+                dispatch_completed = False
+                raw_result: Any = None
+                blocked_result: Any = None
+                try:
+                    _arm_forward_once_watchdog(watchdog)
+                    counts[program] += 1
+                    write_progress(
+                        progress,
+                        progress_record(
+                            "dispatch_started",
+                            dispatch_ordinal=dispatch_ordinal,
+                            phase=supercycle_manifest["phase"],
+                            phase_supercycle=supercycle_manifest[
+                                "phase_supercycle"
+                            ],
+                            global_supercycle=supercycle_manifest[
+                                "global_supercycle"
+                            ],
+                            supercycle_position=position,
+                            program=program,
+                            watchdog_armed_monotonic_ns=watchdog[
+                                "armed_monotonic_ns"
+                            ],
+                            watchdog_deadline_monotonic_ns=watchdog[
+                                "deadline_monotonic_ns"
+                            ],
+                        ),
+                    )
+                    arguments = (
+                        device_forward_arguments
+                        if program in ("reference_forward", "candidate_forward")
+                        else device_step_arguments
+                    )
+                    invocation_started_ns = time.perf_counter_ns()
+                    raw_result = executables[program](*arguments)
+                    blocked_result = _block_tree(raw_result)
+                    invocation_completed_ns = time.perf_counter_ns()
+                    leaves = _exact_program_result_leaves(program, blocked_result)
+                    deleted_result_leaves = _delete_unique_device_leaves(
+                        leaves, label=f"guarded benchmark {program} result"
+                    )
+                    del leaves, blocked_result, raw_result
+                    blocked_result = None
+                    raw_result = None
+                    elapsed_seconds = (
+                        invocation_completed_ns - invocation_started_ns
+                    ) / 1_000_000_000
+                    if (
+                        not math.isfinite(elapsed_seconds)
+                        or elapsed_seconds <= 0
+                        or time.monotonic_ns() >= watchdog["deadline_monotonic_ns"]
+                    ):
+                        raise RuntimeError(
+                            f"guarded benchmark {program} timing/deadline is invalid"
+                        )
+                    completion_counts[program] += 1
+                    sample = {
+                        "dispatch_ordinal": dispatch_ordinal,
+                        "phase": supercycle_manifest["phase"],
+                        "phase_supercycle": supercycle_manifest[
+                            "phase_supercycle"
+                        ],
+                        "global_supercycle": supercycle_manifest[
+                            "global_supercycle"
+                        ],
+                        "supercycle_position": position,
+                        "program": program,
+                        "elapsed_seconds": elapsed_seconds,
+                    }
+                    if supercycle_manifest["phase"] == "measurement":
+                        raw_samples.append(sample)
+                        samples_by_program[program].append(elapsed_seconds)
+                    write_progress(
+                        progress,
+                        progress_record(
+                            "dispatch_completed",
+                            **sample,
+                            result_leaves_blocked_before_timer_stop=True,
+                            result_leaves_explicitly_deleted=deleted_result_leaves,
+                            result_references_released_before_completion=True,
+                        ),
+                    )
+                    dispatch_completed = True
+                finally:
+                    if blocked_result is not None or raw_result is not None:
+                        # Any exception before exact deletion must fail closed.
+                        blocked_result = None
+                        raw_result = None
+                    _settle_forward_once_watchdog(
+                        watchdog, invocation_completed=dispatch_completed
+                    )
+                dispatch_watchdogs.append(
+                    _benchmark_watchdog_manifest(
+                        watchdog,
+                        operation="program_dispatch",
+                        dispatch_ordinal=dispatch_ordinal,
+                        phase=supercycle_manifest["phase"],
+                        phase_supercycle=supercycle_manifest[
+                            "phase_supercycle"
+                        ],
+                        supercycle_position=position,
+                        program=program,
+                    )
+                )
+
+        write_progress(
+            progress,
+            progress_record(
+                "benchmark_samples_completed",
+                raw_measurement_sample_count=len(raw_samples),
+                raw_samples=raw_samples,
+                performance_qualification=False,
+            ),
+        )
+
+        teardown_watchdog = _start_forward_once_watchdog(cgroup_kill_fd)
+        teardown_completed = False
+        try:
+            _arm_forward_once_watchdog(teardown_watchdog)
+            device_teardown_counts["attempts"] += 1
+            write_progress(
+                progress,
+                progress_record(
+                    "device_input_teardown_started",
+                    watchdog_armed_monotonic_ns=teardown_watchdog[
+                        "armed_monotonic_ns"
+                    ],
+                    watchdog_deadline_monotonic_ns=teardown_watchdog[
+                        "deadline_monotonic_ns"
+                    ],
+                ),
+            )
+            ready_device_inputs = _block_tree(device_step_arguments)
+            effects_barrier = getattr(jax, "effects_barrier", None)
+            if not callable(effects_barrier):
+                raise RuntimeError(
+                    "guarded benchmark JAX runtime has no public effects barrier"
+                )
+            effects_barrier()
+            deleted_input_leaves = _delete_unique_device_leaves(
+                ready_device_inputs,
+                label="guarded benchmark staged input",
+            )
+            del ready_device_inputs
+            device_forward_arguments = None
+            device_step_arguments = None
+            executables.clear()
+            jax.clear_caches()
+            gc.collect()
+            teardown_completed_ns = time.monotonic_ns()
+            if teardown_completed_ns >= teardown_watchdog["deadline_monotonic_ns"]:
+                raise RuntimeError(
+                    "guarded benchmark teardown completed at/after its deadline"
+                )
+            device_teardown_counts["completions"] += 1
+            write_progress(
+                progress,
+                progress_record(
+                    "device_input_teardown_completed",
+                    completed_monotonic_ns=teardown_completed_ns,
+                    explicitly_deleted_unique_input_leaves=deleted_input_leaves,
+                    executable_references_cleared=True,
+                    jax_caches_cleared=True,
+                    garbage_collection_completed=True,
+                    all_device_inputs_ready_before_delete=True,
+                    all_dispatch_results_blocked=True,
+                    effects_barrier_completed=True,
+                ),
+            )
+            teardown_completed = True
+        finally:
+            _settle_forward_once_watchdog(
+                teardown_watchdog, invocation_completed=teardown_completed
+            )
+        teardown_manifest = _benchmark_watchdog_manifest(
+            teardown_watchdog,
+            operation="device_input_teardown",
+            device_inputs_explicitly_deleted=True,
+            executable_references_cleared=True,
+            jax_caches_cleared=True,
+            all_device_inputs_ready_before_delete=True,
+            all_dispatch_results_blocked=True,
+            effects_barrier_completed=True,
+        )
+
+        progress_info = os.fstat(progress.fileno())
+        expected_per_program = warmup_supercycles + measured_supercycles
+        exact_counts = dict.fromkeys(_PROGRAM_ORDER, expected_per_program)
+        if (
+            not stat.S_ISREG(progress_info.st_mode)
+            or stat.S_IMODE(progress_info.st_mode) != 0o600
+            or progress_info.st_uid != os.getuid()
+            or progress_info.st_size != progress_byte_count
+            or progress_record_count != expected_records
+            or counts != exact_counts
+            or completion_counts != exact_counts
+            or dispatch_ordinal != expected_dispatches
+            or device_setup_counts != {"attempts": 1, "completions": 1}
+            or device_teardown_counts != {"attempts": 1, "completions": 1}
+        ):
+            raise RuntimeError("guarded benchmark terminal evidence is not exact")
+    _fsync_private_parent(progress_output)
+    return {
+        "invocation_counts": counts,
+        "invocation_completion_counts": completion_counts,
+        "compile_only_zero_candidate_reference_executable_invocations": False,
+        "warmup_orders": [list(item["order"]) for item in schedule[:warmup_supercycles]],
+        "measurement_orders": [
+            list(item["order"]) for item in schedule[warmup_supercycles:]
+        ],
+        "raw_samples": raw_samples,
+        "raw_samples_by_program": samples_by_program,
+        "host_inputs": host_inputs,
+        "device_setup_counts": device_setup_counts,
+        "device_teardown_counts": device_teardown_counts,
+        "progress": {
+            "path": str(progress_output),
+            "protocol": "durable_fsync_jsonl_v1",
+            "record_count": progress_record_count,
+            "bytes": progress_byte_count,
+            "sha256": progress_digest.hexdigest(),
+            "mode": "0600",
+            "directory_fsynced": True,
+        },
+        "setup_watchdog": setup_manifest,
+        "dispatch_watchdogs": dispatch_watchdogs,
+        "teardown_watchdog": teardown_manifest,
+        "performance_qualification": False,
+    }
+
+
 def _package_versions() -> dict[str, str | None]:
     names = (
         "jax",
@@ -1736,11 +2461,306 @@ def _validate_compile_evidence(
     }
 
 
+def _validate_numerics_evidence(
+    path: Path,
+    *,
+    expected_contract: dict[str, Any],
+    expected_geometry: dict[str, Any],
+    expected_source: dict[str, Any],
+    expected_git: dict[str, Any],
+    expected_device: dict[str, Any],
+    expected_packages: dict[str, Any],
+    expected_compile_evidence: dict[str, Any],
+    expected_compile_profile_summary: dict[str, Any],
+) -> dict[str, Any]:
+    evidence, file_manifest = _read_strict_private_json(path)
+    if not isinstance(evidence, dict):
+        raise RuntimeError("numerics evidence root is not an object")
+    if (
+        type(evidence.get("schema_version")) is not int
+        or evidence["schema_version"] != 1
+        or evidence.get("mode") != "numerics_once"
+        or evidence.get("passed") is not True
+    ):
+        raise RuntimeError("numerics evidence is not an exact passing result")
+    for name, actual, expected in (
+        ("contract", evidence.get("contract"), expected_contract),
+        ("geometry", evidence.get("geometry"), expected_geometry),
+        ("device", evidence.get("device"), expected_device),
+    ):
+        if not _json_exact(actual, expected):
+            raise RuntimeError(f"numerics evidence {name} is not exact")
+
+    source = evidence.get("source")
+    if not isinstance(source, dict):
+        raise RuntimeError("numerics evidence source manifest is missing")
+    for name, expected in expected_source.items():
+        if not _json_exact(source.get(name), expected):
+            raise RuntimeError(f"numerics evidence {name} source does not match")
+    if (
+        not _json_exact(source.get("git"), expected_git)
+        or expected_git.get("clean") is not True
+        or not _json_exact(source.get("packages"), expected_packages)
+    ):
+        raise RuntimeError("numerics evidence is not bound to this clean runtime")
+
+    expected_one = dict.fromkeys(_PROGRAM_ORDER, 1)
+    compilation = evidence.get("compilation")
+    invocation = evidence.get("invocation_contract")
+    if (
+        not isinstance(compilation, dict)
+        or tuple(compilation) != _PROGRAM_ORDER
+        or any(
+            not isinstance(manifest, dict)
+            or type(manifest.get("lower_calls")) is not int
+            or manifest["lower_calls"] != 1
+            or type(manifest.get("compile_calls")) is not int
+            or manifest["compile_calls"] != 1
+            for manifest in compilation.values()
+        )
+        or not isinstance(invocation, dict)
+        or not _json_exact(
+            invocation.get("per_program_executable_invocations"), expected_one
+        )
+        or not _json_exact(
+            invocation.get("per_program_executable_completions"), expected_one
+        )
+        or type(invocation.get("total_executable_invocations")) is not int
+        or invocation["total_executable_invocations"] != 4
+        or type(invocation.get("reference_executable_invocations")) is not int
+        or invocation["reference_executable_invocations"] != 2
+        or type(invocation.get("candidate_executable_invocations")) is not int
+        or invocation["candidate_executable_invocations"] != 2
+    ):
+        raise RuntimeError("numerics evidence compile/invocation counts are not exact")
+
+    numerics = evidence.get("numerics")
+    errors = numerics.get("errors") if isinstance(numerics, dict) else None
+    if (
+        not isinstance(numerics, dict)
+        or numerics.get("executed") is not True
+        or numerics.get("reference_compared") is not True
+        or numerics.get("passed") is not True
+        or not isinstance(errors, dict)
+        or set(errors) != {
+            "forward_output",
+            "output",
+            "dx",
+            "d_lora_a",
+            "d_lora_b",
+        }
+    ):
+        raise RuntimeError("numerics evidence comparison is not exact")
+    for manifest in errors.values():
+        if not isinstance(manifest, dict):
+            raise RuntimeError("numerics evidence error manifest is malformed")
+        metric_values: dict[str, float] = {}
+        for name in ("relative_l2", "cosine_similarity", "max_absolute"):
+            value = manifest.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise RuntimeError("numerics evidence error metric is not finite")
+            metric_values[name] = float(value)
+        if (
+            metric_values["relative_l2"] < 0
+            or metric_values["max_absolute"] < 0
+            or not -1 <= metric_values["cosine_similarity"] <= 1
+        ):
+            raise RuntimeError("numerics evidence error metric is outside its domain")
+        if manifest.get("finite") is not True:
+            raise RuntimeError("numerics evidence contains nonfinite results")
+    if not _numerics_gate_passed(errors):
+        raise RuntimeError("numerics evidence misses the exact numerical gate")
+
+    gated = evidence.get("numerics_once")
+    if (
+        not isinstance(gated, dict)
+        or not _json_exact(
+            gated.get("compile_evidence"), expected_compile_evidence
+        )
+        or not _json_exact(
+            gated.get("compile_profile_summary"),
+            expected_compile_profile_summary,
+        )
+        or gated.get("host_inputs_unchanged") is not True
+        or not _json_exact(gated.get("invocation_attempt_counts"), expected_one)
+        or not _json_exact(gated.get("invocation_completion_counts"), expected_one)
+    ):
+        raise RuntimeError("numerics evidence prior-gate binding is not exact")
+    progress = gated.get("progress")
+    if (
+        not isinstance(progress, dict)
+        or type(progress.get("record_count")) is not int
+        or progress["record_count"] != 10
+        or progress.get("protocol") != "durable_fsync_jsonl_v1"
+        or progress.get("mode") != "0600"
+        or progress.get("directory_fsynced") is not True
+        or not isinstance(progress.get("path"), str)
+    ):
+        raise RuntimeError("numerics evidence progress manifest is not exact")
+    progress_path = Path(progress["path"])
+    if not progress_path.is_absolute():
+        raise RuntimeError("numerics evidence progress path is not absolute")
+    progress_raw, progress_file = _read_strict_private_bytes(
+        progress_path, maximum_bytes=16 << 20
+    )
+    if (
+        not progress_raw.endswith(b"\n")
+        or progress.get("bytes") != len(progress_raw)
+        or progress.get("sha256") != hashlib.sha256(progress_raw).hexdigest()
+        or progress_file["mtime_ns"] >= file_manifest["mtime_ns"]
+    ):
+        raise RuntimeError("numerics evidence progress bytes/order are not exact")
+    try:
+        progress_records = [
+            _strict_json_loads(line) for line in progress_raw.splitlines()
+        ]
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("numerics evidence progress is not strict JSONL") from error
+    expected_events = ["host_inputs_ready"]
+    for _program in _PROGRAM_ORDER:
+        expected_events.extend(("dispatch_started", "dispatch_completed"))
+    expected_events.append("numerics_completed")
+    if (
+        len(progress_records) != 10
+        or any(not isinstance(record, dict) for record in progress_records)
+        or [record.get("event") for record in progress_records] != expected_events
+        or any(record.get("mode") != "numerics_once" for record in progress_records)
+    ):
+        raise RuntimeError("numerics evidence progress protocol is not exact")
+    dispatch_records = progress_records[1:-1]
+    if [record.get("program") for record in dispatch_records] != [
+        program for program in _PROGRAM_ORDER for _ in range(2)
+    ]:
+        raise RuntimeError("numerics evidence dispatch order is not exact")
+    if (
+        not _json_exact(
+            progress_records[-1].get("invocation_attempt_counts"), expected_one
+        )
+        or not _json_exact(
+            progress_records[-1].get("invocation_completion_counts"), expected_one
+        )
+        or progress_records[-1].get("passed") is not True
+        or not _json_exact(progress_records[-1].get("errors"), errors)
+    ):
+        raise RuntimeError("numerics evidence terminal progress is not exact")
+
+    watchdogs = gated.get("watchdogs")
+    if (
+        not isinstance(watchdogs, list)
+        or len(watchdogs) != 4
+        or any(
+            not isinstance(watchdog, dict)
+            or watchdog.get("program") != program
+            or type(watchdog.get("dispatch_ordinal")) is not int
+            or watchdog["dispatch_ordinal"] != ordinal
+            or watchdog.get("external_process") is not True
+            or type(watchdog.get("watchdog_pid")) is not int
+            or watchdog["watchdog_pid"] <= 0
+            or watchdog.get("cgroup_wide_timeout_kill") is not True
+            or watchdog.get("dispatch_completed") is not True
+            for ordinal, (program, watchdog) in enumerate(
+                zip(_PROGRAM_ORDER, watchdogs, strict=True), start=1
+            )
+        )
+    ):
+        raise RuntimeError("numerics evidence watchdogs are not exact")
+
+    preflight = evidence.get("preflight")
+    environment = preflight.get("environment") if isinstance(preflight, dict) else None
+    hardware = preflight.get("hardware") if isinstance(preflight, dict) else None
+    profiler_parent = (
+        preflight.get("profiler_parent") if isinstance(preflight, dict) else None
+    )
+    scope = preflight.get("numerics_once_scope") if isinstance(preflight, dict) else None
+    if (
+        not isinstance(environment, dict)
+        or environment.get("XLA_FLAGS_effective") != _DISABLE_COMMAND_BUFFERS
+        or environment.get("command_buffers_enabled") is not False
+        or environment.get("graph_capture_enabled") is not False
+        or not isinstance(hardware, dict)
+        or hardware.get("amdgpu_boot_clean") is not True
+        or hardware.get("kfd_unowned") is not True
+        or hardware.get("connected_amd_connectors") != []
+        or not isinstance(scope, dict)
+        or scope.get("validated") is not True
+        or not re.fullmatch(
+            r"skyrl-bf16-numerics-[0-9]+-[0-9a-f]+\.scope",
+            str(scope.get("scope_unit", "")),
+        )
+    ):
+        raise RuntimeError("numerics evidence guarded preflight is not exact")
+    if not _json_exact(
+        evidence.get("postflight"),
+        {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
+    ):
+        raise RuntimeError("numerics evidence AMDGPU postflight is not clean")
+    if (
+        not isinstance(profiler_parent, dict)
+        or profiler_parent.get("validated") is not True
+        or not _json_exact(profiler_parent.get("limits"), _EXACT_PROFILE_LIMITS)
+        or profiler_parent.get("profiler_path")
+        != expected_source["profiler"]["path"]
+        or profiler_parent.get("profiler_sha256")
+        != expected_source["profiler"]["sha256"]
+        or profiler_parent.get("parent_command_python")
+        != str(Path(sys.executable).absolute())
+    ):
+        raise RuntimeError("numerics evidence profiler binding is not exact")
+    profile_seconds: dict[str, float] = {}
+    for name in (
+        "timeout_seconds",
+        "interval_seconds",
+        "baseline_seconds",
+        "sensor_grace_seconds",
+    ):
+        value = profiler_parent.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise RuntimeError("numerics evidence profiler timing is not exact")
+        profile_seconds[name] = float(value)
+    if not (
+        0 < profile_seconds["timeout_seconds"] <= 1800
+        and 0 < profile_seconds["interval_seconds"] <= 0.25
+        and profile_seconds["baseline_seconds"] >= 2
+        and 0 <= profile_seconds["sensor_grace_seconds"] <= 60
+    ):
+        raise RuntimeError(
+            "numerics evidence profiler timing is outside exact bounds"
+        )
+    return {
+        **file_manifest,
+        "commit": expected_git["commit"],
+        "program_order": list(_PROGRAM_ORDER),
+        "one_attempt_and_completion_per_program": True,
+        "numerics_passed": True,
+        "errors": errors,
+        "progress": progress_file,
+        "progress_record_count": 10,
+        "progress_path": str(progress_path),
+        "clean_preflight_and_postflight": True,
+        "profile_binding": {
+            "python_command": profiler_parent["parent_command_python"],
+            "profiler_path": expected_source["profiler"]["path"],
+            "profiler_sha256": expected_source["profiler"]["sha256"],
+            "probe_path": expected_source["probe"]["path"],
+            **profile_seconds,
+        },
+    }
+
+
 def _validate_compile_profile_summary(
     path: Path,
     *,
     evidence_path: Path,
     evidence_manifest: dict[str, Any],
+    expected_child_command: list[str] | None = None,
 ) -> dict[str, Any]:
     if (
         path.parent != evidence_path.parent
@@ -1802,24 +2822,26 @@ def _validate_compile_profile_summary(
         raise RuntimeError("compile profile records a safety violation")
     if summary.get("kernel_driver_errors") not in (None, []):
         raise RuntimeError("compile profile records kernel driver errors")
-    expected_command = [
-        profile_binding["python_command"],
-        profile_binding["probe_path"],
-        "--allow-gpu",
-        "--compile-only",
-        "--output",
-        str(evidence_path),
-        "--block-m",
-        "16",
-        "--block-n",
-        "32",
-        "--block-k",
-        "64",
-        "--warmups",
-        "0",
-        "--iterations",
-        "0",
-    ]
+    expected_command = expected_child_command
+    if expected_command is None:
+        expected_command = [
+            profile_binding["python_command"],
+            profile_binding["probe_path"],
+            "--allow-gpu",
+            "--compile-only",
+            "--output",
+            str(evidence_path),
+            "--block-m",
+            "16",
+            "--block-n",
+            "32",
+            "--block-k",
+            "64",
+            "--warmups",
+            "0",
+            "--iterations",
+            "0",
+        ]
     expected_safety_limits = {
         "max_junction_temp_c": _EXACT_PROFILE_LIMITS["--max-junction-temp-c"],
         "max_gpu_power_watts": _EXACT_PROFILE_LIMITS["--max-gpu-power-watts"],
@@ -1910,6 +2932,50 @@ def _validate_compile_profile_summary(
     }
 
 
+def _validate_numerics_profile_summary(
+    path: Path,
+    *,
+    evidence_path: Path,
+    evidence_manifest: dict[str, Any],
+    compile_evidence_path: Path,
+    compile_profile_summary_path: Path,
+) -> dict[str, Any]:
+    profile_binding = evidence_manifest.get("profile_binding")
+    progress_path = evidence_manifest.get("progress_path")
+    if not isinstance(profile_binding, dict) or not isinstance(progress_path, str):
+        raise RuntimeError("numerics evidence profile/progress binding is missing")
+    expected_command = [
+        profile_binding["python_command"],
+        profile_binding["probe_path"],
+        "--allow-gpu",
+        "--numerics-once",
+        "--output",
+        str(evidence_path),
+        "--progress-output",
+        progress_path,
+        "--compile-evidence",
+        str(compile_evidence_path),
+        "--compile-profile-summary",
+        str(compile_profile_summary_path),
+        "--block-m",
+        "16",
+        "--block-n",
+        "32",
+        "--block-k",
+        "64",
+        "--warmups",
+        "0",
+        "--iterations",
+        "0",
+    ]
+    return _validate_compile_profile_summary(
+        path,
+        evidence_path=evidence_path,
+        evidence_manifest=evidence_manifest,
+        expected_child_command=expected_command,
+    )
+
+
 def _compile_callable(
     jax: Any, callable_: Any, arguments: tuple[Any, ...]
 ) -> tuple[Any, float, float]:
@@ -1934,7 +3000,7 @@ def _compilation_plan(
 ) -> dict[str, tuple[Any, tuple[Any, ...]]]:
     if mode == "forward_once":
         return {"candidate_forward": (candidate_forward, forward_arguments)}
-    if mode == "numerics_once":
+    if mode == "numerics_once" or mode in _BENCHMARK_MODE_COUNTS:
         return {
             "reference_forward": (reference_forward, forward_arguments),
             "candidate_forward": (candidate_forward, forward_arguments),
@@ -2036,6 +3102,7 @@ def _run(
     preflight: dict[str, Any],
     *,
     guarded_cgroup_kill_fd: int | None = None,
+    smoke_attestation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     probe_path = Path(__file__).resolve(strict=True)
     repo = probe_path.parent.parent
@@ -2128,8 +3195,16 @@ def _run(
     }
     compile_evidence: dict[str, Any] | None = None
     compile_profile_summary: dict[str, Any] | None = None
-    guarded_mode = args.mode in ("forward_once", "numerics_once")
+    numerics_evidence: dict[str, Any] | None = None
+    numerics_profile_summary: dict[str, Any] | None = None
+    guarded_mode = args.mode in _GUARDED_SCOPE_PATTERNS
+    benchmark_mode = args.mode in _BENCHMARK_MODE_COUNTS
     mode_label = args.mode.replace("_", "-")
+    if args.mode == "benchmark":
+        if not isinstance(smoke_attestation, dict):
+            raise RuntimeError("benchmark mode requires a verified smoke attestation")
+    elif smoke_attestation is not None:
+        raise RuntimeError("smoke attestation is only valid with benchmark mode")
     if guarded_mode:
         if git_preflight.get("clean") is not True:
             raise RuntimeError(
@@ -2153,6 +3228,31 @@ def _run(
             evidence_path=args.compile_evidence,
             evidence_manifest=compile_evidence,
         )
+        if benchmark_mode:
+            if args.numerics_evidence is None:
+                raise RuntimeError(f"{mode_label} numerics evidence is missing")
+            if args.numerics_profile_summary is None:
+                raise RuntimeError(
+                    f"{mode_label} numerics profile summary is missing"
+                )
+            numerics_evidence = _validate_numerics_evidence(
+                args.numerics_evidence,
+                expected_contract=_exact_contract(),
+                expected_geometry=geometry_manifest,
+                expected_source=source_preflight,
+                expected_git=git_preflight,
+                expected_device=device_manifest,
+                expected_packages=packages_preflight,
+                expected_compile_evidence=compile_evidence,
+                expected_compile_profile_summary=compile_profile_summary,
+            )
+            numerics_profile_summary = _validate_numerics_profile_summary(
+                args.numerics_profile_summary,
+                evidence_path=args.numerics_evidence,
+                evidence_manifest=numerics_evidence,
+                compile_evidence_path=args.compile_evidence,
+                compile_profile_summary_path=args.compile_profile_summary,
+            )
 
     def reference_forward(x, rms_delta, weight, a, b, scale):
         x_f32 = x.astype(jnp.float32)
@@ -2248,7 +3348,7 @@ def _run(
             host_bf16((args.rank, args.physical_features), 0.01),
             lora_scale,
         )
-        if args.mode == "numerics_once":
+        if args.mode == "numerics_once" or benchmark_mode:
             concrete_arguments = (
                 *concrete_forward_arguments,
                 host_bf16(
@@ -2263,6 +3363,10 @@ def _run(
         concrete_forward_arguments is None or concrete_arguments is None
     ):
         raise RuntimeError("numerics-once mode requires concrete host arguments")
+    if benchmark_mode and (
+        concrete_forward_arguments is None or concrete_arguments is None
+    ):
+        raise RuntimeError(f"{mode_label} mode requires concrete host arguments")
     if guarded_mode:
         compile_arguments = signature_arguments
         compile_forward_arguments = signature_arguments[:-1]
@@ -2299,6 +3403,7 @@ def _run(
             "lower_seconds": lower_seconds,
             "compile_seconds": compile_seconds,
         }
+    del executable
 
     guarded_binding = {
         "contract": _exact_contract(),
@@ -2308,7 +3413,11 @@ def _run(
         "git": git_preflight,
         "compile_evidence": compile_evidence,
         "compile_profile_summary": compile_profile_summary,
+        "numerics_evidence": numerics_evidence,
+        "numerics_profile_summary": numerics_profile_summary,
     }
+    if smoke_attestation is not None:
+        guarded_binding["smoke_attestation"] = smoke_attestation
 
     if args.mode == "forward_once":
         if (
@@ -2336,6 +3445,25 @@ def _run(
             executables=executables,
             step_arguments=concrete_arguments,
             forward_arguments=concrete_forward_arguments,
+            progress_output=args.progress_output,
+            binding=guarded_binding,
+            cgroup_kill_fd=guarded_cgroup_kill_fd,
+        )
+    elif benchmark_mode:
+        if (
+            args.progress_output is None
+            or concrete_forward_arguments is None
+            or concrete_arguments is None
+            or guarded_cgroup_kill_fd is None
+        ):
+            raise RuntimeError(f"{mode_label} mode is missing required arguments")
+        workload = _run_guarded_benchmark_workload(
+            mode=args.mode,
+            jax=jax,
+            device=devices[0],
+            executables=executables,
+            host_step_arguments=concrete_arguments,
+            host_forward_arguments=concrete_forward_arguments,
             progress_output=args.progress_output,
             binding=guarded_binding,
             cgroup_kill_fd=guarded_cgroup_kill_fd,
@@ -2502,6 +3630,92 @@ def _run(
             and compile_profile_summary is not None
             and preflight.get("numerics_once_scope", {}).get("validated") is True
         )
+    elif benchmark_mode:
+        warmup_supercycles, measured_supercycles = _BENCHMARK_MODE_COUNTS[args.mode]
+        total_supercycles = warmup_supercycles + measured_supercycles
+        expected_dispatches = 4 * total_supercycles
+        expected_per_program = total_supercycles
+        expected_counts = dict.fromkeys(_PROGRAM_ORDER, expected_per_program)
+        expected_progress_records = 2 * expected_dispatches + 6
+        expected_measurement_samples = 4 * measured_supercycles
+        numerics = {
+            "executed": False,
+            "passed": True,
+            "prior_numerics_evidence_verified": True,
+            "prior_numerics_evidence": numerics_evidence,
+            "prior_numerics_profile_summary": numerics_profile_summary,
+        }
+        determinism = {
+            "executed": False,
+            "passed": None,
+            "reason": f"{mode_label} is a fixed timing/containment rung",
+        }
+        measurement = {
+            "executed": True,
+            "performance_measured": True,
+            "performance_qualification": False,
+            "raw_samples_only": True,
+            "warmup_supercycles": warmup_supercycles,
+            "measured_supercycles": measured_supercycles,
+            "warmup_orders": workload["warmup_orders"],
+            "measurement_orders": workload["measurement_orders"],
+            "raw_samples": workload["raw_samples"],
+            "raw_samples_by_program": workload["raw_samples_by_program"],
+        }
+        performance_gate = {
+            "executed": False,
+            "passed": None,
+            "reason": (
+                f"{mode_label} records raw samples but does not authorize "
+                "performance promotion"
+            ),
+        }
+        watchdogs = [
+            workload["setup_watchdog"],
+            *workload["dispatch_watchdogs"],
+            workload["teardown_watchdog"],
+        ]
+        passed = bool(
+            tuple(compilation) == _PROGRAM_ORDER
+            and not executables
+            and all(
+                manifest["lower_calls"] == 1 and manifest["compile_calls"] == 1
+                for manifest in compilation.values()
+            )
+            and workload["invocation_counts"] == expected_counts
+            and workload["invocation_completion_counts"] == expected_counts
+            and workload["progress"]["record_count"] == expected_progress_records
+            and len(workload["raw_samples"]) == expected_measurement_samples
+            and all(
+                len(workload["raw_samples_by_program"][program])
+                == measured_supercycles
+                for program in _PROGRAM_ORDER
+            )
+            and all(
+                math.isfinite(sample["elapsed_seconds"])
+                and sample["elapsed_seconds"] > 0
+                for sample in workload["raw_samples"]
+            )
+            and workload["device_setup_counts"]
+            == {"attempts": 1, "completions": 1}
+            and workload["device_teardown_counts"]
+            == {"attempts": 1, "completions": 1}
+            and len(watchdogs) == expected_dispatches + 2
+            and all(
+                watchdog["external_process"] is True
+                and type(watchdog["watchdog_pid"]) is int
+                and watchdog["watchdog_pid"] > 0
+                and watchdog["cgroup_wide_timeout_kill"] is True
+                and watchdog["operation_completed"] is True
+                for watchdog in watchdogs
+            )
+            and compile_evidence is not None
+            and compile_profile_summary is not None
+            and numerics_evidence is not None
+            and numerics_evidence.get("numerics_passed") is True
+            and numerics_profile_summary is not None
+            and preflight.get(f"{args.mode}_scope", {}).get("validated") is True
+        )
     else:
         errors = _error_manifest(workload["actual"], workload["expected"])
         numerics_passed = _numerics_gate_passed(errors)
@@ -2585,13 +3799,14 @@ def _run(
         invocation_counts["candidate_forward"]
         + invocation_counts["candidate_forward_and_vjp"]
     )
+    probe_completed = bool(passed)
     payload = {
         "schema_version": 1,
         "mode": args.mode,
         "qualification_scope": "isolated_stage_only",
         "authorizes_default_model_enablement": False,
         "recommend_for_opt_in_model_integration": recommendation,
-        "passed": bool(passed),
+        "passed": False if benchmark_mode else probe_completed,
         "contract": _exact_contract(),
         "preflight": preflight,
         "device": device_manifest,
@@ -2643,6 +3858,31 @@ def _run(
             "invocation_completion_counts": workload["invocation_completion_counts"],
             "source_and_git_unchanged_across_dispatch": True,
         }
+    elif benchmark_mode:
+        payload["probe_completed"] = probe_completed
+        payload["profile_attested"] = False
+        payload[args.mode] = {
+            "compile_evidence": compile_evidence,
+            "compile_profile_summary": compile_profile_summary,
+            "numerics_evidence": numerics_evidence,
+            "numerics_profile_summary": numerics_profile_summary,
+            "progress": workload["progress"],
+            "host_inputs": workload["host_inputs"],
+            "device_setup_counts": workload["device_setup_counts"],
+            "device_teardown_counts": workload["device_teardown_counts"],
+            "setup_watchdog": workload["setup_watchdog"],
+            "dispatch_watchdogs": workload["dispatch_watchdogs"],
+            "teardown_watchdog": workload["teardown_watchdog"],
+            "invocation_attempt_counts": workload["invocation_counts"],
+            "invocation_completion_counts": workload[
+                "invocation_completion_counts"
+            ],
+            "raw_samples_only": True,
+            "performance_qualification": False,
+            "source_and_git_unchanged_across_dispatch": True,
+        }
+        if smoke_attestation is not None:
+            payload[args.mode]["smoke_attestation"] = smoke_attestation
     return payload
 
 
@@ -2674,6 +3914,30 @@ def main(argv: list[str] | None = None) -> int:
     if Path(sys.executable).absolute() != expected_executable:
         raise RuntimeError(
             f"exact benchmark requires {expected_executable}, got {sys.executable}"
+        )
+    smoke_attestation: dict[str, Any] | None = None
+    if args.mode == "benchmark":
+        if args.smoke_evidence is None or args.smoke_profile_summary is None:
+            raise RuntimeError("benchmark mode is missing smoke evidence inputs")
+        try:
+            attestor = importlib.import_module(
+                "rocm.attest_bf16_rms_gate_up_lora_swiglu_benchmark"
+            )
+        except ModuleNotFoundError as error:
+            if error.name not in {
+                "rocm",
+                "rocm.attest_bf16_rms_gate_up_lora_swiglu_benchmark",
+            }:
+                raise
+            attestor = importlib.import_module(
+                "attest_bf16_rms_gate_up_lora_swiglu_benchmark"
+            )
+        smoke_attestation = attestor.validate_and_attest_benchmark(
+            args.smoke_evidence,
+            args.smoke_profile_summary,
+            output_path=None,
+            expected_mode="benchmark_smoke",
+            write_output=False,
         )
     output_descriptor: int | None = _open_private_file_descriptor(
         args.output, append=False
@@ -2721,6 +3985,7 @@ def main(argv: list[str] | None = None) -> int:
                         args,
                         preflight,
                         guarded_cgroup_kill_fd=guarded_cgroup_kill_fd,
+                        smoke_attestation=smoke_attestation,
                     )
                 finally:
                     postflight = safety_module.require_clean_amdgpu_boot()
@@ -2735,7 +4000,12 @@ def main(argv: list[str] | None = None) -> int:
         if output_descriptor is not None:
             os.close(output_descriptor)
     print(json.dumps(payload, allow_nan=False, sort_keys=True))
-    return 0 if payload["passed"] else 1
+    completed = (
+        payload.get("probe_completed") is True
+        if args.mode in _BENCHMARK_MODE_COUNTS
+        else payload["passed"] is True
+    )
+    return 0 if completed else 1
 
 
 if __name__ == "__main__":
