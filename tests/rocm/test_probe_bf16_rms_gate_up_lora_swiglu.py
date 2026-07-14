@@ -868,11 +868,12 @@ def test_forward_once_scope_requires_exact_shared_systemd_cgroup(
 @pytest.mark.parametrize(
     ("mode", "scope_unit"),
     (
+        ("numerics_once", "skyrl-bf16-numerics-4242-abc123.scope"),
         ("benchmark_smoke", "skyrl-bf16-benchmark-smoke-4242-abc123.scope"),
         ("benchmark", "skyrl-bf16-benchmark-4242-abc123.scope"),
     ),
 )
-def test_benchmark_scope_requires_mode_specific_private_systemd_cgroup(
+def test_guarded_scope_requires_mode_specific_private_systemd_cgroup(
     tmp_path: Path, mode: str, scope_unit: str
 ) -> None:
     proc_root = tmp_path / "proc"
@@ -902,7 +903,7 @@ def test_benchmark_scope_requires_mode_specific_private_systemd_cgroup(
     finally:
         os.close(descriptor)
 
-    wrong_mode = "benchmark" if mode == "benchmark_smoke" else "benchmark_smoke"
+    wrong_mode = "benchmark_smoke" if mode == "benchmark" else "benchmark"
     with pytest.raises(RuntimeError, match="private BF16 systemd scope"):
         probe._require_guarded_scope(
             parent_pid,

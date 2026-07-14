@@ -123,6 +123,11 @@ _BENCHMARK_MODE_COUNTS = {
     "benchmark_smoke": (2, 4),
     "benchmark": (8, 32),
 }
+_GUARDED_SCOPE_UNIT_PATTERNS = {
+    "numerics_once": r"skyrl-bf16-numerics-[0-9]+-[0-9a-f]+\.scope",
+    "benchmark_smoke": r"skyrl-bf16-benchmark-smoke-[0-9]+-[0-9a-f]+\.scope",
+    "benchmark": r"skyrl-bf16-benchmark-[0-9]+-[0-9a-f]+\.scope",
+}
 _EXACT_PROFILE_LIMITS = {
     "--max-junction-temp-c": 90.0,
     "--max-gpu-power-watts": 400.0,
@@ -827,6 +832,13 @@ def _validate_prior_chain(
     }
 
 
+def _guarded_scope_unit_pattern(mode: str) -> str:
+    try:
+        return _GUARDED_SCOPE_UNIT_PATTERNS[mode]
+    except KeyError as error:
+        raise ValueError(f"unsupported guarded mode: {mode}") from error
+
+
 def _validate_preflight(
     preflight: Any,
     *,
@@ -951,8 +963,7 @@ def _validate_preflight(
     }
 
     scope = preflight[scope_key]
-    mode_label = mode.replace("_", "-")
-    unit_pattern = rf"skyrl-bf16-{mode_label}-[0-9]+-[0-9a-f]+\.scope"
+    unit_pattern = _guarded_scope_unit_pattern(mode)
     if (
         not isinstance(scope, dict)
         or scope.get("validated") is not True

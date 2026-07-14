@@ -254,6 +254,107 @@ def _file_manifest(path: str, *, inode: int, digest_digit: str) -> dict[str, Any
     }
 
 
+@pytest.mark.parametrize(
+    ("mode", "scope_unit"),
+    (
+        ("numerics_once", "skyrl-bf16-numerics-123-abc.scope"),
+        ("benchmark_smoke", "skyrl-bf16-benchmark-smoke-123-abc.scope"),
+        ("benchmark", "skyrl-bf16-benchmark-123-abc.scope"),
+    ),
+)
+def test_preflight_accepts_exact_probe_scope_unit_contract(mode: str, scope_unit: str) -> None:
+    repo = Path(attest.__file__).resolve().parent.parent
+    profiler_path = (repo / "rocm" / "profile_rocm.py").resolve()
+    safety_path = (repo / "rocm" / "amdgpu_safety.py").resolve()
+    cgroup = f"/user.slice/user-1000.slice/user@1000.service/app.slice/{scope_unit}"
+    source_only = {
+        "profiler": {
+            "path": str(profiler_path),
+            "sha256": attest.hashlib.sha256(profiler_path.read_bytes()).hexdigest(),
+        }
+    }
+    preflight = {
+        "environment": {
+            "JAX_PLATFORMS": "rocm",
+            "ROCR_VISIBLE_DEVICES": "0",
+            "HIP_VISIBLE_DEVICES": "0",
+            "GPU_DEVICE_ORDINAL": "0",
+            "XLA_FLAGS_effective": attest._DISABLE_COMMAND_BUFFERS,
+            "XLA_FLAGS_original": attest._DISABLE_COMMAND_BUFFERS,
+            "command_buffers_enabled": False,
+            "graph_capture_enabled": False,
+            "inherited": {
+                "JAX_PLATFORMS": "rocm",
+                "HIP_VISIBLE_DEVICES": "0",
+                "XLA_FLAGS": attest._DISABLE_COMMAND_BUFFERS,
+            },
+        },
+        "hardware": {
+            "amdgpu_boot_clean": True,
+            "kfd_accessible": True,
+            "kfd_unowned": True,
+            "connected_amd_connectors": [],
+            "fatal_amdgpu_events": [],
+            "amd_cards": ["card1"],
+            "kfd_path": "/dev/kfd",
+        },
+        "profiler_parent": {
+            "validated": True,
+            "parent_pid": 123,
+            "parent_executable": "/usr/bin/python3",
+            "parent_command_python": str((repo / ".venv" / "bin" / "python").absolute()),
+            "parent_command_sha256": "a" * 64,
+            "profiler_path": str(profiler_path),
+            "profiler_sha256": source_only["profiler"]["sha256"],
+            "limits": dict(attest._EXACT_PROFILE_LIMITS),
+            "timeout_seconds": 600.0,
+            "interval_seconds": 0.05,
+            "baseline_seconds": 5.0,
+            "sensor_grace_seconds": 15.0,
+        },
+        "card_identity": {
+            "drm_card": "card1",
+            "pci_vendor": "0x1002",
+            "pci_device": "0x744c",
+            "driver": "amdgpu",
+            "architecture": "gfx1100",
+            "pci_bdf": "0000:03:00.0",
+            "sysfs_device": "/sys/devices/pci0000:00/0000:03:00.0",
+        },
+        "safety_source": {
+            "path": str(safety_path),
+            "sha256": attest.hashlib.sha256(safety_path.read_bytes()).hexdigest(),
+        },
+        f"{mode}_scope": {
+            "validated": True,
+            "scope_unit": scope_unit,
+            "cgroup": cgroup,
+            "profile_parent_same_cgroup": True,
+            "cgroup_kill_path": f"/sys/fs/cgroup{cgroup}/cgroup.kill",
+            "cgroup_kill_device": 30,
+            "cgroup_kill_inode": 456,
+            "timeout_kill_scope": "entire_systemd_cgroup",
+        },
+    }
+
+    validated = attest._validate_preflight(
+        preflight,
+        mode=mode,
+        repo=repo,
+        source_only=source_only,
+    )
+
+    assert validated["scope"]["scope_unit"] == scope_unit
+
+
+def test_guarded_scope_pattern_rejects_old_numerics_alias_and_unknown_mode() -> None:
+    pattern = attest._guarded_scope_unit_pattern("numerics_once")
+    assert attest.re.fullmatch(pattern, "skyrl-bf16-numerics-123-abc.scope")
+    assert not attest.re.fullmatch(pattern, "skyrl-bf16-numerics-once-123-abc.scope")
+    with pytest.raises(ValueError, match="unsupported guarded mode"):
+        attest._guarded_scope_unit_pattern("unknown")
+
+
 def _determinism_run_fixture(run_id: int) -> dict[str, Any]:
     base = 100 * run_id
     hashes = {
