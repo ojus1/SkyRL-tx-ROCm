@@ -498,16 +498,20 @@ projection with residual addition. Do not write a separate gated-normalized
 
 The launcher currently sets `loss_chunk_size=64`, which already bounds live
 logits and does not materialize full `[T,V]` logits. The current logical
-per-chunk logits are 30.3125 MiB in BF16 or 60.625 MiB in FP32. A fused
-target-logprob custom VJP eliminates this per-chunk tensor, not a full-sequence
-tensor. `M=128` is the first proposed fused-head bucket, not the current setting;
-its BF16/FP32 logical logits would be 60.625/121.25 MiB.
+per-chunk logits are 30.3125 MiB in BF16 or 60.625 MiB in FP32. The default-off
+split target-logprob custom VJP is now wired for explicit `M=64/128/256` plus a
+vocabulary superblock and eliminates this full-vocabulary per-chunk tensor, not
+a full-sequence tensor. Its online forward forms each vocabulary tile once.
+`M=128` remains the first GPU qualification bucket; it is not the launcher
+default. Dense BF16/FP32 logits at that size would be 60.625/121.25 MiB.
 
 The tied embedding is approximately 1.184 GiB, larger than cache. With token
-chunk 64 it is reread once per token chunk in forward. Training nominally reads
-it about three times per chunk across forward, rematerialized forward, and the
-input-gradient VJP. The table below is estimated logical traffic, not measured
-HBM traffic; it applies `ceil(T/M)` and includes group-64 scale bytes for W8/W4:
+chunk 64 it is reread once per token chunk in forward. Training nominally uses
+three embedding dot operands per chunk. In the online custom path these are one
+forward logits dot plus the backward logits-reconstruction and expected-
+embedding dots; the former two-pass prototype had four. The table below is
+estimated logical traffic, not measured HBM traffic; it applies `ceil(T/M)`
+and includes group-64 scale bytes for W8/W4:
 
 | Tied-head route | 64 tokens | 512 tokens | 8,192 tokens | 32,768 tokens |
 |---|---:|---:|---:|---:|
@@ -520,7 +524,10 @@ Fusion does not itself remove vocabulary reads; it permits a larger token
 chunk without a larger logits buffer. `M=128` remains the first fused-head
 bucket. After it is validated, test `M=256`: its work is 325.5 GFLOP and its
 duration is estimated at 54 ms at the conservative 6 TFLOP/s planning rate.
-The W8/W4 rows are bandwidth opportunities, not end-to-end speedup claims.
+The portable online value-plus-VJP lowering has three dot bodies; a production
+fused backward that reuses each live embedding tile for both backward products
+would reduce the BF16 `M=256`, 32K target from 454.69 to 303.125 GiB. The
+W8/W4 rows are bandwidth opportunities, not end-to-end speedup claims.
 
 Forward should use split-vocabulary online max/sum and emit only target
 logprobs. A watchdog-safe, deterministic backward can make each vocabulary

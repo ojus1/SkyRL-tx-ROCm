@@ -153,6 +153,106 @@ def test_low_precision_forward_tracks_current_dense_equation(dtype: jnp.dtype) -
     )
 
 
+def test_online_normalizer_rescales_when_later_blocks_raise_the_maximum() -> None:
+    hidden = jnp.ones((3, 1), dtype=jnp.float32)
+    embedding = jnp.arange(8, dtype=jnp.float32)[:, None]
+    target_ids = jnp.asarray([0, 3, 7], dtype=jnp.int32)
+    active_mask = jnp.ones(target_ids.shape, dtype=jnp.bool_)
+
+    output, residual = _split_vocab_tied_target_logprobs_fwd(
+        hidden,
+        embedding,
+        target_ids,
+        active_mask,
+        64,
+        2,
+    )
+    expected = _independent_dense_equations(hidden, embedding, target_ids)
+    np.testing.assert_allclose(output, expected, rtol=2e-6, atol=2e-6)
+
+    finite_max, denominator = residual[-2:]
+    expected_max = jnp.full_like(finite_max, 7.0)
+    expected_denominator = jnp.full_like(
+        denominator,
+        jnp.sum(jnp.exp(jnp.arange(8, dtype=jnp.float32) - 7.0)),
+    )
+    np.testing.assert_array_equal(finite_max, expected_max)
+    np.testing.assert_allclose(denominator, expected_denominator, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("embedding_value", "expected_denominator"),
+    [(-np.inf, 0.0), (np.inf, np.inf), (np.nan, np.nan)],
+)
+def test_online_normalizer_preserves_nonfinite_logsumexp_convention(
+    embedding_value: float,
+    expected_denominator: float,
+) -> None:
+    hidden = jnp.ones((3, 1), dtype=jnp.float32)
+    embedding = jnp.full((5, 1), embedding_value, dtype=jnp.float32)
+    target_ids = jnp.asarray([0, 2, 4], dtype=jnp.int32)
+    active_mask = jnp.ones(target_ids.shape, dtype=jnp.bool_)
+
+    output, residual = _split_vocab_tied_target_logprobs_fwd(
+        hidden,
+        embedding,
+        target_ids,
+        active_mask,
+        64,
+        2,
+    )
+    expected = _independent_dense_equations(hidden, embedding, target_ids)
+    np.testing.assert_allclose(output, expected, equal_nan=True)
+
+    finite_max, denominator = residual[-2:]
+    np.testing.assert_array_equal(finite_max, jnp.zeros_like(finite_max))
+    if np.isnan(expected_denominator):
+        assert bool(jnp.all(jnp.isnan(denominator)))
+    else:
+        np.testing.assert_array_equal(
+            denominator,
+            jnp.full_like(denominator, expected_denominator),
+        )
+
+
+@pytest.mark.parametrize("embedding_value", [-np.inf, np.inf, np.nan])
+def test_mixed_inactive_exceptional_rows_keep_zero_dhidden(
+    embedding_value: float,
+) -> None:
+    hidden = jnp.ones((3, 1), dtype=jnp.float32)
+    embedding = jnp.full((5, 1), embedding_value, dtype=jnp.float32)
+    target_ids = jnp.asarray([0, 2, 4], dtype=jnp.int32)
+    active_mask = jnp.asarray([True, False, False], dtype=jnp.bool_)
+
+    def objective(value: jax.Array) -> jax.Array:
+        return jnp.sum(
+            split_vocab_tied_target_logprobs(
+                value,
+                embedding,
+                target_ids,
+                token_chunk_size=64,
+                vocab_superblock_size=2,
+                active_mask=active_mask,
+            )
+        )
+
+    output = split_vocab_tied_target_logprobs(
+        hidden,
+        embedding,
+        target_ids,
+        token_chunk_size=64,
+        vocab_superblock_size=2,
+        active_mask=active_mask,
+    )
+    gradient = jax.grad(objective)(hidden)
+    assert bool(jnp.isnan(output[0]))
+    np.testing.assert_array_equal(output[~active_mask], jnp.zeros_like(output[1:]))
+    np.testing.assert_array_equal(
+        gradient[~active_mask],
+        jnp.zeros_like(gradient[1:]),
+    )
+
+
 def test_custom_vjp_dhidden_matches_independent_dense_vjp() -> None:
     hidden, embedding, target_ids = _inputs((2, 37), hidden_size=11, vocab_size=53)
     cotangent = jax.random.normal(jax.random.key(104), target_ids.shape)
@@ -414,6 +514,39 @@ def test_compact_active_study_is_masked_loss_and_vjp_equivalent() -> None:
     np.testing.assert_allclose(actual_gradient, expected_gradient, rtol=3e-6, atol=3e-6)
 
 
+def test_all_inactive_compaction_fill_slots_keep_zero_exceptional_vjp() -> None:
+    hidden = jnp.ones((5, 1), dtype=jnp.float32)
+    embedding = jnp.full((7, 1), jnp.nan, dtype=jnp.float32)
+    target_ids = jnp.arange(5, dtype=jnp.int32)
+    loss_mask = jnp.zeros(target_ids.shape, dtype=jnp.float32)
+
+    def objective(value: jax.Array) -> jax.Array:
+        output, _, _ = compact_masked_tied_target_logprobs_study(
+            value,
+            embedding,
+            target_ids,
+            loss_mask,
+            active_token_capacity=4,
+            token_chunk_size=64,
+            vocab_superblock_size=3,
+        )
+        return jnp.sum(output)
+
+    output, active_count, overflow = compact_masked_tied_target_logprobs_study(
+        hidden,
+        embedding,
+        target_ids,
+        loss_mask,
+        active_token_capacity=4,
+        token_chunk_size=64,
+        vocab_superblock_size=3,
+    )
+    np.testing.assert_array_equal(output, jnp.zeros_like(output))
+    assert int(active_count) == 0
+    assert not bool(overflow)
+    np.testing.assert_array_equal(jax.grad(objective)(hidden), jnp.zeros_like(hidden))
+
+
 def test_compact_active_study_reports_fixed_capacity_overflow() -> None:
     hidden, embedding, target_ids = _inputs((6,), hidden_size=5, vocab_size=19)
     _, active_count, overflow = compact_masked_tied_target_logprobs_study(
@@ -437,6 +570,15 @@ def _has_floating_tensor_shape(stablehlo: str, shape: tuple[int, ...]) -> bool:
 def _has_typed_tensor_shape(stablehlo: str, shape: tuple[int, ...], dtype: str) -> bool:
     dimensions = "x".join(str(dimension) for dimension in shape)
     return f"tensor<{dimensions}x{dtype}>" in stablehlo
+
+
+def _stablehlo_op_count(stablehlo: str, operation: str) -> int:
+    return len(
+        re.findall(
+            rf"(?m)^\s*%[A-Za-z0-9_]+\s*=\s*stablehlo\.{re.escape(operation)}\b",
+            stablehlo,
+        )
+    )
 
 
 def test_stablehlo_forward_and_vjp_use_tiles_not_full_logits() -> None:
@@ -483,6 +625,11 @@ def test_stablehlo_forward_and_vjp_use_tiles_not_full_logits() -> None:
         )
         assert not _has_floating_tensor_shape(stablehlo, (token_count, vocab_size))
         assert not _has_floating_tensor_shape(stablehlo, (token_chunk_size, vocab_size))
+    # For this pinned small FP32 lowering, the online scan has one syntactic
+    # forward dot body. Value-plus-dHidden has three dot bodies rather than the
+    # former four. This is an IR-structure guard, not a physical-read claim.
+    assert _stablehlo_op_count(split_hlo, "dot_general") == 1
+    assert _stablehlo_op_count(value_and_dhidden_hlo, "dot_general") == 3
 
 
 def test_stablehlo_exact_qwen35_geometry_has_bounded_logit_tiles() -> None:
@@ -528,6 +675,8 @@ def test_stablehlo_exact_qwen35_geometry_has_bounded_logit_tiles() -> None:
     assert _has_typed_tensor_shape(
         value_and_dhidden_hlo, (token_chunk_size, hidden_size), "f32"
     )
+    assert _stablehlo_op_count(forward_hlo, "dot_general") == 1
+    assert _stablehlo_op_count(value_and_dhidden_hlo, "dot_general") == 3
 
 
 def test_dense_convenience_reference_matches_independent_equations() -> None:

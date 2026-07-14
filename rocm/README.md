@@ -981,8 +981,10 @@ stage prototypes have separate promotion records:
 [`QUERY_BOUNDED_GQA.md`](QUERY_BOUNDED_GQA.md), and
 [`TIED_LOGPROB_PROTOTYPE.md`](TIED_LOGPROB_PROTOTYPE.md).
 
-All of those implementations remain unwired. The quantized LoRA implementation
-in `skyrl/tx/kernels/quantized_lora.py` is a CPU semantic oracle only; it is not
+All of those implementations remain default-off. The split tied-logprob path
+has explicit Qwen3.5 model wiring but no GPU qualification; GDN and the other
+megakernel prototypes remain unwired. The quantized LoRA implementation in
+`skyrl/tx/kernels/quantized_lora.py` is a CPU semantic oracle only; it is not
 selected by model code and is not a GPU performance path. The native gfx1100
 IU8/IU4 compile proof and production FFI requirements are in
 [`QUANTIZED_FFI.md`](QUANTIZED_FFI.md). Likewise,

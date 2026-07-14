@@ -1,8 +1,9 @@
 # Split-vocabulary tied target-logprob prototype
 
-Status: equation and lowering experiment only. Nothing in this document or in
-`skyrl/tx/kernels/tied_logprob.py` is wired into a model, selected on GPU, or a
-measured speed kernel.
+Status: default-off equation and lowering experiment. Qwen3.5 can select
+`skyrl/tx/kernels/tied_logprob.py` only through the explicit
+`tied_logprob_vocab_superblock_size` backend option. It has not been selected
+or measured on GPU and is not a qualified speed kernel.
 
 ## Boundary and semantics
 
@@ -19,21 +20,21 @@ The prototype preserves those equations while splitting work along both axes:
 - tokens use a static `M` of 64, 128, or 256;
 - vocabulary rows use a configurable superblock `VB`;
 - forward retains only one `M x VB` logits tile and `O(M)` normalizer state;
+- forward updates online max/sumexp state while that sole tile is live;
 - a clamped final slice overlaps and masks earlier rows when `V % VB != 0`,
   avoiding a second, padded embedding-shaped logical buffer;
 - backward recomputes one tile at a time and returns only `dHidden`;
 - the tied embedding is explicitly frozen by the custom VJP.
 
-The JAX oracle uses two vocabulary passes in forward: one for the global maximum
-and target gather, and one for the exponential denominator. This mirrors the
-current dense `jax.nn.logsumexp` precision policy closely, but it rereads the
-embedding and is not a performance implementation. A future GPU kernel should
-use a numerically stable online `(max, sumexp)` update in one forward pass.
-Reduction reassociation means the split forward is numerically close rather
-than bit-identical. Its low-precision VJP is deliberately strengthened: it
-forms probabilities and accumulates the expected embedding in FP32, then casts
-`dHidden` to the model dtype. BF16/FP16 agreement therefore uses explicit
-tolerances against autodiff through the current dense equation.
+The JAX forward now uses one vocabulary scan with a numerically stable online
+`(max, sumexp)` update and target gather. A non-finite final maximum is
+classified as positive infinity, negative infinity, or NaN so the exceptional
+denominator retains the dense `jax.nn.logsumexp` convention without a second
+tile formation. Reduction reassociation means the split forward is numerically
+close rather than bit-identical. Its low-precision VJP is deliberately
+strengthened: it forms probabilities and accumulates the expected embedding in
+FP32, then casts `dHidden` to the model dtype. BF16/FP16 agreement therefore
+uses explicit tolerances against autodiff through the current dense equation.
 
 The main API is unmasked and therefore preserves the observable
 `compute_logprobs` contract. An optional boolean mask can predicate rows for
@@ -60,9 +61,9 @@ For `V=248,320`, `H=2,560`, BF16, and 32,768 target tokens:
 | Current `M=64` full logits chunk | 30.3125 MiB |
 | Full logits at `M=256` | 121.25 MiB |
 | Split `M=256, VB=4,096` logits tile | 2.0 MiB |
-| One-pass forward reads, `M=64` (future kernel) | 606.25 GiB |
-| One-pass forward reads, `M=128` (future kernel) | 303.125 GiB |
-| One-pass forward reads, `M=256` (future kernel) | 151.5625 GiB |
+| One forward embedding operand, `M=64` | 606.25 GiB |
+| One forward embedding operand, `M=128` | 303.125 GiB |
+| One forward embedding operand, `M=256` | 151.5625 GiB |
 
 The read figures are logical GEMM operand traffic, not measured VRAM traffic.
 They explain the main opportunity: a small vocabulary tile permits `M=256`
@@ -71,13 +72,17 @@ relative to the current `M=64`. Actual cache behavior, matrix occupancy, and
 the fixed arithmetic count limit realized speedup, so this needs isolated GPU
 measurement before integration.
 
-The future online forward plus recomputing backward would read the embedding
-twice per token chunk. The present JAX oracle reads it three times (two forward,
-one backward) and must not be benchmarked as the proposed implementation. To
-realize two reads after integration, the fused head must also bypass SkyRL's
-existing per-chunk `jax.checkpoint`: its compact normalizer residual replaces
-the reason for rematerializing the dense logits path. Leaving that checkpoint
-around the custom stage can rematerialize forward and restore a third read.
+The online change reduces value-plus-`dHidden` StableHLO from four dot bodies to
+three: one forward logits dot, then a backward logits reconstruction and
+probability-weighted embedding dot. At `M=256`, treating each dot operand as a
+full logical embedding pass gives 454.6875 GiB at 32K, down from 606.25 GiB for
+the former two-pass oracle and 4x below the current dense `M=64` route. A fused
+ROCm backward could load each vocabulary tile once and reuse it for its two dot
+products, reducing the production target to two logical passes or 303.125 GiB.
+The portable JAX lowering does not prove that cache or fusion already realizes
+that reuse. The model wiring bypasses the dense head's outer per-chunk
+`jax.checkpoint`, because the custom VJP's compact normalizer residual already
+defines recomputation.
 
 Quantized frozen embeddings can stack with this boundary:
 
@@ -116,9 +121,10 @@ prototype are the semantic oracle for both routes, not a fallback kernel.
 
 CPU-only tests cover all three token chunk sizes, non-divisible token/vocabulary
 padding, exact tail-row ownership, negative and out-of-range target gathers,
-BF16/FP16 agreement, arbitrary-cotangent `dHidden` (including the normalizer
-cotangent for an out-of-range gather), frozen embedding, masking, fixed-capacity
-active compaction, and validation failures:
+positive-infinity/negative-infinity/NaN normalizer behavior, BF16/FP16
+agreement, arbitrary-cotangent `dHidden` (including the normalizer cotangent
+for an out-of-range gather), frozen embedding, masking, fixed-capacity active
+compaction, and validation failures:
 
 ```bash
 JAX_PLATFORMS=cpu .venv/bin/python -m pytest -q \
@@ -128,8 +134,10 @@ JAX_PLATFORMS=cpu .venv/bin/python -m pytest -q \
 The StableHLO audit lowers an independent dense reference first and confirms it
 contains `65 x 97` logits. It then lowers split forward and value-plus-VJP and
 confirms both contain `64 x 32` tiles while containing neither `65 x 97` nor
-`64 x 97` floating buffers. This is a logical-buffer result only; allocator
-peak memory must be measured on the eventual GPU implementation.
+`64 x 97` floating buffers. Forward contains exactly one `dot_general` body;
+value-plus-`dHidden` contains exactly three, rather than the former four. This
+is a logical-program result only; allocator peak and realized traffic must be
+measured on the eventual GPU implementation.
 
 A second compile-only audit uses the exact Qwen3.5-4B head geometry. For both
 forward and value-plus-`dHidden`, the lowered IR contains a `256 x 4,096` BF16
