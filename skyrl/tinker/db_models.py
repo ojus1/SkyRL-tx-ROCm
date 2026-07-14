@@ -28,6 +28,7 @@ def enable_sqlite_wal(engine, *, busy_timeout_ms: int = 30_000) -> None:
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
 
@@ -110,6 +111,21 @@ class FutureDB(SQLModel, table=True):
     status: RequestStatus = Field(default=RequestStatus.PENDING, index=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_type=DateTime(timezone=True))
     completed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+
+
+class RequestDedupDB(SQLModel, table=True):
+    """Committed identity and response for one retryable state-changing request."""
+
+    __tablename__ = "request_deduplication"
+
+    request_key: str = Field(primary_key=True)
+    request_type: str
+    payload_sha256: str
+    response_data: dict[str, object] | None = Field(default=None, sa_type=JSON)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_type=DateTime(timezone=True),
+    )
 
 
 class CheckpointDB(SQLModel, table=True):

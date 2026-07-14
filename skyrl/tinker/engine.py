@@ -981,13 +981,17 @@ class TinkerEngine:
             logger.warning(f"Ignoring unload request for model {model_id} that is not loaded.")
         else:
             self.backend.delete_model(model_id)
-
-            # Update model status in DB
-            with Session(self.db_engine) as session:
-                _ = session.exec(update(ModelDB).where(ModelDB.model_id == model_id).values(status="unloaded"))
-                session.commit()
-
             logger.info(f"Unloaded model {model_id}")
+
+        # A replay after a backend-side success may find the adapter already
+        # absent.  Persist the same terminal state in either case.
+        with Session(self.db_engine) as session:
+            _ = session.exec(
+                update(ModelDB)
+                .where(ModelDB.model_id == model_id)
+                .values(status="unloaded")
+            )
+            session.commit()
 
         return types.UnloadModelOutput(model_id=model_id, status="unloaded")
 

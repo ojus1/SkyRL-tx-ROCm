@@ -69,6 +69,7 @@ def test_cleanup_stale_sessions():
                 last_heartbeat_at=stale_heartbeat,
             )
         )
+        session.flush()
         session.add(
             ModelDB(
                 model_id=model_id,

@@ -245,7 +245,7 @@ def test_launcher_rejects_unknown_memory_mode_before_creating_run_root(tmp_path)
     )
 
     result = subprocess.run(
-        ["bash", str(_LAUNCHER), "cpu-invalid-mode"],
+        [str(_LAUNCHER), "cpu-invalid-mode"],
         cwd=_REPO,
         env=environment,
         capture_output=True,
@@ -280,7 +280,7 @@ def test_launcher_preallocate_mode_rejects_conflicting_environment_early(
     )
 
     result = subprocess.run(
-        ["bash", str(_LAUNCHER), "cpu-conflict"],
+        [str(_LAUNCHER), "cpu-conflict"],
         cwd=_REPO,
         env=environment,
         capture_output=True,
@@ -291,4 +291,33 @@ def test_launcher_preallocate_mode_rejects_conflicting_environment_early(
 
     assert result.returncode == 2
     assert "conflicts with SKYRL_QWEN35_MEMORY_MODE=preallocate85" in result.stderr
+    assert not run_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("ROCR_VISIBLE_DEVICES", "1", "must be unset or exactly 0"),
+        ("SKYRL_ROCM_PALLAS_ATTENTION", "2", "must be exactly 0 or 1"),
+    ],
+)
+def test_launcher_rejects_nonexact_attested_runtime_environment_early(
+    tmp_path, name, value, message
+):
+    run_root = tmp_path / "runs"
+    environment = _clean_environment()
+    environment.update({"SKYRL_QWEN35_RUN_ROOT": str(run_root), name: value})
+
+    result = subprocess.run(
+        [str(_LAUNCHER), "cpu-invalid-runtime-environment"],
+        cwd=_REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
     assert not run_root.exists()

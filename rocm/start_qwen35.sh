@@ -172,6 +172,18 @@ case "$memory_mode" in
     ;;
 esac
 
+if [[ -n "${ROCR_VISIBLE_DEVICES:-}" && "$ROCR_VISIBLE_DEVICES" != "0" ]]; then
+  echo "ROCR_VISIBLE_DEVICES must be unset or exactly 0 for the qualified Qwen3.5 server." >&2
+  exit 2
+fi
+case "${SKYRL_ROCM_PALLAS_ATTENTION:-0}" in
+  0|1) ;;
+  *)
+    echo "SKYRL_ROCM_PALLAS_ATTENTION must be exactly 0 or 1." >&2
+    exit 2
+    ;;
+esac
+
 if [[ -n "$prewarm_buckets" ]]; then
   while IFS= read -r exported_name; do
     case "$exported_name" in
@@ -692,7 +704,7 @@ PY
 fi
 export LLVM_PATH=/opt/rocm/llvm
 export JAX_PLATFORMS=rocm
-export ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-0}"
+export ROCR_VISIBLE_DEVICES=0
 if [[ "$memory_mode" == "growth" ]]; then
   # Preserve the validated baseline behavior and inherited allocator/fraction.
   export XLA_PYTHON_CLIENT_PREALLOCATE=false

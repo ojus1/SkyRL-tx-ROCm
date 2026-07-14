@@ -2,6 +2,8 @@
 # ruff: noqa: E402
 
 import asyncio
+import hashlib
+import json
 import os
 import random
 import signal
@@ -56,6 +58,7 @@ from skyrl.tinker.db_models import (
     EngineLaunchStatus,
     FutureDB,
     ModelDB,
+    RequestDedupDB,
     RequestStatus,
     SamplingSessionDB,
     SessionDB,
@@ -1167,6 +1170,158 @@ async def create_future(
     return future_db.request_id
 
 
+def _sequence_request_identity(scope: str, sequence_id: int | None) -> str | None:
+    if sequence_id is None:
+        return None
+    encoded = json.dumps(
+        {
+            "scope": scope,
+            "sequence_id": sequence_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _http_request_identity(scope: str, request: Request) -> str | None:
+    values = request.headers.getlist("x-idempotency-key")
+    if not values:
+        return None
+    if len(values) != 1 or not values[0] or len(values[0].encode("utf-8")) > 512:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Idempotency-Key must be one nonempty bounded value",
+        )
+    encoded = json.dumps(
+        {"scope": scope, "idempotency_key": values[0]},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _request_payload_sha256(
+    request: BaseModel, *, ignored_fields: frozenset[str] = frozenset()
+) -> str:
+    payload = request.model_dump(mode="json")
+    for field in ignored_fields:
+        payload.pop(field, None)
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail="request payload is not canonically serializable",
+        ) from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _load_deduplicated_response(
+    session: AsyncSession,
+    *,
+    request_key: str | None,
+    request_type: str,
+    payload_sha256: str,
+) -> dict[str, object] | None:
+    if request_key is None:
+        return None
+    record = await session.get(RequestDedupDB, request_key)
+    if record is None:
+        return None
+    if (
+        record.request_type != request_type
+        or record.payload_sha256 != payload_sha256
+    ):
+        # 409 is retryable for five minutes in the supported Tinker SDK.
+        raise HTTPException(
+            status_code=400,
+            detail="request sequence identity conflicts with a prior payload",
+        )
+    if record.response_data is None:
+        raise HTTPException(
+            status_code=503,
+            detail="request sequence identity has no committed response",
+        )
+    return dict(record.response_data)
+
+
+async def _reserve_deduplicated_request(
+    session: AsyncSession,
+    *,
+    request_key: str | None,
+    request_type: str,
+    payload_sha256: str,
+) -> dict[str, object] | None:
+    if request_key is None:
+        return None
+    # Insert first: on SQLite/WAL a SELECT-then-INSERT transaction can fail its
+    # read-to-write upgrade with SQLITE_BUSY_SNAPSHOT under concurrent retries.
+    session.add(
+        RequestDedupDB(
+            request_key=request_key,
+            request_type=request_type,
+            payload_sha256=payload_sha256,
+            response_data=None,
+        )
+    )
+    try:
+        await session.flush()
+    except IntegrityError as error:
+        await session.rollback()
+        replay = await _load_deduplicated_response(
+            session,
+            request_key=request_key,
+            request_type=request_type,
+            payload_sha256=payload_sha256,
+        )
+        if replay is None:
+            raise HTTPException(
+                status_code=503,
+                detail="request sequence identity could not be reserved",
+            ) from error
+        return replay
+    return None
+
+
+async def _commit_deduplicated_response(
+    session: AsyncSession,
+    *,
+    request_key: str | None,
+    request_type: str,
+    payload_sha256: str,
+    response_data: dict[str, object],
+) -> tuple[dict[str, object], bool]:
+    if request_key is None:
+        await session.commit()
+        return response_data, False
+    record = await session.get(RequestDedupDB, request_key)
+    if record is None or (
+        record.request_type != request_type
+        or record.payload_sha256 != payload_sha256
+        or record.response_data is not None
+    ):
+        await session.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="request sequence reservation changed before commit",
+        )
+    record.response_data = response_data
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise
+    return response_data, False
+
+
 async def create_checkpoint(
     session: AsyncSession,
     model_id: str,
@@ -1194,7 +1349,8 @@ async def create_checkpoint(
             raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
         else:
             raise HTTPException(
-                status_code=409, detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'"
+                status_code=400,
+                detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'",
             )
 
 
@@ -1203,13 +1359,19 @@ class LoRAConfig(BaseModel):
     seed: int | None = Field(
         default=None, description="Seed for LoRA weight initialization. If None, a random seed is used."
     )
+    train_mlp: bool = True
+    train_attn: bool = True
+    train_unembed: bool = True
 
 
 class CreateModelRequest(BaseModel):
     session_id: str
+    model_seq_id: int = Field(ge=0)
     base_model: str
     lora_config: LoRAConfig
+    user_metadata: dict[str, Any] | None = None
     model_role: str = "policy"
+    type: Literal["create_model"] = "create_model"
 
 
 class CreateModelResponse(BaseModel):
@@ -1222,7 +1384,7 @@ class CreateModelResponse(BaseModel):
 
 class UnloadModelRequest(BaseModel):
     model_id: str
-    type: str | None = None
+    type: Literal["unload_model"] = "unload_model"
 
 
 class UnloadModelResponse(BaseModel):
@@ -1410,11 +1572,13 @@ class ForwardBackwardInput(BaseModel):
 class ForwardBackwardRequest(BaseModel):
     model_id: str
     forward_backward_input: ForwardBackwardInput
+    seq_id: int = Field(ge=0)
 
 
 class ForwardRequest(BaseModel):
     model_id: str
     forward_input: ForwardBackwardInput
+    seq_id: int = Field(ge=0)
 
 
 class AdamParams(BaseModel):
@@ -1423,6 +1587,7 @@ class AdamParams(BaseModel):
     beta2: float = Field(default=0.95, ge=0.0, lt=1.0)
     eps: float = Field(default=1e-12, gt=0.0)
     weight_decay: float = Field(default=0.0, ge=0.0)
+    grad_clip_norm: Literal[0.0] = 0.0
 
     def to_types(self) -> types.AdamParams:
         return types.AdamParams(
@@ -1437,13 +1602,14 @@ class AdamParams(BaseModel):
 class OptimStepRequest(BaseModel):
     model_id: str
     adam_params: AdamParams
+    seq_id: int = Field(ge=0)
 
 
 class SaveWeightsForSamplerRequest(BaseModel):
     model_id: str
     path: str | None = Field(default=None, pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
-    sampling_session_seq_id: int | None = None
-    seq_id: int | None = None
+    sampling_session_seq_id: int | None = Field(default=None, ge=0)
+    seq_id: int = Field(ge=0)
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
     @model_validator(mode="after")
@@ -1502,7 +1668,7 @@ class SampleRequest(BaseModel):
     base_model: str | None = None
     model_path: str | None = None
     sampling_session_id: str | None = None
-    seq_id: int | None = None
+    seq_id: int | None = Field(default=None, ge=0)
     prompt_logprobs: bool | None = None
     topk_prompt_logprobs: int = 0
     type: Literal["sample"] = "sample"
@@ -1527,13 +1693,16 @@ class SampleRequest(BaseModel):
 class SaveWeightsRequest(BaseModel):
     model_id: str
     path: str = Field(..., pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
-    type: Literal["save_weights"] | None = None
+    seq_id: int = Field(ge=0)
+    type: Literal["save_weights"] = "save_weights"
 
 
 class LoadWeightsRequest(BaseModel):
     model_id: str
     path: str
-    type: Literal["load_weights"] | None = None
+    optimizer: bool | None = None
+    seq_id: int = Field(ge=0)
+    type: Literal["load_weights"] = "load_weights"
 
 
 class FutureResponse(BaseModel):
@@ -1647,6 +1816,10 @@ class WeightsInfoResponse(BaseModel):
 
 class ClientConfigResponse(BaseModel):
     pjwt_auth_enabled: bool = False
+    # Holder-level submit retries retain the same sample seq_id and are
+    # deduplicated server-side.  Disabling the outer whole-operation retry
+    # prevents the SDK from allocating a new seq_id after an ambiguous result.
+    sample_no_retries: Literal[True] = True
 
 
 @app.post("/api/v1/client/config", response_model=ClientConfigResponse)
@@ -1706,8 +1879,23 @@ async def healthz(request: Request):
 
 
 @app.post("/api/v1/create_session", response_model=CreateSessionResponse)
-async def create_session(request: CreateSessionRequest, session: AsyncSession = Depends(get_session)):
+async def create_session(
+    request: CreateSessionRequest,
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+):
     """Create a new session + persist in DB"""
+    request_type = "create_session"
+    request_key = _http_request_identity("create-session", req)
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return CreateSessionResponse.model_validate(replay)
     session_id = f"session_{uuid4().hex[:8]}"
     session_db = SessionDB(
         session_id=session_id,
@@ -1717,8 +1905,15 @@ async def create_session(request: CreateSessionRequest, session: AsyncSession = 
         status="active",
     )
     session.add(session_db)
-    await session.commit()
-    return CreateSessionResponse(session_id=session_id)
+    response = CreateSessionResponse(session_id=session_id)
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return CreateSessionResponse.model_validate(committed)
 
 
 @app.post("/api/v1/session_heartbeat", response_model=SessionHeartbeatResponse)
@@ -1736,6 +1931,20 @@ async def session_heartbeat(request: SessionHeartbeatRequest, session: AsyncSess
 @app.post("/api/v1/create_sampling_session", response_model=CreateSamplingSessionResponse)
 async def create_sampling_session(request: CreateSamplingSessionRequest, session: AsyncSession = Depends(get_session)):
     """Create a new sampling session within an existing session."""
+    request_type = "create_sampling_session"
+    request_key = _sequence_request_identity(
+        f"sampling-client:{request.session_id}",
+        request.sampling_session_seq_id,
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return CreateSamplingSessionResponse.model_validate(replay)
     session_db = await session.get(SessionDB, request.session_id)
     if session_db is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1751,8 +1960,17 @@ async def create_sampling_session(request: CreateSamplingSessionRequest, session
         model_path=request.model_path,
     )
     session.add(sampling_db)
-    await session.commit()
-    return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+    response = CreateSamplingSessionResponse(
+        sampling_session_id=sampling_session_id
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return CreateSamplingSessionResponse.model_validate(committed)
 
 
 @app.get("/api/v1/samplers/{sampler_id}", response_model=GetSamplerResponse)
@@ -1780,6 +1998,20 @@ async def get_sampler(sampler_id: str, session: AsyncSession = Depends(get_sessi
 @app.post("/api/v1/create_model", response_model=CreateModelResponse)
 async def create_model(request: CreateModelRequest, session: AsyncSession = Depends(get_session)):
     """Create a new model, optionally with a LoRA adapter."""
+    request_type = types.RequestType.CREATE_MODEL.value
+    request_key = _sequence_request_identity(
+        f"training-client:{request.session_id}", request.model_seq_id
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return CreateModelResponse.model_validate(replay)
+
     # Validate session exists
     session_db = await session.get(SessionDB, request.session_id)
     if session_db is None:
@@ -1790,7 +2022,14 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
     # alpha = 32 seems to be the tinker default (see https://thinkingmachines.ai/blog/lora/)
     # Generate a random seed if not provided
     seed = request.lora_config.seed if request.lora_config.seed is not None else random.randint(0, 2**31 - 1)
-    lora_config = types.LoraConfig(rank=request.lora_config.rank, alpha=32.0, seed=seed)
+    lora_config = types.LoraConfig(
+        rank=request.lora_config.rank,
+        alpha=32.0,
+        seed=seed,
+        train_mlp=request.lora_config.train_mlp,
+        train_attn=request.lora_config.train_attn,
+        train_unembed=request.lora_config.train_unembed,
+    )
     request_id = await create_future(
         session=session,
         request_type=types.RequestType.CREATE_MODEL,
@@ -1808,20 +2047,39 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
     )
     session.add(model_db)
 
-    await session.commit()
-
-    return CreateModelResponse(
+    response = CreateModelResponse(
         model_id=model_id,
         base_model=request.base_model,
         lora_config=request.lora_config,
         status="created",
         request_id=str(request_id),
     )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return CreateModelResponse.model_validate(committed)
 
 
 @app.post("/api/v1/unload_model", response_model=UnloadModelResponse)
 async def unload_model(request: UnloadModelRequest, session: AsyncSession = Depends(get_session)):
     """Unload a model and free all associated resources."""
+    request_type = types.RequestType.UNLOAD_MODEL.value
+    request_key = _sequence_request_identity(
+        f"model-lifecycle:{request.model_id}", 0
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return UnloadModelResponse.model_validate(replay)
     # Validate model exists
     model_db = await session.get(ModelDB, request.model_id)
     if model_db is None:
@@ -1838,9 +2096,17 @@ async def unload_model(request: UnloadModelRequest, session: AsyncSession = Depe
         request_data=types.UnloadModelInput(),
     )
 
-    await session.commit()
-
-    return UnloadModelResponse(request_id=str(request_id), model_id=request.model_id)
+    response = UnloadModelResponse(
+        request_id=str(request_id), model_id=request.model_id
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return UnloadModelResponse.model_validate(committed)
 
 
 class GetInfoRequest(BaseModel):
@@ -1886,6 +2152,19 @@ async def get_training_run(model_id: str, session: AsyncSession = Depends(get_se
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)
 async def forward_backward(request: ForwardBackwardRequest, session: AsyncSession = Depends(get_session)):
     """Compute and accumulate gradients."""
+    request_type = types.RequestType.FORWARD_BACKWARD.value
+    request_key = _sequence_request_identity(
+        f"training:{request.model_id}", request.seq_id
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
     await get_model(session, request.model_id)
 
     request_id = await create_future(
@@ -1895,14 +2174,35 @@ async def forward_backward(request: ForwardBackwardRequest, session: AsyncSessio
         request_data=request.forward_backward_input.to_types(),
     )
 
-    await session.commit()
-
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return FutureResponse.model_validate(committed)
 
 
 @app.post("/api/v1/forward", response_model=FutureResponse)
 async def forward(request: ForwardRequest, session: AsyncSession = Depends(get_session)):
     """Forward pass to obtain logprobs without accumulating gradients"""
+    request_type = types.RequestType.FORWARD.value
+    request_key = _sequence_request_identity(
+        f"training:{request.model_id}", request.seq_id
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
     await get_model(session, request.model_id)
 
     request_id = await create_future(
@@ -1912,14 +2212,35 @@ async def forward(request: ForwardRequest, session: AsyncSession = Depends(get_s
         request_data=request.forward_input.to_types(),
     )
 
-    await session.commit()
-
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return FutureResponse.model_validate(committed)
 
 
 @app.post("/api/v1/optim_step", response_model=FutureResponse)
 async def optim_step(request: OptimStepRequest, session: AsyncSession = Depends(get_session)):
     """Update model using accumulated gradients."""
+    request_type = types.RequestType.OPTIM_STEP.value
+    request_key = _sequence_request_identity(
+        f"training:{request.model_id}", request.seq_id
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
     await get_model(session, request.model_id)
 
     request_id = await create_future(
@@ -1929,14 +2250,35 @@ async def optim_step(request: OptimStepRequest, session: AsyncSession = Depends(
         request_data=types.OptimStepInput(adam_params=request.adam_params.to_types()),
     )
 
-    await session.commit()
-
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return FutureResponse.model_validate(committed)
 
 
 @app.post("/api/v1/load_weights", response_model=FutureResponse)
 async def load_weights(request: LoadWeightsRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Loads weights and training state."""
+    request_type = types.RequestType.LOAD_WEIGHTS.value
+    request_key = _sequence_request_identity(
+        f"training:{request.model_id}", request.seq_id
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
     await get_model(session, request.model_id)
 
     path = types.TinkerPath.parse(request.path)
@@ -1959,14 +2301,35 @@ async def load_weights(request: LoadWeightsRequest, req: Request, session: Async
         request_data=types.LoadWeightsInput(source_model_id=source_model_id, checkpoint_id=checkpoint_id),
     )
 
-    await session.commit()
-
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return FutureResponse.model_validate(committed)
 
 
 @app.post("/api/v1/save_weights", response_model=FutureResponse)
 async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depends(get_session)):
     """Saves weights and training state."""
+    request_type = types.RequestType.SAVE_WEIGHTS.value
+    request_key = _sequence_request_identity(
+        f"training:{request.model_id}", request.seq_id
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
     # Create pending checkpoint entry (validates model exists)
     await create_checkpoint(
         session=session,
@@ -1982,14 +2345,47 @@ async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depe
         request_data=types.SaveWeightsInput(path=request.path),
     )
 
-    await session.commit()
-
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return FutureResponse.model_validate(committed)
 
 
 @app.post("/api/v1/save_weights_for_sampler", response_model=FutureResponse)
 async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, session: AsyncSession = Depends(get_session)):
     """Saves weights in a format compatible with sampling/inference servers."""
+    request_type = types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER.value
+    request_key = _sequence_request_identity(
+        f"training:{request.model_id}", request.seq_id
+    )
+    # tinker 0.22.4 allocates this session counter inside its outer retry
+    # closure.  The stable training seq_id defines the logical request; replay
+    # must return the first committed session even when this allocator value
+    # advances after a lost response.
+    ignored_fields = (
+        frozenset({"sampling_session_seq_id"})
+        if request.path is None
+        else frozenset()
+    )
+    payload_sha256 = _request_payload_sha256(
+        request, ignored_fields=ignored_fields
+    )
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
+
     # Get the model (validates it exists and gives us the session_id)
     model = await get_model(session, request.model_id)
 
@@ -2027,9 +2423,17 @@ async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, sessio
         ),
     )
 
-    await session.commit()
-
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
+    return FutureResponse.model_validate(committed)
 
 
 async def get_sampling_model(request: SampleRequest, session: AsyncSession) -> (str | None, str | None):
@@ -2051,6 +2455,28 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             status_code=400,
             detail="sampling_session_id must not contain ':' (the routing-key delimiter)",
         )
+
+    request_type = (
+        types.RequestType.EXTERNAL.value
+        if req.app.state.external_inference_client
+        else types.RequestType.SAMPLE.value
+    )
+    request_key = (
+        _sequence_request_identity(
+            f"sampling:{request.sampling_session_id}", request.seq_id
+        )
+        if request.sampling_session_id is not None
+        else _http_request_identity("sample-direct", req)
+    )
+    payload_sha256 = _request_payload_sha256(request)
+    replay = await _reserve_deduplicated_request(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+    )
+    if replay is not None:
+        return FutureResponse.model_validate(replay)
 
     base_model, model_path = await get_sampling_model(request, session)
 
@@ -2076,9 +2502,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
 
     request_id = await create_future(
         session=session,
-        request_type=(
-            types.RequestType.EXTERNAL if req.app.state.external_inference_client else types.RequestType.SAMPLE
-        ),
+        request_type=types.RequestType(request_type),
         model_id=model_id,
         request_data=types.SampleInput(
             base_model=base_model,
@@ -2092,7 +2516,16 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         ),
     )
 
-    await session.commit()
+    response = FutureResponse(
+        future_id=str(request_id), status="pending", request_id=str(request_id)
+    )
+    committed, _ = await _commit_deduplicated_response(
+        session,
+        request_key=request_key,
+        request_type=request_type,
+        payload_sha256=payload_sha256,
+        response_data=response.model_dump(mode="json"),
+    )
 
     if req.app.state.external_inference_client:
         asyncio.create_task(
@@ -2101,7 +2534,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             )
         )
 
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    return FutureResponse.model_validate(committed)
 
 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)

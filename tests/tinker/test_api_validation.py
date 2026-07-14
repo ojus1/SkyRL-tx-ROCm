@@ -102,6 +102,11 @@ def test_datum_to_types_preserves_values_and_returns():
     assert datum.loss_fn_inputs.returns.data == [0.4, 0.5, 0.6]
 
 
+def test_optimizer_rejects_unimplemented_nonzero_gradient_clipping():
+    with pytest.raises(ValidationError):
+        api.AdamParams(learning_rate=1e-5, grad_clip_norm=1.0)
+
+
 # --- ModelInputChunk discriminator tests (api) ---
 
 _api_adapter = TypeAdapter(api.ModelInputChunk)
