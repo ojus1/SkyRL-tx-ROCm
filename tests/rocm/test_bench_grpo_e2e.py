@@ -53,7 +53,9 @@ def test_canonical_sampling_specialization_records_full_generator_shape():
         "expanded_sample_count": 2,
         "effective_sample_microbatch_size": 1,
         "generator_call_count": 2,
-        "generator_call_count_evidence": "contract_derived_not_dispatch_measured",
+        "generator_call_count_evidence": (
+            "explicit_sequential_single_sample_requests"
+        ),
         "prompt_tokens": 49,
         "prompt_bucket_tokens": 64,
         "total_kv_bucket_tokens": 96,
@@ -194,11 +196,12 @@ class _FakeSamplingClient:
     def __init__(self, events, *, fail_sample=False):
         self.events = events
         self.fail_sample = fail_sample
+        self.sample_count = 0
 
     async def sample_async(self, **kwargs):
         self.events.append("sample")
         assert kwargs["prompt"].length == 49
-        assert kwargs["num_samples"] == 2
+        assert kwargs["num_samples"] == 1
         assert kwargs["include_prompt_logprobs"] is False
         assert kwargs["topk_prompt_logprobs"] == 0
         params = kwargs["sampling_params"]
@@ -207,9 +210,14 @@ class _FakeSamplingClient:
         assert params.top_k == -1
         assert params.top_p == 1.0
         assert params.stop is None
+        assert params.seed == 7 + self.sample_count
         if self.fail_sample:
             raise RuntimeError("synthetic sample failure")
-        return _sample_response()
+        response = SimpleNamespace(
+            sequences=[_sample_response().sequences[self.sample_count]]
+        )
+        self.sample_count += 1
+        return response
 
 
 class _FakeTrainingClient:
@@ -440,6 +448,7 @@ def test_run_executes_real_sampler_update_snapshot_lifecycle_in_order(
         "adapter_create",
         "snapshot:1",
         "sample",
+        "sample",
         "submit:forward_backward",
         "submit:optim",
         "resolve:forward_backward",
@@ -492,6 +501,12 @@ def test_run_executes_real_sampler_update_snapshot_lifecycle_in_order(
         "duplicate_submission_creates_one_future": True,
         "backend_effect_exactly_once_across_engine_crash": False,
         "external_sampling_dispatch_covered": False,
+    }
+    assert records[0]["sampling"]["request_plan"] == {
+        "execution": "sequential",
+        "request_count": 2,
+        "num_samples_per_request": 1,
+        "seeds": [7, 8],
     }
     assert sampled_record["completion_tokens"] == [
         list(range(100, 116)),

@@ -257,7 +257,9 @@ def _sampling_specialization(
         "expanded_sample_count": group_size,
         "effective_sample_microbatch_size": sample_max_num_sequences,
         "generator_call_count": math.ceil(group_size / sample_max_num_sequences),
-        "generator_call_count_evidence": "contract_derived_not_dispatch_measured",
+        "generator_call_count_evidence": (
+            "explicit_sequential_single_sample_requests"
+        ),
         "prompt_tokens": prompt_tokens,
         "prompt_bucket_tokens": prompt_bucket,
         "total_kv_bucket_tokens": total_kv_bucket,
@@ -278,6 +280,11 @@ class SampledGroup:
     completions: tuple[tuple[int, ...], ...]
     logprobs: tuple[tuple[float, ...], ...]
     stop_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleResponseGroup:
+    sequences: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -716,6 +723,7 @@ async def _run(args: argparse.Namespace, output) -> None:
             f"{EXPECTED_TINKER_VERSION}"
         )
     expected_git_head, expected_git_tree = _client_source_revision()
+    completion_seeds = tuple(args.seed + index for index in range(GROUP_SIZE))
     specialization = _sampling_specialization(
         prompt_tokens=PROMPT_TOKENS,
         max_new_tokens=MAX_NEW_TOKENS,
@@ -766,6 +774,12 @@ async def _run(args: argparse.Namespace, output) -> None:
             "stop": None,
             "whole_operation_retries": False,
             "submit_retries_require_server_sequence_dedup": True,
+            "request_plan": {
+                "execution": "sequential",
+                "request_count": GROUP_SIZE,
+                "num_samples_per_request": 1,
+                "seeds": completion_seeds,
+            },
             "specialization": specialization,
         },
         "retry_safety": {
@@ -924,23 +938,30 @@ async def _run(args: argparse.Namespace, output) -> None:
             action=lambda: _save_exact_sampler_snapshot(training_client),
             durations=phase_durations,
         )
-        sampling_params = tinker.SamplingParams(
-            max_tokens=MAX_NEW_TOKENS,
-            seed=args.seed,
-            stop=None,
-            temperature=1.0,
-            top_k=-1,
-            top_p=1.0,
-        )
-
         async def sample_group():
-            return await sampling_client.sample_async(
-                prompt=tinker.ModelInput.from_ints(list(prompt_tokens)),
-                num_samples=GROUP_SIZE,
-                sampling_params=sampling_params,
-                include_prompt_logprobs=False,
-                topk_prompt_logprobs=0,
-            )
+            sequences: list[Any] = []
+            for seed in completion_seeds:
+                response = await sampling_client.sample_async(
+                    prompt=tinker.ModelInput.from_ints(list(prompt_tokens)),
+                    num_samples=1,
+                    sampling_params=tinker.SamplingParams(
+                        max_tokens=MAX_NEW_TOKENS,
+                        seed=seed,
+                        stop=None,
+                        temperature=1.0,
+                        top_k=-1,
+                        top_p=1.0,
+                    ),
+                    include_prompt_logprobs=False,
+                    topk_prompt_logprobs=0,
+                )
+                returned = getattr(response, "sequences", None)
+                if not isinstance(returned, (list, tuple)) or len(returned) != 1:
+                    raise ValueError(
+                        "single-sample request returned the wrong sequence count"
+                    )
+                sequences.append(returned[0])
+            return _SampleResponseGroup(sequences=tuple(sequences))
 
         response = await _timed_async_phase(
             output,
