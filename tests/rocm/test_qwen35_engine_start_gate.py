@@ -91,6 +91,42 @@ def _private_gate_dir(tmp_path: Path) -> Path:
     return gate_dir
 
 
+def _kfd_ownership_harness(tmp_path: Path) -> Path:
+    source = _LAUNCHER.read_text(encoding="utf-8")
+    start = source.index("require_engine_start_kfd_unowned() {\n")
+    end = source.index("\n}\n\nawait_engine_start_release()", start) + len("\n}")
+    function_source = source[start:end].replace("/usr/bin/fuser", '"$fake_fuser"', 1)
+
+    fake_fuser = tmp_path / "fuser"
+    fake_fuser.write_text(
+        """#!/bin/bash
+printf '%s' "${FAKE_FUSER_OUTPUT-}"
+exit "${FAKE_FUSER_STATUS:?}"
+""",
+        encoding="utf-8",
+    )
+    fake_fuser.chmod(0o700)
+
+    harness = tmp_path / "kfd-ownership-harness.sh"
+    harness.write_text(
+        """#!/bin/bash
+set -euo pipefail
+fake_fuser="$1"
+"""
+        + function_source
+        + """
+if require_engine_start_kfd_unowned; then
+  exit 0
+else
+  exit $?
+fi
+""",
+        encoding="utf-8",
+    )
+    harness.chmod(0o700)
+    return harness
+
+
 def _launcher_environment(tmp_path: Path) -> dict[str, str]:
     environment = os.environ.copy()
     for name in tuple(environment):
@@ -421,6 +457,44 @@ def test_gate_is_after_postflight_cache_attestation_and_prewarm_only_exit() -> N
         assert gate_only_executable in gate_dependency_section
     assert source.index("unset SKYRL_QWEN35_ENGINE_START_GATE_DIR", gate_call) < clear_traps
     subprocess.run(["bash", "-n", str(_LAUNCHER)], check=True)
+
+
+@pytest.mark.parametrize(
+    ("fuser_status", "fuser_output", "expected_status", "expected_error"),
+    (
+        (1, "", 0, ""),
+        (0, "1234", 1, "owned after prewarm handoff: 1234"),
+        (2, "", 1, "exact /dev/kfd ownership could not be verified"),
+        (1, "unexpected output", 1, "exact /dev/kfd ownership could not be verified"),
+    ),
+)
+def test_post_handoff_kfd_check_preserves_exact_fuser_status(
+    tmp_path: Path,
+    fuser_status: int,
+    fuser_output: str,
+    expected_status: int,
+    expected_error: str,
+) -> None:
+    harness = _kfd_ownership_harness(tmp_path)
+    environment = os.environ.copy()
+    environment["FAKE_FUSER_STATUS"] = str(fuser_status)
+    environment["FAKE_FUSER_OUTPUT"] = fuser_output
+
+    result = subprocess.run(
+        [str(harness), str(tmp_path / "fuser")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == expected_status
+    assert result.stdout == ""
+    if expected_error:
+        assert expected_error in result.stderr
+    else:
+        assert result.stderr == ""
 
 
 @pytest.mark.parametrize(

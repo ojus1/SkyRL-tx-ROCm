@@ -1267,8 +1267,9 @@ require_engine_start_kfd_unowned() {
   if kfd_owners="$(/usr/bin/fuser /dev/kfd 2>&1)"; then
     echo "refusing API start because /dev/kfd is owned after prewarm handoff: $kfd_owners" >&2
     return 1
+  else
+    fuser_status=$?
   fi
-  fuser_status=$?
   if ((fuser_status != 1)) || [[ -n "${kfd_owners//[[:space:]]/}" ]]; then
     echo "refusing API start because exact /dev/kfd ownership could not be verified" >&2
     return 1
