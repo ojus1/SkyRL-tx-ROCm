@@ -15,7 +15,7 @@ fatal AMDGPU journal monitoring.
 - The validated growth-mode training baseline disables JAX preallocation and
   keeps Pallas attention opt-in. Fixed-85% BFC preallocation is used only by
   the explicitly guarded capacity probes described below.
-- Junction temperature is capped at 90 C and configured GPU power at 315 W.
+- Junction temperature is capped at 90 C and configured GPU power at 400 W.
   Full VRAM plus CPU/RAM/disk offload are permitted; individual qualification
   rungs may retain tighter workload-specific caps when their expected footprint
   is much smaller. There is no longer a global zero-swap or 4 GiB

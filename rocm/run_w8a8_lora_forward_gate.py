@@ -11,7 +11,7 @@ All limits and paths are fixed for the first logical ``M=3,K=64,N=17`` rung,
 whose Pallas call uses full physical ``M=16,N=32`` tiles.  The runtime phase has
 a separate five-second dispatch watchdog and exactly one compiled invocation.
 This controller exposes no shape, repetition, warmup, backward, graph, or
-replay option.  The child separately refuses a hardware power cap above 315 W.
+replay option.  The child separately refuses a hardware power cap above 400 W.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ _DISPATCH_KILL_REAP_SECONDS = 1.0
 _EXECUTE_FINAL_SCOPE_QUERY_SECONDS = 0.1
 _MAX_TELEMETRY_DISPATCH_BRACKET_SECONDS = 0.20
 _MAX_JUNCTION_TEMP_C = 90.0
-_MAX_GPU_POWER_WATTS = 315.0
+_MAX_GPU_POWER_WATTS = 400.0
 _MAX_VRAM_GIB = 2.0
 _MIN_HOST_AVAILABLE_GIB = 0.0
 _MAX_SWAP_GIB = 8.0
@@ -229,7 +229,7 @@ namespace = {
 exec(compile(payload, profile, "exec"), namespace)
 """
 _EXPECTED_SOURCE_SHA256 = {
-    "child": "38cb842cea95e82e99b092c64a749fcf096899b20e2680991b4e6fa9ac0343ab",
+    "child": "427e8f497cb8d5860b701779085bb2551a0572658c8e37b523c9e01acb3848bf",
     "isa_inspector": "c8299c341e241b3723e00efcaa7157f29743b73cbaaa8b2cabd7d9ce14d001b6",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
     "handoff": "4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392",
@@ -487,7 +487,7 @@ def _contract(phase: str) -> dict[str, Any]:
         },
         "power_evidence_caveat": (
             "profile_rocm measures power1_average reactively; the child also "
-            "requires the hardware power1_cap to be no greater than 315 W"
+            "requires the hardware power1_cap to be no greater than 400 W"
         ),
     }
 
@@ -3003,9 +3003,9 @@ def _audit_runtime_profile_outputs(
             and power_match.group(1) == junction_match.group(1)
             and type(value.get("power_cap_uw")) is int
             and value.get("power_cap_uw") > 0
-            and value.get("power_cap_uw") <= 315_000_000
+            and value.get("power_cap_uw") <= 400_000_000
             and type(value.get("maximum_power_cap_uw")) is int
-            and value.get("maximum_power_cap_uw") == 315_000_000
+            and value.get("maximum_power_cap_uw") == 400_000_000
             and type(value.get("junction_temperature_millic")) is int
             and value.get("junction_temperature_millic") >= 0
             and value.get("junction_temperature_millic") <= 85_000

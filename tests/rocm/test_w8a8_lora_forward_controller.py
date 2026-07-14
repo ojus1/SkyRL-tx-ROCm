@@ -387,7 +387,7 @@ def test_contract_fixes_profiler_handoff_and_one_shot_counts() -> None:
         "sensor_grace_seconds": 15.0,
         "terminate_grace_seconds": 0.5,
         "maximum_sampled_junction_temperature_c": 90.0,
-        "maximum_sampled_average_gpu_power_watts": 315.0,
+        "maximum_sampled_average_gpu_power_watts": 400.0,
         "maximum_sampled_sysfs_vram_gib": 2.0,
         "minimum_host_available_gib": 0.0,
         "maximum_swap_gib": 8.0,
@@ -534,7 +534,7 @@ def test_profile_command_is_exact_and_passes_only_the_lock_fd(tmp_path: Path) ->
     assert value("--sensor-grace-seconds") == "15.0"
     assert value("--terminate-grace-seconds") == "0.5"
     assert value("--max-junction-temp-c") == "90.0"
-    assert value("--max-gpu-power-watts") == "315.0"
+    assert value("--max-gpu-power-watts") == "400.0"
     assert value("--max-vram-gib") == "2.0"
     assert value("--min-host-available-gib") == "0.0"
     assert value("--max-swap-gib") == "8.0"
@@ -1732,7 +1732,7 @@ def test_evidence_audit_reparses_raw_ir_and_requires_two_measured_samples(
             "gpu": {"card": "card1", "device_id": "0x744c"},
             "safety_limits": {
                 "max_junction_temp_c": 90.0,
-                "max_gpu_power_watts": 315.0,
+                "max_gpu_power_watts": 400.0,
                 "max_vram_bytes": 2.0 * 1024**3,
                 "min_host_available_bytes": 0.0,
                 "max_swap_bytes": 8.0 * 1024**3,
@@ -2315,8 +2315,8 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
     }
     hardware_limits = {
         "power_cap_path": f"{device_root}/hwmon/hwmon4/power1_cap",
-        "power_cap_uw": 315_000_000,
-        "maximum_power_cap_uw": 315_000_000,
+        "power_cap_uw": 400_000_000,
+        "maximum_power_cap_uw": 400_000_000,
         "junction_path": f"{device_root}/hwmon/hwmon4/temp2_input",
         "junction_temperature_millic": 85_000,
         "maximum_launch_junction_millic": 85_000,
@@ -2775,7 +2775,7 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             },
             "safety_limits": {
                 "max_junction_temp_c": 90.0,
-                "max_gpu_power_watts": 315.0,
+                "max_gpu_power_watts": 400.0,
                 "max_vram_bytes": 2.0 * 1024**3,
                 "min_host_available_bytes": 0.0,
                 "max_swap_bytes": 8.0 * 1024**3,

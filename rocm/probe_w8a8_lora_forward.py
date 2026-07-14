@@ -5,7 +5,7 @@ Abstract mode refuses without JAX.  The sole ROCm contract is one logical
 ``M=3,K=64,N=17`` BF16/W8-group64/rank-8 forward using full physical
 ``M=16,N=32`` Pallas tiles.  A controller holds SkyRL's global ROCm lock and
 the child validates the exact headless RX 7900 XTX, clean boot, sole
-command-buffer-disable flag, and hardware power cap no greater than 315 W.
+command-buffer-disable flag, and hardware power cap no greater than 400 W.
 Compile never invokes the executable.  Execute requalifies the fresh gfx1100
 object, then performs one input transfer, one invocation, one output transfer,
 and a host comparison.  This probe has no backward, warmup, replay, benchmark,
@@ -43,7 +43,7 @@ _ROW_SUPERBLOCK = 16
 _SCALING = 0.75
 _COMMAND_BUFFER_FLAG = "--xla_gpu_enable_command_buffer="
 _EXPECTED_DEVICE_ID = "0x744c"
-_MAX_HARDWARE_POWER_CAP_UW = 315_000_000
+_MAX_HARDWARE_POWER_CAP_UW = 400_000_000
 _MAX_TEMP_BYTES = 256 * 1024**2
 _MAX_TOTAL_BYTES = 512 * 1024**2
 _MAX_ARTIFACT_FILES = 256
@@ -742,7 +742,7 @@ def _validate_controller_supervision(
         "--max-junction-temp-c",
         "90.0",
         "--max-gpu-power-watts",
-        "315.0",
+        "400.0",
         "--max-vram-gib",
         "2.0",
         "--min-host-available-gib",
@@ -957,7 +957,7 @@ def _read_hardware_limits(device: Path) -> dict[str, Any]:
     power_cap = _read_int_with_wake_retry(cap_path, "hardware power cap")
     if power_cap <= 0 or power_cap > _MAX_HARDWARE_POWER_CAP_UW:
         raise RuntimeError(
-            f"hardware power cap {power_cap} uW exceeds the 315 W contract"
+            f"hardware power cap {power_cap} uW exceeds the 400 W contract"
         )
     junction_path: Path | None = None
     for label_path in sorted(hwmons[0].glob("temp[0-9]*_label")):

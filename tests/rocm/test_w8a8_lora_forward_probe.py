@@ -894,7 +894,9 @@ def test_hardware_launch_gate_requires_power_and_temperature_margin(
 
     assert result["power_cap_uw"] == 300_000_000
     assert result["junction_temperature_millic"] == 84_000
-    (hwmon / "power1_cap").write_text("315000001\n")
+    (hwmon / "power1_cap").write_text("400000000\n")
+    assert _PROBE._read_hardware_limits(device)["power_cap_uw"] == 400_000_000
+    (hwmon / "power1_cap").write_text("400000001\n")
     with pytest.raises(RuntimeError, match="exceeds"):
         _PROBE._read_hardware_limits(device)
     (hwmon / "power1_cap").write_text("300000000\n")
@@ -1444,7 +1446,7 @@ def _prepare_fake_rocm_execute(
     def hardware_limits(_device_root):
         operations.append("hardware_limits")
         return {
-            "power_cap_uw": 315_000_000,
+            "power_cap_uw": 400_000_000,
             "junction_temperature_millic": 40_000,
         }
 

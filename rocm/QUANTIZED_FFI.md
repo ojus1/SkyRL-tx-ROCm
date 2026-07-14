@@ -166,12 +166,12 @@ warmup, repetition, replay, GPU reference, device-side error reduction, graph,
 model, or benchmark path, and it cannot promote the runtime or model path.
 
 The controller fixes sampled-sysfs thresholds of 2 GiB VRAM, 90 C junction,
-and 315 W `power1_average`, plus an 85 C child launch gate, 300-second child
+and 400 W `power1_average`, plus an 85 C child launch gate, 300-second child
 timeout, 330-second independent supervisor watchdog, and relaxed 0 GiB
 host-available/8 GiB swap limits. It records and bounds the largest observed
 sample gap, but this remains reactive evidence rather than a continuous
 measurement. The child also refuses a reported hardware `power1_cap` above
-315 W; that configuration still does not prove that every instantaneous
+400 W; that configuration still does not prove that every instantaneous
 electrical transient stayed below the cap. The process uses a fresh private
 7.5%-of-VRAM BFC allocator limit and fresh JAX,
 Triton, compiler-dump, and `TF_XLA_HSACO_CACHE_DIR` directories. Longer compile
