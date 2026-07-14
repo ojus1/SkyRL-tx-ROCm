@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import inspect
 import json
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -42,6 +44,57 @@ _NUMERICS_RESULT_SHAPES = (
     (8, 18432),
 )
 
+_EXPECTED_PROGRAM_STRUCTURES = {
+    "reference_forward": {"dot_general_count": 3, "pallas_calls": []},
+    "candidate_forward": {
+        "dot_general_count": 1,
+        "pallas_calls": [
+            {
+                "name": "skyrl_qwen35_bf16_rms_materialize_lora_a_forward",
+                "grid": [4],
+                "outputs": [
+                    {"shape": [64, 2560], "dtype": "bfloat16"},
+                    {"shape": [64, 8], "dtype": "bfloat16"},
+                    {"shape": [64], "dtype": "float32"},
+                    {"shape": [64], "dtype": "float32"},
+                ],
+            },
+            {
+                "name": ("skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_forward"),
+                "grid": [4, 288],
+                "outputs": [{"shape": [64, 9216], "dtype": "bfloat16"}],
+            },
+        ],
+    },
+    "reference_forward_and_vjp": {
+        "dot_general_count": 8,
+        "pallas_calls": [],
+    },
+    "candidate_forward_and_vjp": {
+        "dot_general_count": 6,
+        "pallas_calls": [
+            {
+                "name": "skyrl_qwen35_bf16_rms_materialize_lora_a_forward",
+                "grid": [4],
+                "outputs": [
+                    {"shape": [64, 2560], "dtype": "bfloat16"},
+                    {"shape": [64, 8], "dtype": "bfloat16"},
+                    {"shape": [64], "dtype": "float32"},
+                    {"shape": [64], "dtype": "float32"},
+                ],
+            },
+            {
+                "name": ("skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_" "residual_forward"),
+                "grid": [4, 288],
+                "outputs": [
+                    {"shape": [64, 9216], "dtype": "bfloat16"},
+                    {"shape": [64, 18432], "dtype": "bfloat16"},
+                ],
+            },
+        ],
+    },
+}
+
 
 def _host_bf16_arguments() -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
     forward_arguments = tuple(np.zeros((1,), dtype=bfloat16) for _ in range(6))
@@ -50,9 +103,7 @@ def _host_bf16_arguments() -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ..
 
 
 def _numerics_result_tree(value: float = 1.0) -> tuple[np.ndarray, ...]:
-    return tuple(
-        np.full(shape, value, dtype=bfloat16) for shape in _NUMERICS_RESULT_SHAPES
-    )
+    return tuple(np.full(shape, value, dtype=bfloat16) for shape in _NUMERICS_RESULT_SHAPES)
 
 
 def _mock_host_input_manifest(
@@ -113,9 +164,7 @@ class _FakeDeviceLeaf:
 
 
 class _FakeJax:
-    def __init__(
-        self, device: _FakeDevice, staged_inputs: tuple[_FakeDeviceLeaf, ...]
-    ) -> None:
+    def __init__(self, device: _FakeDevice, staged_inputs: tuple[_FakeDeviceLeaf, ...]) -> None:
         self.device = device
         self.staged_inputs = staged_inputs
         self.device_put_calls: list[tuple[tuple[object, ...], _FakeDevice]] = []
@@ -123,16 +172,12 @@ class _FakeJax:
         self.clear_caches_calls = 0
         self.effects_barrier_calls = 0
 
-    def device_put(
-        self, arguments: tuple[object, ...], *, device: _FakeDevice
-    ) -> tuple[_FakeDeviceLeaf, ...]:
+    def device_put(self, arguments: tuple[object, ...], *, device: _FakeDevice) -> tuple[_FakeDeviceLeaf, ...]:
         assert device is self.device
         self.device_put_calls.append((arguments, device))
         return self.staged_inputs
 
-    def device_get(
-        self, arguments: tuple[_FakeDeviceLeaf, ...]
-    ) -> tuple[_FakeDeviceLeaf, ...]:
+    def device_get(self, arguments: tuple[_FakeDeviceLeaf, ...]) -> tuple[_FakeDeviceLeaf, ...]:
         self.device_get_calls.append(arguments)
         return arguments
 
@@ -183,9 +228,7 @@ def _install_benchmark_watchdog_mocks(
         )
         events.append(("armed", identifier, None))
 
-    def settle_watchdog(
-        state: dict[str, object], *, invocation_completed: bool
-    ) -> None:
+    def settle_watchdog(state: dict[str, object], *, invocation_completed: bool) -> None:
         identifier = int(state["identifier"])
         assert state["settled"] is False
         state["settled"] = True
@@ -201,19 +244,12 @@ def _install_benchmark_device_mocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[_FakeJax, _FakeDevice, tuple[_FakeDeviceLeaf, ...]]:
     device = _FakeDevice()
-    staged_inputs = tuple(
-        _FakeDeviceLeaf(shape, device) for _name, shape in probe._INPUT_SPECS
-    )
+    staged_inputs = tuple(_FakeDeviceLeaf(shape, device) for _name, shape in probe._INPUT_SPECS)
     jax = _FakeJax(device, staged_inputs)
 
-    def validate_roundtrip(
-        roundtrip: object, host_manifest: dict[str, object]
-    ) -> dict[str, object]:
+    def validate_roundtrip(roundtrip: object, host_manifest: dict[str, object]) -> dict[str, object]:
         assert type(roundtrip) is tuple
-        assert all(
-            actual is expected
-            for actual, expected in zip(roundtrip, staged_inputs, strict=True)
-        )
+        assert all(actual is expected for actual, expected in zip(roundtrip, staged_inputs, strict=True))
         assert tuple(host_manifest) == tuple(name for name, _shape in probe._INPUT_SPECS)
         return {"all_hashes_match": True}
 
@@ -224,12 +260,8 @@ def _install_benchmark_device_mocks(
         return block_until_ready() if callable(block_until_ready) else value
 
     monkeypatch.setattr(probe, "_block_tree", block_tree)
-    monkeypatch.setattr(
-        probe, "_host_input_manifest", _mock_benchmark_host_input_manifest
-    )
-    monkeypatch.setattr(
-        probe, "_validate_device_input_roundtrip", validate_roundtrip
-    )
+    monkeypatch.setattr(probe, "_host_input_manifest", _mock_benchmark_host_input_manifest)
+    monkeypatch.setattr(probe, "_validate_device_input_roundtrip", validate_roundtrip)
     return jax, device, staged_inputs
 
 
@@ -262,7 +294,7 @@ def _clear_accelerator_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_exact_contract_fixes_geometry_target_limits_capture_and_gates() -> None:
     assert probe._exact_contract() == {
-        "case": "qwen35_b1_t64_bf16_rms_gate_up_lora_swiglu",
+        "case": "qwen35_b1_t64_bf16_rms_gate_up_lora_swiglu_contiguous_v1",
         "geometry": {
             "batch_size": 1,
             "sequence_length": 64,
@@ -274,7 +306,12 @@ def test_exact_contract_fixes_geometry_target_limits_capture_and_gates() -> None
             "dtype": "bfloat16",
             "eps": 1e-6,
         },
-        "initial_tiles": {"block_m": 16, "pair_block_n": 32, "block_k": 64},
+        "initial_tiles": {
+            "block_m": 16,
+            "block_physical_n": 64,
+            "block_k": 32,
+        },
+        "program_structures": _EXPECTED_PROGRAM_STRUCTURES,
         "target": {
             "drm_card": "card1",
             "pci_id": "1002:744c",
@@ -397,6 +434,39 @@ def test_exact_contract_fixes_geometry_target_limits_capture_and_gates() -> None
     }
 
 
+def test_program_structure_harness_records_nested_pallas_contract() -> None:
+    assert probe._expected_program_structures() == _EXPECTED_PROGRAM_STRUCTURES
+
+    dot = SimpleNamespace(
+        primitive=SimpleNamespace(name="dot_general"),
+        params={},
+        outvars=(),
+    )
+    kernel_jaxpr = SimpleNamespace(eqns=[dot])
+    pallas_call = SimpleNamespace(
+        primitive=SimpleNamespace(name="pallas_call"),
+        params={
+            "name": "test_contiguous_program",
+            "grid_mapping": SimpleNamespace(grid=(4, 288)),
+            "jaxpr": kernel_jaxpr,
+        },
+        outvars=(SimpleNamespace(aval=SimpleNamespace(shape=(64, 9216), dtype=np.dtype(bfloat16))),),
+    )
+    closed = SimpleNamespace(jaxpr=SimpleNamespace(eqns=[pallas_call]))
+    fake_jax = SimpleNamespace(make_jaxpr=lambda _callable: lambda *_arguments: closed)
+
+    assert probe._program_structure_manifest(fake_jax, object(), ()) == {
+        "dot_general_count": 1,
+        "pallas_calls": [
+            {
+                "name": "test_contiguous_program",
+                "grid": [4, 288],
+                "outputs": [{"shape": [64, 9216], "dtype": "bfloat16"}],
+            }
+        ],
+    }
+
+
 def test_numerics_gate_uses_exclusive_three_percent_for_every_result() -> None:
     assert probe._numerics_gate_passed(_valid_errors())
 
@@ -454,7 +524,7 @@ def test_parser_requires_double_ack_and_exact_production_geometry(
         args.product_features,
         args.rank,
     ) == (1, 64, 64, 2560, 18432, 9216, 8)
-    assert (args.block_m, args.block_n, args.block_k) == (16, 32, 64)
+    assert (args.block_m, args.block_physical_n, args.block_k) == (16, 64, 32)
     assert args.eps == 1e-6
 
     with pytest.raises(SystemExit):
@@ -462,9 +532,7 @@ def test_parser_requires_double_ack_and_exact_production_geometry(
     with pytest.raises(SystemExit):
         probe._parse_args(["--allow-gpu", "--output", str(output)])
     with pytest.raises(SystemExit):
-        probe._parse_args(
-            ["--allow-gpu", "--compile-only", "--execute", "--output", str(output)]
-        )
+        probe._parse_args(["--allow-gpu", "--compile-only", "--execute", "--output", str(output)])
 
     for flag, value in (
         ("--batch-size", "2"),
@@ -477,9 +545,7 @@ def test_parser_requires_double_ack_and_exact_production_geometry(
         ("--eps", "1e-5"),
     ):
         with pytest.raises(SystemExit):
-            probe._parse_args(
-                ["--allow-gpu", "--compile-only", "--output", str(output), flag, value]
-            )
+            probe._parse_args(["--allow-gpu", "--compile-only", "--output", str(output), flag, value])
 
 
 def test_parser_allows_zero_compile_samples_but_rejects_unguarded_execute(
@@ -532,12 +598,12 @@ def test_parser_requires_exact_guarded_forward_once_contract(tmp_path: Path) -> 
     assert args.progress_output == progress
     assert args.compile_evidence == evidence
     assert args.compile_profile_summary == profile_summary
-    assert (args.block_m, args.block_n, args.block_k) == (16, 32, 64)
+    assert (args.block_m, args.block_physical_n, args.block_k) == (16, 64, 32)
 
     for mutation in (
         ["--block-m", "32"],
-        ["--block-n", "16"],
-        ["--block-k", "32"],
+        ["--block-physical-n", "128"],
+        ["--block-k", "64"],
         ["--warmups", "1"],
         ["--iterations", "1"],
     ):
@@ -616,13 +682,13 @@ def test_parser_requires_exact_guarded_numerics_once_contract(tmp_path: Path) ->
     assert args.progress_output == progress
     assert args.compile_evidence == evidence
     assert args.compile_profile_summary == profile_summary
-    assert (args.block_m, args.block_n, args.block_k) == (16, 32, 64)
+    assert (args.block_m, args.block_physical_n, args.block_k) == (16, 64, 32)
     assert (args.warmups, args.iterations) == (0, 0)
 
     for mutation in (
         ["--block-m", "32"],
-        ["--block-n", "16"],
-        ["--block-k", "32"],
+        ["--block-physical-n", "128"],
+        ["--block-k", "64"],
         ["--warmups", "1"],
         ["--iterations", "1"],
     ):
@@ -715,7 +781,7 @@ def test_parser_requires_exact_guarded_benchmark_contract(
     assert args.compile_profile_summary == compile_summary
     assert args.numerics_evidence == numerics_evidence
     assert args.numerics_profile_summary == numerics_summary
-    assert (args.block_m, args.block_n, args.block_k) == (16, 32, 64)
+    assert (args.block_m, args.block_physical_n, args.block_k) == (16, 64, 32)
 
     for required_flag in (
         "--progress-output",
@@ -734,16 +800,14 @@ def test_parser_requires_exact_guarded_benchmark_contract(
         ["--warmups", str(warmups + 1)],
         ["--iterations", str(iterations + 1)],
         ["--block-m", "32"],
-        ["--block-n", "16"],
-        ["--block-k", "32"],
+        ["--block-physical-n", "128"],
+        ["--block-k", "64"],
     ):
         with pytest.raises(SystemExit):
             probe._parse_args([*base, *mutation])
 
     relative_numerics = list(base)
-    relative_numerics[relative_numerics.index(str(numerics_evidence))] = (
-        "numerics.jsonl"
-    )
+    relative_numerics[relative_numerics.index(str(numerics_evidence))] = "numerics.jsonl"
     with pytest.raises(SystemExit):
         probe._parse_args(relative_numerics)
 
@@ -756,21 +820,15 @@ def test_parser_rejects_unsupported_or_nondivisible_tiles(tmp_path: Path) -> Non
     output = (tmp_path / "probe.jsonl").resolve()
     for flag, value in (
         ("--block-m", "128"),
-        ("--block-n", "48"),
+        ("--block-physical-n", "48"),
         ("--block-k", "128"),
     ):
         with pytest.raises(SystemExit):
-            probe._parse_args(
-                ["--allow-gpu", "--compile-only", "--output", str(output), flag, value]
-            )
+            probe._parse_args(["--allow-gpu", "--compile-only", "--output", str(output), flag, value])
 
-    block_m = probe._parse_args(
-        ["--allow-gpu", "--compile-only", "--output", str(output), "--block-m", "32"]
-    )
+    block_m = probe._parse_args(["--allow-gpu", "--compile-only", "--output", str(output), "--block-m", "32"])
     assert block_m.block_m == 32
-    block_k = probe._parse_args(
-        ["--allow-gpu", "--compile-only", "--output", str(output), "--block-k", "32"]
-    )
+    block_k = probe._parse_args(["--allow-gpu", "--compile-only", "--output", str(output), "--block-k", "32"])
     assert block_k.block_k == 32
 
 
@@ -792,9 +850,7 @@ def test_forward_once_scope_requires_exact_shared_systemd_cgroup(
     kill_path.parent.mkdir(parents=True)
     kill_path.touch()
 
-    manifest, descriptor = probe._require_forward_once_scope(
-        parent_pid, proc_root=proc_root, cgroup_root=cgroup_root
-    )
+    manifest, descriptor = probe._require_forward_once_scope(parent_pid, proc_root=proc_root, cgroup_root=cgroup_root)
     try:
         assert manifest["validated"] is True
         assert manifest["scope_unit"] == "skyrl-bf16-forward-4242-abc123.scope"
@@ -806,9 +862,7 @@ def test_forward_once_scope_requires_exact_shared_systemd_cgroup(
 
     (proc_root / str(parent_pid) / "cgroup").write_text("0::/other.scope\n")
     with pytest.raises(RuntimeError, match="not in the same cgroup"):
-        probe._require_forward_once_scope(
-            parent_pid, proc_root=proc_root, cgroup_root=cgroup_root
-        )
+        probe._require_forward_once_scope(parent_pid, proc_root=proc_root, cgroup_root=cgroup_root)
 
 
 @pytest.mark.parametrize(
@@ -824,10 +878,7 @@ def test_benchmark_scope_requires_mode_specific_private_systemd_cgroup(
     proc_root = tmp_path / "proc"
     cgroup_root = tmp_path / "cgroup"
     parent_pid = 4242
-    scope = (
-        f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/"
-        f"app.slice/{scope_unit}"
-    )
+    scope = f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/" f"app.slice/{scope_unit}"
     (proc_root / "self").mkdir(parents=True)
     (proc_root / str(parent_pid)).mkdir(parents=True)
     (proc_root / "self" / "cgroup").write_text(f"0::{scope}\n")
@@ -875,13 +926,10 @@ def test_compile_evidence_is_exactly_source_git_and_zero_invocations_bound(
         "dtype": "bfloat16",
         "eps": 1e-6,
         "block_m": 16,
-        "pair_block_n": 32,
-        "block_k": 64,
+        "block_physical_n": 64,
+        "block_k": 32,
     }
-    source = {
-        name: {"path": f"/repo/{name}.py", "sha256": name * 8}
-        for name in ("kernel", "probe", "profiler")
-    }
+    source = {name: {"path": f"/repo/{name}.py", "sha256": name * 8} for name in ("kernel", "probe", "profiler")}
     git = {
         "commit": "a" * 40,
         "branch": "main",
@@ -903,7 +951,13 @@ def test_compile_evidence_is_exactly_source_git_and_zero_invocations_bound(
         "numpy": "test",
     }
     compilation = {
-        name: {"lower_calls": 1, "compile_calls": 1}
+        name: {
+            "lower_calls": 1,
+            "compile_calls": 1,
+            "lower_seconds": 0.1,
+            "compile_seconds": 0.2,
+            "program_structure": copy.deepcopy(_EXPECTED_PROGRAM_STRUCTURES[name]),
+        }
         for name in (
             "reference_forward_and_vjp",
             "candidate_forward_and_vjp",
@@ -912,7 +966,7 @@ def test_compile_evidence_is_exactly_source_git_and_zero_invocations_bound(
         )
     }
     payload = {
-        "schema_version": 1,
+        "schema_version": probe._EVIDENCE_SCHEMA_VERSION,
         "mode": "compile_only",
         "passed": True,
         "contract": probe._exact_contract(),
@@ -985,6 +1039,40 @@ def test_compile_evidence_is_exactly_source_git_and_zero_invocations_bound(
     assert manifest["zero_executable_invocations"] is True
     assert manifest["commit"] == "a" * 40
 
+    for invalid_schema in (1, True):
+        payload["schema_version"] = invalid_schema
+        evidence.unlink()
+        evidence.write_text(json.dumps(payload) + "\n")
+        evidence.chmod(0o600)
+        with pytest.raises(RuntimeError, match="schema is not exact"):
+            probe._validate_compile_evidence(
+                evidence,
+                expected_contract=probe._exact_contract(),
+                expected_geometry=geometry,
+                expected_source=source,
+                expected_git=git,
+                expected_device=device,
+                expected_packages=packages,
+            )
+    payload["schema_version"] = probe._EVIDENCE_SCHEMA_VERSION
+
+    candidate_structure = payload["compilation"]["candidate_forward"]["program_structure"]
+    candidate_structure["pallas_calls"][1]["grid"] = [4, 144]
+    evidence.unlink()
+    evidence.write_text(json.dumps(payload) + "\n")
+    evidence.chmod(0o600)
+    with pytest.raises(RuntimeError, match="program structure is not exact"):
+        probe._validate_compile_evidence(
+            evidence,
+            expected_contract=probe._exact_contract(),
+            expected_geometry=geometry,
+            expected_source=source,
+            expected_git=git,
+            expected_device=device,
+            expected_packages=packages,
+        )
+    candidate_structure["pallas_calls"][1]["grid"] = [4, 288]
+
     payload["invocation_contract"]["total_executable_invocations"] = 1
     evidence.unlink()
     evidence.write_text(json.dumps(payload) + "\n")
@@ -1036,9 +1124,7 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
     exact_once = dict.fromkeys(probe._PROGRAM_ORDER, 1)
     errors = _valid_errors()
 
-    progress_records: list[dict[str, object]] = [
-        {"event": "host_inputs_ready", "mode": "numerics_once"}
-    ]
+    progress_records: list[dict[str, object]] = [{"event": "host_inputs_ready", "mode": "numerics_once"}]
     for program in probe._PROGRAM_ORDER:
         progress_records.extend(
             (
@@ -1065,9 +1151,7 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
         }
     )
     progress = (tmp_path / "numerics-progress.jsonl").resolve()
-    progress_raw = "".join(
-        json.dumps(record, allow_nan=False) + "\n" for record in progress_records
-    ).encode()
+    progress_raw = "".join(json.dumps(record, allow_nan=False) + "\n" for record in progress_records).encode()
     progress.write_bytes(progress_raw)
     progress.chmod(0o600)
     progress_time = 1_700_000_000_000_000_000
@@ -1085,7 +1169,7 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
         "sensor_grace_seconds": 15.0,
     }
     payload = {
-        "schema_version": 1,
+        "schema_version": probe._EVIDENCE_SCHEMA_VERSION,
         "mode": "numerics_once",
         "passed": True,
         "contract": expected_contract,
@@ -1097,7 +1181,13 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
             "packages": expected_packages,
         },
         "compilation": {
-            program: {"lower_calls": 1, "compile_calls": 1}
+            program: {
+                "lower_calls": 1,
+                "compile_calls": 1,
+                "lower_seconds": 0.1,
+                "compile_seconds": 0.2,
+                "program_structure": copy.deepcopy(_EXPECTED_PROGRAM_STRUCTURES[program]),
+            }
             for program in probe._PROGRAM_ORDER
         },
         "invocation_contract": {
@@ -1183,6 +1273,25 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
     assert manifest["progress_record_count"] == 10
     assert manifest["progress_path"] == str(progress)
 
+    residual_structure = payload["compilation"]["candidate_forward_and_vjp"]["program_structure"]
+    residual_structure["pallas_calls"][1]["name"] = "wrong_residual_program"
+    evidence.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n")
+    evidence.chmod(0o600)
+    os.utime(evidence, ns=(evidence_time, evidence_time))
+    with pytest.raises(RuntimeError, match="program structure is not exact"):
+        probe._validate_numerics_evidence(
+            evidence,
+            expected_contract=expected_contract,
+            expected_geometry=expected_geometry,
+            expected_source=expected_source,
+            expected_git=expected_git,
+            expected_device=expected_device,
+            expected_packages=expected_packages,
+            expected_compile_evidence=expected_compile_evidence,
+            expected_compile_profile_summary=expected_compile_summary,
+        )
+    residual_structure["pallas_calls"][1]["name"] = "skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_residual_forward"
+
     payload["numerics"]["errors"]["dx"]["relative_l2"] = 0.03
     evidence.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n")
     evidence.chmod(0o600)
@@ -1203,7 +1312,7 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
 
 def test_private_json_rejects_duplicate_keys(tmp_path: Path) -> None:
     evidence = tmp_path / "duplicate.json"
-    evidence.write_text('{"schema_version": 1, "schema_version": 1}\n')
+    evidence.write_text('{"schema_version": 2, "schema_version": 2}\n')
     evidence.chmod(0o600)
     with pytest.raises(RuntimeError, match="not strict JSON"):
         probe._read_strict_private_json(evidence)
@@ -1268,10 +1377,10 @@ def test_compile_profile_summary_must_complete_with_observed_safe_limits(
             str(evidence),
             "--block-m",
             "16",
-            "--block-n",
-            "32",
-            "--block-k",
+            "--block-physical-n",
             "64",
+            "--block-k",
+            "32",
             "--warmups",
             "0",
             "--iterations",
@@ -1280,12 +1389,8 @@ def test_compile_profile_summary_must_complete_with_observed_safe_limits(
         "command_recorded": True,
         "passed_file_descriptor_count": 0,
     }
-    telemetry_records = [telemetry_manifest] + [
-        {"record_type": "sample", "ordinal": index} for index in range(31)
-    ]
-    telemetry_path.write_text(
-        "".join(json.dumps(record) + "\n" for record in telemetry_records)
-    )
+    telemetry_records = [telemetry_manifest] + [{"record_type": "sample", "ordinal": index} for index in range(31)]
+    telemetry_path.write_text("".join(json.dumps(record) + "\n" for record in telemetry_records))
     telemetry_path.chmod(0o600)
     telemetry_time = evidence_time + 500_000
     os.utime(telemetry_path, ns=(telemetry_time, telemetry_time))
@@ -1386,10 +1491,10 @@ def test_numerics_profile_summary_binds_exact_prior_gate_command(
             str(compile_summary),
             "--block-m",
             "16",
-            "--block-n",
-            "32",
-            "--block-k",
+            "--block-physical-n",
             "64",
+            "--block-k",
+            "32",
             "--warmups",
             "0",
             "--iterations",
@@ -1444,9 +1549,7 @@ def test_environment_rejects_hidden_accelerator_or_library_overrides(
         "--xla_gpu_enable_command_buffer= --xla_dump_to=/tmp/hlo",
     ),
 )
-def test_environment_rejects_every_nonexact_xla_flag_set(
-    monkeypatch: pytest.MonkeyPatch, flags: str
-) -> None:
+def test_environment_rejects_every_nonexact_xla_flag_set(monkeypatch: pytest.MonkeyPatch, flags: str) -> None:
     _clear_accelerator_environment(monkeypatch)
     monkeypatch.setenv("XLA_FLAGS", flags)
     with pytest.raises(RuntimeError, match="rejects inherited XLA_FLAGS"):
@@ -1491,9 +1594,7 @@ def test_compile_only_workload_returns_before_any_executable_invocation() -> Non
         step_arguments=None,
         forward_arguments=None,
     )
-    assert (
-        result["compile_only_zero_candidate_reference_executable_invocations"] is True
-    )
+    assert result["compile_only_zero_candidate_reference_executable_invocations"] is True
     assert result["invocation_counts"] == {
         "reference_forward": 0,
         "candidate_forward": 0,
@@ -1508,33 +1609,21 @@ def test_compile_only_workload_returns_before_any_executable_invocation() -> Non
     ("mode", "warmups", "measurements"),
     (("benchmark_smoke", 2, 4), ("benchmark", 8, 32)),
 )
-def test_guarded_benchmark_schedule_has_exact_balanced_rotations(
-    mode: str, warmups: int, measurements: int
-) -> None:
+def test_guarded_benchmark_schedule_has_exact_balanced_rotations(mode: str, warmups: int, measurements: int) -> None:
     schedule = probe._benchmark_schedule(mode)
     assert len(schedule) == warmups + measurements
-    assert [item["global_supercycle"] for item in schedule] == list(
-        range(warmups + measurements)
-    )
-    assert [item["phase_supercycle"] for item in schedule[:warmups]] == list(
-        range(warmups)
-    )
-    assert [item["phase_supercycle"] for item in schedule[warmups:]] == list(
-        range(measurements)
-    )
-    assert [item["phase"] for item in schedule] == ["warmup"] * warmups + [
-        "measurement"
-    ] * measurements
+    assert [item["global_supercycle"] for item in schedule] == list(range(warmups + measurements))
+    assert [item["phase_supercycle"] for item in schedule[:warmups]] == list(range(warmups))
+    assert [item["phase_supercycle"] for item in schedule[warmups:]] == list(range(measurements))
+    assert [item["phase"] for item in schedule] == ["warmup"] * warmups + ["measurement"] * measurements
     assert [item["order"] for item in schedule[:warmups]] == [
         probe._BENCHMARK_WARMUP_ORDERS[index % 2] for index in range(warmups)
     ]
     assert [item["order"] for item in schedule[warmups:]] == [
-        probe._BENCHMARK_MEASUREMENT_ROTATION[index % 4]
-        for index in range(measurements)
+        probe._BENCHMARK_MEASUREMENT_ROTATION[index % 4] for index in range(measurements)
     ]
     assert all(
-        len(order) == 4 and set(order) == set(probe._PROGRAM_ORDER)
-        for order in (item["order"] for item in schedule)
+        len(order) == 4 and set(order) == set(probe._PROGRAM_ORDER) for order in (item["order"] for item in schedule)
     )
     flattened = [program for item in schedule for program in item["order"]]
     assert {program: flattened.count(program) for program in probe._PROGRAM_ORDER} == (
@@ -1607,7 +1696,13 @@ def test_forward_once_plan_and_workload_run_only_one_candidate_forward(
             executable=executable,
             arguments=("input",),
             progress_output=progress,
-            binding={"tiles": {"block_m": 16, "pair_block_n": 32, "block_k": 64}},
+            binding={
+                "tiles": {
+                    "block_m": 16,
+                    "block_physical_n": 64,
+                    "block_k": 32,
+                }
+            },
             cgroup_kill_fd=kill_fd,
         )
     finally:
@@ -1717,12 +1812,8 @@ def test_numerics_once_plan_and_workload_run_exact_guarded_order(
     executables = {
         "reference_forward": Executable("reference_forward", result_tree[0]),
         "candidate_forward": Executable("candidate_forward", result_tree[0]),
-        "reference_forward_and_vjp": Executable(
-            "reference_forward_and_vjp", result_tree
-        ),
-        "candidate_forward_and_vjp": Executable(
-            "candidate_forward_and_vjp", result_tree
-        ),
+        "reference_forward_and_vjp": Executable("reference_forward_and_vjp", result_tree),
+        "candidate_forward_and_vjp": Executable("candidate_forward_and_vjp", result_tree),
     }
     watchdogs: list[dict[str, object]] = []
     watchdog_events: list[tuple[str, int, bool | None]] = []
@@ -1838,11 +1929,7 @@ def test_numerics_once_plan_and_workload_run_exact_guarded_order(
         "dispatch_completed",
         "numerics_completed",
     ]
-    dispatch_records = [
-        record
-        for record in records
-        if record["event"] in ("dispatch_started", "dispatch_completed")
-    ]
+    dispatch_records = [record for record in records if record["event"] in ("dispatch_started", "dispatch_completed")]
     assert [record["program"] for record in dispatch_records] == [
         program for program in expected_order for _ in range(2)
     ]
@@ -2068,16 +2155,8 @@ def test_guarded_benchmark_runs_exact_schedule_and_durable_protocol(
     def executable(program: str):
         def invoke(*arguments: object) -> object:
             calls.append(program)
-            assert arguments == (
-                staged_inputs
-                if program.endswith("and_vjp")
-                else staged_inputs[:-1]
-            )
-            specs = (
-                probe._STEP_RESULT_SPECS
-                if program.endswith("and_vjp")
-                else probe._FORWARD_RESULT_SPECS
-            )
+            assert arguments == (staged_inputs if program.endswith("and_vjp") else staged_inputs[:-1])
+            specs = probe._STEP_RESULT_SPECS if program.endswith("and_vjp") else probe._FORWARD_RESULT_SPECS
             leaves = tuple(_FakeDeviceLeaf(shape, device) for _name, shape in specs)
             result_leaves.extend(leaves)
             return leaves if len(leaves) > 1 else leaves[0]
@@ -2111,12 +2190,8 @@ def test_guarded_benchmark_runs_exact_schedule_and_durable_protocol(
     expected_watchdogs = expected_dispatches + 2
     expected_samples = 4 * measurements
     assert calls == expected_calls
-    assert result["warmup_orders"] == [
-        list(item["order"]) for item in schedule[:warmups]
-    ]
-    assert result["measurement_orders"] == [
-        list(item["order"]) for item in schedule[warmups:]
-    ]
+    assert result["warmup_orders"] == [list(item["order"]) for item in schedule[:warmups]]
+    assert result["measurement_orders"] == [list(item["order"]) for item in schedule[warmups:]]
     exact_counts = dict.fromkeys(probe._PROGRAM_ORDER, total_supercycles)
     assert result["invocation_counts"] == exact_counts
     assert result["invocation_completion_counts"] == exact_counts
@@ -2143,9 +2218,7 @@ def test_guarded_benchmark_runs_exact_schedule_and_durable_protocol(
     assert [watchdog["dispatch_ordinal"] for watchdog in result["dispatch_watchdogs"]] == (
         list(range(1, expected_dispatches + 1))
     )
-    assert [watchdog["program"] for watchdog in result["dispatch_watchdogs"]] == (
-        expected_calls
-    )
+    assert [watchdog["program"] for watchdog in result["dispatch_watchdogs"]] == (expected_calls)
     assert result["teardown_watchdog"] == {
         "operation": "device_input_teardown",
         "device_inputs_explicitly_deleted": True,
@@ -2161,9 +2234,7 @@ def test_guarded_benchmark_runs_exact_schedule_and_durable_protocol(
         "timeout_seconds": 5.0,
         "armed_monotonic_ns": watchdogs[-1]["armed_monotonic_ns"],
         "deadline_monotonic_ns": watchdogs[-1]["deadline_monotonic_ns"],
-        "armed_ack_received_monotonic_ns": watchdogs[-1][
-            "armed_ack_received_monotonic_ns"
-        ],
+        "armed_ack_received_monotonic_ns": watchdogs[-1]["armed_ack_received_monotonic_ns"],
         "operation_completed": True,
     }
 
@@ -2197,14 +2268,9 @@ def test_guarded_benchmark_runs_exact_schedule_and_durable_protocol(
         for sample in raw_samples
     )
     assert set(result["raw_samples_by_program"]) == set(probe._PROGRAM_ORDER)
+    assert all(len(result["raw_samples_by_program"][program]) == measurements for program in probe._PROGRAM_ORDER)
     assert all(
-        len(result["raw_samples_by_program"][program]) == measurements
-        for program in probe._PROGRAM_ORDER
-    )
-    assert all(
-        sample["elapsed_seconds"]
-        in result["raw_samples_by_program"][sample["program"]]
-        for sample in raw_samples
+        sample["elapsed_seconds"] in result["raw_samples_by_program"][sample["program"]] for sample in raw_samples
     )
 
     raw_progress = progress.read_bytes()
@@ -2250,9 +2316,7 @@ def test_guarded_benchmark_runs_exact_schedule_and_durable_protocol(
     assert [record["result_leaves_explicitly_deleted"] for record in completed] == [
         4 if program.endswith("and_vjp") else 1 for program in expected_calls
     ]
-    assert records[samples_record_index]["raw_measurement_sample_count"] == (
-        expected_samples
-    )
+    assert records[samples_record_index]["raw_measurement_sample_count"] == (expected_samples)
     assert records[samples_record_index]["raw_samples"] == raw_samples
     assert records[-1]["explicitly_deleted_unique_input_leaves"] == 7
     assert records[-1]["all_device_inputs_ready_before_delete"] is True
@@ -2276,11 +2340,7 @@ def test_benchmark_smoke_dispatch_failure_never_completes_or_calls_later_program
             calls.append(program)
             if len(calls) == 2:
                 raise RuntimeError("synthetic guarded benchmark dispatch failure")
-            specs = (
-                probe._STEP_RESULT_SPECS
-                if program.endswith("and_vjp")
-                else probe._FORWARD_RESULT_SPECS
-            )
+            specs = probe._STEP_RESULT_SPECS if program.endswith("and_vjp") else probe._FORWARD_RESULT_SPECS
             leaves = tuple(_FakeDeviceLeaf(shape, device) for _name, shape in specs)
             result_leaves.extend(leaves)
             return leaves if len(leaves) > 1 else leaves[0]
@@ -2293,9 +2353,7 @@ def test_benchmark_smoke_dispatch_failure_never_completes_or_calls_later_program
     kill_path.touch()
     kill_fd = os.open(kill_path, os.O_WRONLY)
     try:
-        with pytest.raises(
-            RuntimeError, match="synthetic guarded benchmark dispatch failure"
-        ):
+        with pytest.raises(RuntimeError, match="synthetic guarded benchmark dispatch failure"):
             probe._run_guarded_benchmark_workload(
                 mode="benchmark_smoke",
                 jax=jax,
@@ -2370,10 +2428,7 @@ def test_real_forward_once_watchdog_deadline_exists_before_armed_ack(
         watchdog = probe._start_forward_once_watchdog(kill_fd)
         probe._arm_forward_once_watchdog(watchdog)
         assert watchdog["armed"] is True
-        assert (
-            watchdog["deadline_monotonic_ns"] - watchdog["armed_monotonic_ns"]
-            == 5_000_000_000
-        )
+        assert watchdog["deadline_monotonic_ns"] - watchdog["armed_monotonic_ns"] == 5_000_000_000
         assert (
             watchdog["armed_monotonic_ns"]
             <= watchdog["armed_ack_received_monotonic_ns"]
@@ -2462,10 +2517,7 @@ def test_forward_once_exception_never_signals_invocation_completion(
     finally:
         os.close(kill_fd)
     assert completions == [False]
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "failed-progress.jsonl").read_text().splitlines()
-    ]
+    records = [json.loads(line) for line in (tmp_path / "failed-progress.jsonl").read_text().splitlines()]
     assert [record["event"] for record in records] == [
         "compiled_input_ready",
         "dispatch_started",
@@ -2590,22 +2642,14 @@ def test_private_output_is_exclusive_and_owner_only(tmp_path: Path) -> None:
 
 def test_source_orders_fresh_environment_guard_and_clean_boot_postflight() -> None:
     main_source = inspect.getsource(probe.main)
-    assert main_source.index("preloaded =") < main_source.index(
-        "_configure_environment()"
-    )
+    assert main_source.index("preloaded =") < main_source.index("_configure_environment()")
     assert main_source.index("_configure_environment()") < main_source.index("_run(")
-    assert main_source.index("_open_private_file_descriptor(") < main_source.index(
-        "_run("
-    )
-    assert main_source.index("_run(") < main_source.index(
-        "_write_reserved_private_output("
-    )
+    assert main_source.index("_open_private_file_descriptor(") < main_source.index("_run(")
+    assert main_source.index("_run(") < main_source.index("_write_reserved_private_output(")
     assert "guarded_qwen35_rocm_process" in main_source
     assert "finally:" in main_source
     assert "postflight = safety_module.require_clean_amdgpu_boot()" in main_source
 
     workload_source = inspect.getsource(probe._run_compiled_workload)
-    assert workload_source.index('if mode == "compile_only":') < workload_source.index(
-        "def invoke("
-    )
+    assert workload_source.index('if mode == "compile_only":') < workload_source.index("def invoke(")
     assert "executables[key](*arguments)" in workload_source

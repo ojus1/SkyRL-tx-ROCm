@@ -25,8 +25,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_ATTESTATION_TYPE = "bf16_rms_gate_up_lora_swiglu_benchmark_profile_attestation"
+_ATTESTATION_TYPE = "bf16_rms_gate_up_lora_swiglu_contiguous_v1_benchmark_profile_attestation"
 _DISABLE_COMMAND_BUFFERS = "--xla_gpu_enable_command_buffer="
+_EVIDENCE_SCHEMA_VERSION = 2
 _WATCHDOG_SECONDS = 5.0
 _WATCHDOG_NS = 5_000_000_000
 _MIN_FORWARD_VJP_SPEEDUP = 1.10
@@ -123,6 +124,53 @@ _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 
 
+def _expected_program_structures() -> dict[str, Any]:
+    stage_one = {
+        "name": "skyrl_qwen35_bf16_rms_materialize_lora_a_forward",
+        "grid": [4],
+        "outputs": [
+            {"shape": [64, 2560], "dtype": "bfloat16"},
+            {"shape": [64, 8], "dtype": "bfloat16"},
+            {"shape": [64], "dtype": "float32"},
+            {"shape": [64], "dtype": "float32"},
+        ],
+    }
+    return {
+        "reference_forward": {"dot_general_count": 3, "pallas_calls": []},
+        "candidate_forward": {
+            "dot_general_count": 1,
+            "pallas_calls": [
+                stage_one,
+                {
+                    "name": "skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_forward",
+                    "grid": [4, 288],
+                    "outputs": [
+                        {"shape": [64, 9216], "dtype": "bfloat16"},
+                    ],
+                },
+            ],
+        },
+        "reference_forward_and_vjp": {
+            "dot_general_count": 8,
+            "pallas_calls": [],
+        },
+        "candidate_forward_and_vjp": {
+            "dot_general_count": 6,
+            "pallas_calls": [
+                stage_one,
+                {
+                    "name": ("skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_" "residual_forward"),
+                    "grid": [4, 288],
+                    "outputs": [
+                        {"shape": [64, 9216], "dtype": "bfloat16"},
+                        {"shape": [64, 18432], "dtype": "bfloat16"},
+                    ],
+                },
+            ],
+        },
+    }
+
+
 def _expected_contract() -> dict[str, Any]:
     benchmark_common = {
         "compiled_programs": list(_PROGRAM_ORDER),
@@ -135,7 +183,7 @@ def _expected_contract() -> dict[str, Any]:
         "performance_qualification": False,
     }
     return {
-        "case": "qwen35_b1_t64_bf16_rms_gate_up_lora_swiglu",
+        "case": "qwen35_b1_t64_bf16_rms_gate_up_lora_swiglu_contiguous_v1",
         "geometry": {
             "batch_size": 1,
             "sequence_length": 64,
@@ -147,7 +195,12 @@ def _expected_contract() -> dict[str, Any]:
             "dtype": "bfloat16",
             "eps": 1e-6,
         },
-        "initial_tiles": {"block_m": 16, "pair_block_n": 32, "block_k": 64},
+        "initial_tiles": {
+            "block_m": 16,
+            "block_physical_n": 64,
+            "block_k": 32,
+        },
+        "program_structures": _expected_program_structures(),
         "target": {
             "drm_card": "card1",
             "pci_id": "1002:744c",
@@ -223,9 +276,7 @@ def _expected_contract() -> dict[str, Any]:
             "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
             "gradient_cosine_similarity_report_only": True,
             "minimum_forward_and_vjp_speedup": _MIN_FORWARD_VJP_SPEEDUP,
-            "minimum_rematerialized_stage_speedup": (
-                _MIN_REMATERIALIZED_STAGE_SPEEDUP
-            ),
+            "minimum_rematerialized_stage_speedup": (_MIN_REMATERIALIZED_STAGE_SPEEDUP),
             "deterministic_repeat_required": True,
         },
         "authorizes_default_model_enablement": False,
@@ -236,8 +287,8 @@ def _exact_geometry() -> dict[str, Any]:
     return {
         **_expected_contract()["geometry"],
         "block_m": 16,
-        "pair_block_n": 32,
-        "block_k": 64,
+        "block_physical_n": 64,
+        "block_k": 32,
     }
 
 
@@ -250,8 +301,7 @@ def _json_exact(actual: Any, expected: Any) -> bool:
         )
     if isinstance(expected, list):
         return len(actual) == len(expected) and all(
-            _json_exact(left, right)
-            for left, right in zip(actual, expected, strict=True)
+            _json_exact(left, right) for left, right in zip(actual, expected, strict=True)
         )
     return bool(actual == expected)
 
@@ -275,9 +325,7 @@ def _strict_json_loads(raw: bytes) -> Any:
     )
 
 
-def _read_private_bytes(
-    path: Path, *, maximum_bytes: int
-) -> tuple[bytes, dict[str, Any]]:
+def _read_private_bytes(path: Path, *, maximum_bytes: int) -> tuple[bytes, dict[str, Any]]:
     if not path.is_absolute():
         raise RuntimeError("attestation input paths must be absolute")
     resolved = path.resolve(strict=True)
@@ -339,9 +387,7 @@ def _read_private_bytes(
     }
 
 
-def _read_private_json(
-    path: Path, *, maximum_bytes: int = 16 << 20
-) -> tuple[Any, dict[str, Any]]:
+def _read_private_json(path: Path, *, maximum_bytes: int = 16 << 20) -> tuple[Any, dict[str, Any]]:
     raw, manifest = _read_private_bytes(path, maximum_bytes=maximum_bytes)
     try:
         payload = _strict_json_loads(raw)
@@ -471,9 +517,7 @@ def _benchmark_schedule(mode: str) -> tuple[dict[str, Any], ...]:
                 "phase": "warmup",
                 "phase_supercycle": index,
                 "global_supercycle": index,
-                "order": _BENCHMARK_WARMUP_ORDERS[
-                    index % len(_BENCHMARK_WARMUP_ORDERS)
-                ],
+                "order": _BENCHMARK_WARMUP_ORDERS[index % len(_BENCHMARK_WARMUP_ORDERS)],
             }
         )
     for index in range(measurements):
@@ -482,17 +526,13 @@ def _benchmark_schedule(mode: str) -> tuple[dict[str, Any], ...]:
                 "phase": "measurement",
                 "phase_supercycle": index,
                 "global_supercycle": warmups + index,
-                "order": _BENCHMARK_MEASUREMENT_ROTATION[
-                    index % len(_BENCHMARK_MEASUREMENT_ROTATION)
-                ],
+                "order": _BENCHMARK_MEASUREMENT_ROTATION[index % len(_BENCHMARK_MEASUREMENT_ROTATION)],
             }
         )
     return tuple(schedule)
 
 
-def _validate_source_and_runtime(
-    source: Any, *, repo: Path
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _validate_source_and_runtime(source: Any, *, repo: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if not isinstance(source, dict) or set(source) != {
         "kernel",
         "probe",
@@ -502,12 +542,7 @@ def _validate_source_and_runtime(
     }:
         raise RuntimeError("benchmark source/runtime manifest is not exact")
     expected_paths = {
-        "kernel": repo
-        / "skyrl"
-        / "tx"
-        / "kernels"
-        / "rocm"
-        / "bf16_rms_gate_up_lora_swiglu.py",
+        "kernel": repo / "skyrl" / "tx" / "kernels" / "rocm" / "bf16_rms_gate_up_lora_swiglu_contiguous.py",
         "probe": repo / "rocm" / "probe_bf16_rms_gate_up_lora_swiglu.py",
         "profiler": repo / "rocm" / "profile_rocm.py",
     }
@@ -540,9 +575,7 @@ def _validate_source_and_runtime(
     return source_only, git, packages
 
 
-def _validate_embedded_file_manifest(
-    manifest: Any, *, label: str, maximum_bytes: int
-) -> tuple[bytes, dict[str, Any]]:
+def _validate_embedded_file_manifest(manifest: Any, *, label: str, maximum_bytes: int) -> tuple[bytes, dict[str, Any]]:
     if not isinstance(manifest, dict) or not isinstance(manifest.get("path"), str):
         raise RuntimeError(f"{label} file manifest is missing")
     path = Path(manifest["path"])
@@ -553,14 +586,10 @@ def _validate_embedded_file_manifest(
     return raw, actual
 
 
-def _validate_compact_profile_manifest(
-    manifest: Any, *, label: str
-) -> dict[str, Any]:
+def _validate_compact_profile_manifest(manifest: Any, *, label: str) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         raise RuntimeError(f"{label} compact profile manifest is missing")
-    _validate_embedded_file_manifest(
-        manifest, label=f"{label} summary", maximum_bytes=1 << 20
-    )
+    _validate_embedded_file_manifest(manifest, label=f"{label} summary", maximum_bytes=1 << 20)
     if (
         manifest.get("status") != "completed"
         or type(manifest.get("returncode")) is not int
@@ -585,29 +614,21 @@ def _validate_compact_profile_manifest(
     telemetry = manifest.get("telemetry")
     if not isinstance(telemetry, dict):
         raise RuntimeError(f"{label} compact telemetry binding is missing")
-    _validate_embedded_file_manifest(
-        telemetry, label=f"{label} telemetry", maximum_bytes=32 << 20
-    )
+    _validate_embedded_file_manifest(telemetry, label=f"{label} telemetry", maximum_bytes=32 << 20)
     _require_int(
         telemetry.get("record_count"),
         label=f"{label} telemetry record count",
         minimum=2,
     )
-    _require_sha256(
-        telemetry.get("command_sha256"), label=f"{label} command digest"
-    )
-    _require_sha256(
-        telemetry.get("profiler_sha256"), label=f"{label} profiler digest"
-    )
+    _require_sha256(telemetry.get("command_sha256"), label=f"{label} command digest")
+    _require_sha256(telemetry.get("profiler_sha256"), label=f"{label} profiler digest")
     if not isinstance(telemetry.get("evidence_output_path"), str):
         raise RuntimeError(f"{label} evidence output path is missing")
     return manifest
 
 
 def _validate_host_input_manifest(host_inputs: Any) -> dict[str, Any]:
-    if not isinstance(host_inputs, dict) or tuple(host_inputs) != tuple(
-        sorted(name for name, _shape in _INPUT_SPECS)
-    ):
+    if not isinstance(host_inputs, dict) or tuple(host_inputs) != tuple(sorted(name for name, _shape in _INPUT_SPECS)):
         # The result JSON is written with sort_keys=True.
         raise RuntimeError("benchmark host input set is not exact")
     expected = dict(_INPUT_SPECS)
@@ -616,8 +637,7 @@ def _validate_host_input_manifest(host_inputs: Any) -> dict[str, Any]:
         element_count = math.prod(shape)
         if (
             not isinstance(manifest, dict)
-            or set(manifest)
-            != {"shape", "dtype", "element_count", "bytes", "sha256"}
+            or set(manifest) != {"shape", "dtype", "element_count", "bytes", "sha256"}
             or not _json_exact(manifest.get("shape"), list(shape))
             or manifest.get("dtype") != "bfloat16"
             or type(manifest.get("element_count")) is not int
@@ -640,7 +660,9 @@ def _validate_error_manifest(errors: Any) -> dict[str, Any]:
         if not isinstance(manifest, dict):
             raise RuntimeError(f"prior numerics {name} error manifest is malformed")
         relative_l2 = _require_number(
-            manifest.get("relative_l2"), label=f"prior numerics {name} relative L2", minimum=0
+            manifest.get("relative_l2"),
+            label=f"prior numerics {name} relative L2",
+            minimum=0,
         )
         cosine = _require_number(
             manifest.get("cosine_similarity"),
@@ -671,9 +693,7 @@ def _validate_prior_chain(
     compile_manifest = gated.get("compile_evidence")
     if not isinstance(compile_manifest, dict):
         raise RuntimeError("embedded compile evidence manifest is missing")
-    compile_raw, _ = _validate_embedded_file_manifest(
-        compile_manifest, label="compile evidence", maximum_bytes=4 << 20
-    )
+    compile_raw, _ = _validate_embedded_file_manifest(compile_manifest, label="compile evidence", maximum_bytes=4 << 20)
     try:
         compile_result = _strict_json_loads(compile_raw)
     except (UnicodeDecodeError, ValueError) as error:
@@ -682,7 +702,8 @@ def _validate_prior_chain(
     invocation = compile_result.get("invocation_contract") if isinstance(compile_result, dict) else None
     if (
         not isinstance(compile_result, dict)
-        or compile_result.get("schema_version") != 1
+        or type(compile_result.get("schema_version")) is not int
+        or compile_result["schema_version"] != _EVIDENCE_SCHEMA_VERSION
         or compile_result.get("mode") != "compile_only"
         or compile_result.get("passed") is not True
         or not _json_exact(compile_result.get("contract"), contract)
@@ -695,6 +716,7 @@ def _validate_prior_chain(
         or invocation.get("total_executable_invocations") != 0
     ):
         raise RuntimeError("embedded compile evidence is not exact")
+    _validate_compilation(compile_result.get("compilation"))
     if (
         compile_manifest.get("commit") != source["git"]["commit"]
         or compile_manifest.get("zero_executable_invocations") is not True
@@ -702,9 +724,7 @@ def _validate_prior_chain(
         or compile_manifest.get("programs") != sorted(_PROGRAM_ORDER)
     ):
         raise RuntimeError("embedded compact compile binding is not exact")
-    compile_profile = _validate_compact_profile_manifest(
-        gated.get("compile_profile_summary"), label="compile"
-    )
+    compile_profile = _validate_compact_profile_manifest(gated.get("compile_profile_summary"), label="compile")
     if compile_profile["telemetry"].get("evidence_output_path") != compile_manifest["path"]:
         raise RuntimeError("compile profile is not bound to compile evidence")
 
@@ -719,20 +739,15 @@ def _validate_prior_chain(
     except (UnicodeDecodeError, ValueError) as error:
         raise RuntimeError("embedded numerics evidence is not strict JSON") from error
     exact_one = dict.fromkeys(_PROGRAM_ORDER, 1)
-    numerics_invocation = (
-        numerics_result.get("invocation_contract")
-        if isinstance(numerics_result, dict)
-        else None
-    )
+    numerics_invocation = numerics_result.get("invocation_contract") if isinstance(numerics_result, dict) else None
     numerics = numerics_result.get("numerics") if isinstance(numerics_result, dict) else None
-    numerics_gated = (
-        numerics_result.get("numerics_once") if isinstance(numerics_result, dict) else None
-    )
+    numerics_gated = numerics_result.get("numerics_once") if isinstance(numerics_result, dict) else None
     errors = numerics.get("errors") if isinstance(numerics, dict) else None
     _validate_error_manifest(errors)
     if (
         not isinstance(numerics_result, dict)
-        or numerics_result.get("schema_version") != 1
+        or type(numerics_result.get("schema_version")) is not int
+        or numerics_result["schema_version"] != _EVIDENCE_SCHEMA_VERSION
         or numerics_result.get("mode") != "numerics_once"
         or numerics_result.get("passed") is not True
         or not _json_exact(numerics_result.get("contract"), contract)
@@ -740,12 +755,8 @@ def _validate_prior_chain(
         or not _json_exact(numerics_result.get("device"), device)
         or not _json_exact(numerics_result.get("source"), source)
         or not isinstance(numerics_invocation, dict)
-        or not _json_exact(
-            numerics_invocation.get("per_program_executable_invocations"), exact_one
-        )
-        or not _json_exact(
-            numerics_invocation.get("per_program_executable_completions"), exact_one
-        )
+        or not _json_exact(numerics_invocation.get("per_program_executable_invocations"), exact_one)
+        or not _json_exact(numerics_invocation.get("per_program_executable_completions"), exact_one)
         or numerics_invocation.get("total_executable_invocations") != 4
         or not isinstance(numerics, dict)
         or numerics.get("executed") is not True
@@ -753,12 +764,11 @@ def _validate_prior_chain(
         or numerics.get("passed") is not True
         or not isinstance(numerics_gated, dict)
         or not _json_exact(numerics_gated.get("compile_evidence"), compile_manifest)
-        or not _json_exact(
-            numerics_gated.get("compile_profile_summary"), compile_profile
-        )
+        or not _json_exact(numerics_gated.get("compile_profile_summary"), compile_profile)
         or numerics_gated.get("host_inputs_unchanged") is not True
     ):
         raise RuntimeError("embedded numerics evidence is not exact")
+    _validate_compilation(numerics_result.get("compilation"))
     prior_host_inputs = _validate_host_input_manifest(numerics_gated.get("host_inputs"))
     if not _json_exact(prior_host_inputs, gated.get("host_inputs")):
         raise RuntimeError("benchmark inputs do not match prior numerics inputs")
@@ -772,14 +782,10 @@ def _validate_prior_chain(
     ):
         raise RuntimeError("embedded compact numerics binding is not exact")
     progress_manifest = numerics_manifest.get("progress")
-    _validate_embedded_file_manifest(
-        progress_manifest, label="numerics progress", maximum_bytes=16 << 20
-    )
+    _validate_embedded_file_manifest(progress_manifest, label="numerics progress", maximum_bytes=16 << 20)
     if numerics_manifest.get("progress_record_count") != 10:
         raise RuntimeError("embedded numerics progress count is not exact")
-    numerics_profile = _validate_compact_profile_manifest(
-        gated.get("numerics_profile_summary"), label="numerics"
-    )
+    numerics_profile = _validate_compact_profile_manifest(gated.get("numerics_profile_summary"), label="numerics")
     if numerics_profile["telemetry"].get("evidence_output_path") != numerics_manifest["path"]:
         raise RuntimeError("numerics profile is not bound to numerics evidence")
     return {
@@ -825,7 +831,8 @@ def _validate_preflight(
         raise RuntimeError("benchmark inherited XLA flags are not exact")
     inherited = environment.get("inherited")
     if not isinstance(inherited, dict) or any(
-        name not in {
+        name
+        not in {
             "JAX_PLATFORMS",
             "ROCR_VISIBLE_DEVICES",
             "HIP_VISIBLE_DEVICES",
@@ -875,14 +882,11 @@ def _validate_preflight(
         or profiler_parent.get("validated") is not True
         or profiler_parent.get("parent_command_python") != expected_python
         or profiler_parent.get("profiler_path") != source_only["profiler"]["path"]
-        or profiler_parent.get("profiler_sha256")
-        != source_only["profiler"]["sha256"]
+        or profiler_parent.get("profiler_sha256") != source_only["profiler"]["sha256"]
         or not _json_exact(profiler_parent.get("limits"), _EXACT_PROFILE_LIMITS)
     ):
         raise RuntimeError("benchmark profiler-parent binding is not exact")
-    _require_int(
-        profiler_parent.get("parent_pid"), label="profiler parent PID", minimum=1
-    )
+    _require_int(profiler_parent.get("parent_pid"), label="profiler parent PID", minimum=1)
     if not isinstance(profiler_parent.get("parent_executable"), str):
         raise RuntimeError("benchmark profiler executable is missing")
     _require_sha256(
@@ -928,17 +932,11 @@ def _validate_preflight(
         or not isinstance(scope.get("cgroup"), str)
         or not scope["cgroup"].endswith("/" + scope["scope_unit"])
         or not isinstance(scope.get("cgroup_kill_path"), str)
-        or not scope["cgroup_kill_path"].endswith(
-            scope["cgroup"] + "/cgroup.kill"
-        )
+        or not scope["cgroup_kill_path"].endswith(scope["cgroup"] + "/cgroup.kill")
     ):
         raise RuntimeError("benchmark private systemd scope is not exact")
-    _require_int(
-        scope.get("cgroup_kill_device"), label="cgroup.kill device", minimum=0
-    )
-    _require_int(
-        scope.get("cgroup_kill_inode"), label="cgroup.kill inode", minimum=1
-    )
+    _require_int(scope.get("cgroup_kill_device"), label="cgroup.kill device", minimum=0)
+    _require_int(scope.get("cgroup_kill_inode"), label="cgroup.kill inode", minimum=1)
     return {"profiler_timings": timings, "scope": scope, "safety_source": safety_source}
 
 
@@ -949,19 +947,23 @@ def _validate_compilation(compilation: Any) -> dict[str, Any]:
         if (
             not isinstance(manifest, dict)
             or set(manifest)
-            != {"lower_calls", "compile_calls", "lower_seconds", "compile_seconds"}
+            != {
+                "lower_calls",
+                "compile_calls",
+                "lower_seconds",
+                "compile_seconds",
+                "program_structure",
+            }
             or type(manifest.get("lower_calls")) is not int
             or manifest["lower_calls"] != 1
             or type(manifest.get("compile_calls")) is not int
             or manifest["compile_calls"] != 1
         ):
             raise RuntimeError(f"benchmark {program} compilation is not exact")
-        _require_number(
-            manifest["lower_seconds"], label=f"{program} lower time", minimum=0
-        )
-        _require_number(
-            manifest["compile_seconds"], label=f"{program} compile time", minimum=0
-        )
+        _require_number(manifest["lower_seconds"], label=f"{program} lower time", minimum=0)
+        _require_number(manifest["compile_seconds"], label=f"{program} compile time", minimum=0)
+        if not _json_exact(manifest["program_structure"], _expected_program_structures()[program]):
+            raise RuntimeError(f"benchmark {program} program structure is not exact")
     return compilation
 
 
@@ -978,17 +980,14 @@ def _validate_watchdog(
             raise RuntimeError(f"{label} watchdog {name} is not exact")
     if (
         watchdog.get("external_process") is not True
-        or watchdog.get("timeout_action")
-        != "cgroup.kill_then_pidfd_SIGKILL_fallback"
+        or watchdog.get("timeout_action") != "cgroup.kill_then_pidfd_SIGKILL_fallback"
         or watchdog.get("cgroup_wide_timeout_kill") is not True
         or watchdog.get("timeout_seconds") != _WATCHDOG_SECONDS
         or watchdog.get("operation_completed") is not True
     ):
         raise RuntimeError(f"{label} watchdog containment is not exact")
     _require_int(watchdog.get("watchdog_pid"), label=f"{label} watchdog PID", minimum=1)
-    armed = _require_int(
-        watchdog.get("armed_monotonic_ns"), label=f"{label} armed time", minimum=1
-    )
+    armed = _require_int(watchdog.get("armed_monotonic_ns"), label=f"{label} armed time", minimum=1)
     deadline = _require_int(
         watchdog.get("deadline_monotonic_ns"),
         label=f"{label} deadline",
@@ -1004,9 +1003,7 @@ def _validate_watchdog(
     return watchdog
 
 
-def _validate_device_input_evidence(
-    setup_completed: dict[str, Any], host_inputs: dict[str, Any]
-) -> None:
+def _validate_device_input_evidence(setup_completed: dict[str, Any], host_inputs: dict[str, Any]) -> None:
     device_inputs = setup_completed.get("device_inputs")
     roundtrip = setup_completed.get("roundtrip")
     if (
@@ -1092,9 +1089,7 @@ def _validate_progress(
     ):
         raise RuntimeError("benchmark progress manifest is not exact")
     progress_path = Path(progress_manifest["path"])
-    progress_raw, progress_file = _read_private_bytes(
-        progress_path, maximum_bytes=32 << 20
-    )
+    progress_raw, progress_file = _read_private_bytes(progress_path, maximum_bytes=32 << 20)
     if (
         not progress_raw.endswith(b"\n")
         or progress_manifest.get("bytes") != len(progress_raw)
@@ -1130,11 +1125,7 @@ def _validate_progress(
         "host_inputs_ready",
         "device_input_setup_started",
         "device_input_setup_completed",
-        *(
-            event
-            for _dispatch in dispatches
-            for event in ("dispatch_started", "dispatch_completed")
-        ),
+        *(event for _dispatch in dispatches for event in ("dispatch_started", "dispatch_completed")),
         "benchmark_samples_completed",
         "device_input_teardown_started",
         "device_input_teardown_completed",
@@ -1168,26 +1159,18 @@ def _validate_progress(
         nonlocal previous_monotonic
         if (
             type(record.get("schema_version")) is not int
-            or record["schema_version"] != 1
+            or record["schema_version"] != _EVIDENCE_SCHEMA_VERSION
             or record.get("mode") != mode
             or record.get("probe_pid") != probe_pid
             or not _json_exact(record.get("binding"), expected_binding)
-            or not _json_exact(
-                record.get("invocation_attempt_counts"), attempt_counts
-            )
-            or not _json_exact(
-                record.get("invocation_completion_counts"), completion_counts
-            )
+            or not _json_exact(record.get("invocation_attempt_counts"), attempt_counts)
+            or not _json_exact(record.get("invocation_completion_counts"), completion_counts)
             or not _json_exact(record.get("device_input_setup_counts"), setup_counts)
-            or not _json_exact(
-                record.get("device_input_teardown_counts"), teardown_counts
-            )
+            or not _json_exact(record.get("device_input_teardown_counts"), teardown_counts)
         ):
             raise RuntimeError("benchmark progress common binding/counts are not exact")
         _require_int(record.get("wall_time_ns"), label="progress wall time", minimum=1)
-        monotonic = _require_int(
-            record.get("monotonic_time_ns"), label="progress monotonic time", minimum=1
-        )
+        monotonic = _require_int(record.get("monotonic_time_ns"), label="progress monotonic time", minimum=1)
         if monotonic <= previous_monotonic:
             raise RuntimeError("benchmark progress monotonic order is not strict")
         previous_monotonic = monotonic
@@ -1231,10 +1214,8 @@ def _validate_progress(
         },
     )
     if (
-        setup_started.get("watchdog_armed_monotonic_ns")
-        != setup_watchdog["armed_monotonic_ns"]
-        or setup_started.get("watchdog_deadline_monotonic_ns")
-        != setup_watchdog["deadline_monotonic_ns"]
+        setup_started.get("watchdog_armed_monotonic_ns") != setup_watchdog["armed_monotonic_ns"]
+        or setup_started.get("watchdog_deadline_monotonic_ns") != setup_watchdog["deadline_monotonic_ns"]
     ):
         raise RuntimeError("benchmark setup watchdog/progress binding changed")
 
@@ -1269,9 +1250,7 @@ def _validate_progress(
         raise RuntimeError("benchmark dispatch watchdog count is not exact")
     record_index = 3
     expected_samples: list[dict[str, Any]] = []
-    for ordinal, (dispatch, watchdog) in enumerate(
-        zip(dispatches, watchdogs, strict=True), start=1
-    ):
+    for ordinal, (dispatch, watchdog) in enumerate(zip(dispatches, watchdogs, strict=True), start=1):
         program = dispatch["program"]
         attempt_counts[program] += 1
         started = records[record_index]
@@ -1305,10 +1284,8 @@ def _validate_progress(
             },
         )
         if (
-            started.get("watchdog_armed_monotonic_ns")
-            != validated_watchdog["armed_monotonic_ns"]
-            or started.get("watchdog_deadline_monotonic_ns")
-            != validated_watchdog["deadline_monotonic_ns"]
+            started.get("watchdog_armed_monotonic_ns") != validated_watchdog["armed_monotonic_ns"]
+            or started.get("watchdog_deadline_monotonic_ns") != validated_watchdog["deadline_monotonic_ns"]
         ):
             raise RuntimeError("benchmark dispatch watchdog/progress binding changed")
 
@@ -1333,8 +1310,7 @@ def _validate_progress(
         )
         if (
             completed.get("result_leaves_blocked_before_timer_stop") is not True
-            or completed.get("result_leaves_explicitly_deleted")
-            != _RESULT_LEAF_COUNTS[program]
+            or completed.get("result_leaves_explicitly_deleted") != _RESULT_LEAF_COUNTS[program]
             or completed.get("result_references_released_before_completion") is not True
         ):
             raise RuntimeError("benchmark dispatch result deletion is not exact")
@@ -1380,10 +1356,8 @@ def _validate_progress(
         },
     )
     if (
-        teardown_started.get("watchdog_armed_monotonic_ns")
-        != teardown_watchdog["armed_monotonic_ns"]
-        or teardown_started.get("watchdog_deadline_monotonic_ns")
-        != teardown_watchdog["deadline_monotonic_ns"]
+        teardown_started.get("watchdog_armed_monotonic_ns") != teardown_watchdog["armed_monotonic_ns"]
+        or teardown_started.get("watchdog_deadline_monotonic_ns") != teardown_watchdog["deadline_monotonic_ns"]
     ):
         raise RuntimeError("benchmark teardown watchdog/progress binding changed")
 
@@ -1408,8 +1382,7 @@ def _validate_progress(
     )
     if (
         teardown_completed_ns >= teardown_watchdog["deadline_monotonic_ns"]
-        or teardown_completed.get("explicitly_deleted_unique_input_leaves")
-        != len(_INPUT_SPECS)
+        or teardown_completed.get("explicitly_deleted_unique_input_leaves") != len(_INPUT_SPECS)
         or teardown_completed.get("executable_references_cleared") is not True
         or teardown_completed.get("jax_caches_cleared") is not True
         or teardown_completed.get("garbage_collection_completed") is not True
@@ -1452,9 +1425,7 @@ def _validate_measurement(
     warmups, measurements = _BENCHMARK_MODE_COUNTS[mode]
     schedule = _benchmark_schedule(mode)
     expected_warmup_orders = [list(item["order"]) for item in schedule[:warmups]]
-    expected_measurement_orders = [
-        list(item["order"]) for item in schedule[warmups:]
-    ]
+    expected_measurement_orders = [list(item["order"]) for item in schedule[warmups:]]
     measurement = raw_result.get("measurement")
     if (
         not isinstance(measurement, dict)
@@ -1464,26 +1435,16 @@ def _validate_measurement(
         or measurement.get("raw_samples_only") is not True
         or measurement.get("warmup_supercycles") != warmups
         or measurement.get("measured_supercycles") != measurements
-        or not _json_exact(
-            measurement.get("warmup_orders"), expected_warmup_orders
-        )
-        or not _json_exact(
-            measurement.get("measurement_orders"), expected_measurement_orders
-        )
-        or not _json_exact(
-            measurement.get("raw_samples"), progress["expected_samples"]
-        )
+        or not _json_exact(measurement.get("warmup_orders"), expected_warmup_orders)
+        or not _json_exact(measurement.get("measurement_orders"), expected_measurement_orders)
+        or not _json_exact(measurement.get("raw_samples"), progress["expected_samples"])
     ):
         raise RuntimeError("benchmark measurement manifest is not exact")
     by_program = measurement.get("raw_samples_by_program")
     if not isinstance(by_program, dict) or set(by_program) != set(_PROGRAM_ORDER):
         raise RuntimeError("benchmark per-program samples are not exact")
     expected_by_program = {
-        program: [
-            sample["elapsed_seconds"]
-            for sample in progress["expected_samples"]
-            if sample["program"] == program
-        ]
+        program: [sample["elapsed_seconds"] for sample in progress["expected_samples"] if sample["program"] == program]
         for program in _PROGRAM_ORDER
     }
     if not _json_exact(by_program, expected_by_program) or any(
@@ -1491,23 +1452,11 @@ def _validate_measurement(
     ):
         raise RuntimeError("benchmark per-program sample binding changed")
 
-    medians = {
-        program: statistics.median(samples)
-        for program, samples in expected_by_program.items()
-    }
-    forward_speedup = (
-        medians["reference_forward"] / medians["candidate_forward"]
-    )
-    vjp_speedup = (
-        medians["reference_forward_and_vjp"]
-        / medians["candidate_forward_and_vjp"]
-    )
-    reference_rematerialized = (
-        medians["reference_forward"] + medians["reference_forward_and_vjp"]
-    )
-    candidate_rematerialized = (
-        medians["candidate_forward"] + medians["candidate_forward_and_vjp"]
-    )
+    medians = {program: statistics.median(samples) for program, samples in expected_by_program.items()}
+    forward_speedup = medians["reference_forward"] / medians["candidate_forward"]
+    vjp_speedup = medians["reference_forward_and_vjp"] / medians["candidate_forward_and_vjp"]
+    reference_rematerialized = medians["reference_forward"] + medians["reference_forward_and_vjp"]
+    candidate_rematerialized = medians["candidate_forward"] + medians["candidate_forward_and_vjp"]
     rematerialized_speedup = reference_rematerialized / candidate_rematerialized
     if not all(
         math.isfinite(value) and value > 0
@@ -1520,8 +1469,7 @@ def _validate_measurement(
     ):
         raise RuntimeError("benchmark derived performance is not finite")
     gates_passed = bool(
-        vjp_speedup >= _MIN_FORWARD_VJP_SPEEDUP
-        and rematerialized_speedup >= _MIN_REMATERIALIZED_STAGE_SPEEDUP
+        vjp_speedup >= _MIN_FORWARD_VJP_SPEEDUP and rematerialized_speedup >= _MIN_REMATERIALIZED_STAGE_SPEEDUP
     )
     return {
         "raw_samples_by_program": expected_by_program,
@@ -1530,9 +1478,7 @@ def _validate_measurement(
         "forward_and_vjp_speedup": vjp_speedup,
         "rematerialized_stage_speedup": rematerialized_speedup,
         "minimum_forward_and_vjp_speedup": _MIN_FORWARD_VJP_SPEEDUP,
-        "minimum_rematerialized_stage_speedup": (
-            _MIN_REMATERIALIZED_STAGE_SPEEDUP
-        ),
+        "minimum_rematerialized_stage_speedup": (_MIN_REMATERIALIZED_STAGE_SPEEDUP),
         "performance_gates_passed": gates_passed,
         "qualifying_mode": mode == "benchmark",
         "determinism_required_for_integration": True,
@@ -1551,10 +1497,7 @@ def _expected_profile_command(
     warmups, measurements = _BENCHMARK_MODE_COUNTS[mode]
     command = [
         str((repo / ".venv" / "bin" / "python").absolute()),
-        str(
-            (repo / "rocm" / "probe_bf16_rms_gate_up_lora_swiglu.py")
-            .resolve(strict=True)
-        ),
+        str((repo / "rocm" / "probe_bf16_rms_gate_up_lora_swiglu.py").resolve(strict=True)),
         "--allow-gpu",
         "--" + mode.replace("_", "-"),
         "--output",
@@ -1585,10 +1528,10 @@ def _expected_profile_command(
         (
             "--block-m",
             "16",
-            "--block-n",
-            "32",
-            "--block-k",
+            "--block-physical-n",
             "64",
+            "--block-k",
+            "32",
             "--warmups",
             str(warmups),
             "--iterations",
@@ -1609,40 +1552,27 @@ def _validate_profile(
     gated: dict[str, Any],
     smoke_attestation: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if (
-        profile_summary_path.parent != result_path.parent
-        or profile_summary_path.name != "telemetry.jsonl.summary.json"
-    ):
+    if profile_summary_path.parent != result_path.parent or profile_summary_path.name != "telemetry.jsonl.summary.json":
         raise RuntimeError("benchmark profile summary is not the exact result sibling")
-    summary, summary_file = _read_private_json(
-        profile_summary_path, maximum_bytes=1 << 20
-    )
+    summary, summary_file = _read_private_json(profile_summary_path, maximum_bytes=1 << 20)
     telemetry_path = profile_summary_path.with_name("telemetry.jsonl")
-    telemetry_raw, telemetry_file = _read_private_bytes(
-        telemetry_path, maximum_bytes=64 << 20
-    )
+    telemetry_raw, telemetry_file = _read_private_bytes(telemetry_path, maximum_bytes=64 << 20)
     if not telemetry_raw.endswith(b"\n"):
         raise RuntimeError("benchmark telemetry is not complete JSONL")
     try:
-        telemetry = [
-            _strict_json_loads(line) for line in telemetry_raw.splitlines()
-        ]
+        telemetry = [_strict_json_loads(line) for line in telemetry_raw.splitlines()]
     except (UnicodeDecodeError, ValueError) as error:
         raise RuntimeError("benchmark telemetry is not strict JSONL") from error
     if (
         not isinstance(summary, dict)
         or not telemetry
         or not isinstance(telemetry[0], dict)
-        or max(result_file["mtime_ns"], telemetry_file["mtime_ns"])
-        >= summary_file["mtime_ns"]
+        or max(result_file["mtime_ns"], telemetry_file["mtime_ns"]) >= summary_file["mtime_ns"]
     ):
         raise RuntimeError("benchmark result/telemetry/summary ordering is not exact")
     manifest = telemetry[0]
     samples = telemetry[1:]
-    if any(
-        not isinstance(sample, dict) or sample.get("record_type") != "sample"
-        for sample in samples
-    ):
+    if any(not isinstance(sample, dict) or sample.get("record_type") != "sample" for sample in samples):
         raise RuntimeError("benchmark telemetry sample stream is not exact")
     profiler = raw_result["preflight"]["profiler_parent"]
     expected_limits = {
@@ -1714,9 +1644,7 @@ def _validate_profile(
         raise RuntimeError("benchmark profiler did not complete safely and exactly")
     previous_wall = 0
     for sample in samples:
-        wall = _require_int(
-            sample.get("wall_time_ns"), label="telemetry wall time", minimum=1
-        )
+        wall = _require_int(sample.get("wall_time_ns"), label="telemetry wall time", minimum=1)
         if wall <= previous_wall:
             raise RuntimeError("benchmark telemetry wall-time order is not strict")
         previous_wall = wall
@@ -1727,9 +1655,7 @@ def _validate_profile(
     maxima: dict[str, float] = {}
     for name, limit in _SAFETY_METRIC_LIMITS.items():
         measured_values = [
-            _require_number(
-                sample[name], label=f"telemetry {name}", minimum=0
-            )
+            _require_number(sample[name], label=f"telemetry {name}", minimum=0)
             for sample in samples
             if sample.get("phase") == "measured" and sample.get(name) is not None
         ]
@@ -1787,12 +1713,11 @@ def _validate_raw_result(
     if not isinstance(raw_result, dict):
         raise RuntimeError("benchmark result root is not an object")
     mode = raw_result.get("mode")
-    if mode not in _BENCHMARK_MODE_COUNTS or (
-        expected_mode is not None and mode != expected_mode
-    ):
+    if mode not in _BENCHMARK_MODE_COUNTS or (expected_mode is not None and mode != expected_mode):
         raise RuntimeError("benchmark result mode is not exact")
     if (
-        raw_result.get("schema_version") != 1
+        type(raw_result.get("schema_version")) is not int
+        or raw_result["schema_version"] != _EVIDENCE_SCHEMA_VERSION
         or raw_result.get("passed") is not False
         or raw_result.get("probe_completed") is not True
         or raw_result.get("profile_attested") is not False
@@ -1810,7 +1735,8 @@ def _validate_raw_result(
     device = raw_result.get("device")
     if (
         not isinstance(device, dict)
-        or set(device) != {
+        or set(device)
+        != {
             "backend",
             "device_kind",
             "architecture",
@@ -1823,9 +1749,7 @@ def _validate_raw_result(
         or "rocm" not in device["platform_version"].lower()
     ):
         raise RuntimeError("benchmark device identity is not exact")
-    source_only, git, packages = _validate_source_and_runtime(
-        raw_result.get("source"), repo=repo
-    )
+    source_only, git, packages = _validate_source_and_runtime(raw_result.get("source"), repo=repo)
     _validate_preflight(
         raw_result.get("preflight"),
         mode=mode,
@@ -1863,22 +1787,12 @@ def _validate_raw_result(
     invocation = raw_result.get("invocation_contract")
     if (
         not isinstance(invocation, dict)
-        or not _json_exact(
-            invocation.get("per_program_executable_invocations"), exact_counts
-        )
-        or not _json_exact(
-            invocation.get("per_program_executable_completions"), exact_counts
-        )
-        or invocation.get("reference_executable_invocations")
-        != 2 * (warmups + measurements)
-        or invocation.get("candidate_executable_invocations")
-        != 2 * (warmups + measurements)
-        or invocation.get("total_executable_invocations")
-        != 4 * (warmups + measurements)
-        or invocation.get(
-            "compile_only_zero_candidate_reference_executable_invocations"
-        )
-        is not False
+        or not _json_exact(invocation.get("per_program_executable_invocations"), exact_counts)
+        or not _json_exact(invocation.get("per_program_executable_completions"), exact_counts)
+        or invocation.get("reference_executable_invocations") != 2 * (warmups + measurements)
+        or invocation.get("candidate_executable_invocations") != 2 * (warmups + measurements)
+        or invocation.get("total_executable_invocations") != 4 * (warmups + measurements)
+        or invocation.get("compile_only_zero_candidate_reference_executable_invocations") is not False
     ):
         raise RuntimeError("benchmark invocation contract is not exact")
     if (
@@ -1897,9 +1811,7 @@ def _validate_raw_result(
         or numerics.get("executed") is not False
         or numerics.get("passed") is not True
         or numerics.get("prior_numerics_evidence_verified") is not True
-        or not _json_exact(
-            numerics.get("prior_numerics_evidence"), gated["numerics_evidence"]
-        )
+        or not _json_exact(numerics.get("prior_numerics_evidence"), gated["numerics_evidence"])
         or not _json_exact(
             numerics.get("prior_numerics_profile_summary"),
             gated["numerics_profile_summary"],
@@ -1911,12 +1823,19 @@ def _validate_raw_result(
         or performance_gate.get("passed") is not None
     ):
         raise RuntimeError("benchmark inherited gates are not exact")
-    return mode, raw_result, result_file, gated, smoke_attestation, {
-        "source": source_only,
-        "git": git,
-        "packages": packages,
-        "progress": progress,
-    }
+    return (
+        mode,
+        raw_result,
+        result_file,
+        gated,
+        smoke_attestation,
+        {
+            "source": source_only,
+            "git": git,
+            "packages": packages,
+            "progress": progress,
+        },
+    )
 
 
 def validate_and_attest_benchmark(
@@ -1983,14 +1902,12 @@ def validate_and_attest_benchmark(
     )
     attestor_path = Path(__file__).resolve(strict=True)
     composite = {
-        "schema_version": 1,
+        "schema_version": _EVIDENCE_SCHEMA_VERSION,
         "attestation_type": _ATTESTATION_TYPE,
         "mode": mode,
         "passed": True,
         "attestation_passed": True,
-        "timing_qualified": bool(
-            mode == "benchmark" and performance["performance_gates_passed"]
-        ),
+        "timing_qualified": bool(mode == "benchmark" and performance["performance_gates_passed"]),
         "performance_qualified": False,
         "probe_completed": True,
         "profile_attested": True,
@@ -2033,9 +1950,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--profile-summary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--expected-mode", choices=tuple(_BENCHMARK_MODE_COUNTS), required=True
-    )
+    parser.add_argument("--expected-mode", choices=tuple(_BENCHMARK_MODE_COUNTS), required=True)
     return parser.parse_args(argv)
 
 

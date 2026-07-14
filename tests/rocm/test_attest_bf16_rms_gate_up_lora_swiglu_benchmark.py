@@ -12,6 +12,57 @@ import pytest
 from rocm import attest_bf16_rms_gate_up_lora_swiglu_benchmark as attest
 from rocm import probe_bf16_rms_gate_up_lora_swiglu as probe
 
+_EXPECTED_PROGRAM_STRUCTURES = {
+    "reference_forward": {"dot_general_count": 3, "pallas_calls": []},
+    "candidate_forward": {
+        "dot_general_count": 1,
+        "pallas_calls": [
+            {
+                "name": "skyrl_qwen35_bf16_rms_materialize_lora_a_forward",
+                "grid": [4],
+                "outputs": [
+                    {"shape": [64, 2560], "dtype": "bfloat16"},
+                    {"shape": [64, 8], "dtype": "bfloat16"},
+                    {"shape": [64], "dtype": "float32"},
+                    {"shape": [64], "dtype": "float32"},
+                ],
+            },
+            {
+                "name": ("skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_forward"),
+                "grid": [4, 288],
+                "outputs": [{"shape": [64, 9216], "dtype": "bfloat16"}],
+            },
+        ],
+    },
+    "reference_forward_and_vjp": {
+        "dot_general_count": 8,
+        "pallas_calls": [],
+    },
+    "candidate_forward_and_vjp": {
+        "dot_general_count": 6,
+        "pallas_calls": [
+            {
+                "name": "skyrl_qwen35_bf16_rms_materialize_lora_a_forward",
+                "grid": [4],
+                "outputs": [
+                    {"shape": [64, 2560], "dtype": "bfloat16"},
+                    {"shape": [64, 8], "dtype": "bfloat16"},
+                    {"shape": [64], "dtype": "float32"},
+                    {"shape": [64], "dtype": "float32"},
+                ],
+            },
+            {
+                "name": ("skyrl_qwen35_bf16_contiguous_gate_up_lora_swiglu_" "residual_forward"),
+                "grid": [4, 288],
+                "outputs": [
+                    {"shape": [64, 9216], "dtype": "bfloat16"},
+                    {"shape": [64, 18432], "dtype": "bfloat16"},
+                ],
+            },
+        ],
+    },
+}
+
 
 def _private_dir(path: Path) -> Path:
     path.chmod(0o700)
@@ -22,6 +73,79 @@ def _write_private_json(path: Path, payload: Any) -> Path:
     path.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n")
     path.chmod(0o600)
     return path
+
+
+def _compilation_fixture() -> dict[str, Any]:
+    structures = json.loads(json.dumps(_EXPECTED_PROGRAM_STRUCTURES))
+    return {
+        program: {
+            "lower_calls": 1,
+            "compile_calls": 1,
+            "lower_seconds": 0.1,
+            "compile_seconds": 0.2,
+            "program_structure": structures[program],
+        }
+        for program in attest._PROGRAM_ORDER
+    }
+
+
+def _raw_result_fixture(schema_version: Any) -> dict[str, Any]:
+    mode = "benchmark_smoke"
+    warmups, measurements = attest._BENCHMARK_MODE_COUNTS[mode]
+    count = warmups + measurements
+    per_program = dict.fromkeys(attest._PROGRAM_ORDER, count)
+    progress = {"path": "/tmp/benchmark-smoke.progress.jsonl"}
+    gated = {
+        "compile_evidence": {"path": "/tmp/compile.json"},
+        "compile_profile_summary": {"path": "/tmp/compile-summary.json"},
+        "numerics_evidence": {"path": "/tmp/numerics.json"},
+        "numerics_profile_summary": {"path": "/tmp/numerics-summary.json"},
+        "progress": progress,
+        "invocation_attempt_counts": per_program,
+        "invocation_completion_counts": per_program,
+        "raw_samples_only": True,
+        "performance_qualification": False,
+    }
+    return {
+        "schema_version": schema_version,
+        "mode": mode,
+        "passed": False,
+        "probe_completed": True,
+        "profile_attested": False,
+        "qualification_scope": "isolated_stage_only",
+        "authorizes_default_model_enablement": False,
+        "recommend_for_opt_in_model_integration": False,
+        "contract": attest._expected_contract(),
+        "geometry": attest._exact_geometry(),
+        "postflight": {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
+        "device": {
+            "backend": "gpu",
+            "device_kind": "Radeon RX 7900 XTX",
+            "architecture": "gfx1100",
+            "platform_version": "ROCm test",
+        },
+        "source": {},
+        "preflight": {},
+        "compilation": {},
+        mode: gated,
+        "invocation_contract": {
+            "per_program_executable_invocations": per_program,
+            "per_program_executable_completions": per_program,
+            "reference_executable_invocations": 2 * count,
+            "candidate_executable_invocations": 2 * count,
+            "total_executable_invocations": 4 * count,
+            "compile_only_zero_candidate_reference_executable_invocations": False,
+        },
+        "numerics": {
+            "executed": False,
+            "passed": True,
+            "prior_numerics_evidence_verified": True,
+            "prior_numerics_evidence": gated["numerics_evidence"],
+            "prior_numerics_profile_summary": gated["numerics_profile_summary"],
+        },
+        "determinism": {"executed": False},
+        "performance_gate": {"executed": False, "passed": None},
+    }
 
 
 def _measurement_fixture(mode: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -119,12 +243,23 @@ def _public_stub_data(tmp_path: Path, mode: str, smoke: Any = None):
 
 
 def test_contract_matches_probe_and_import_does_not_load_jax() -> None:
-    assert attest._expected_contract() == probe._exact_contract()
-    assert attest._exact_geometry() == {
-        **probe._exact_contract()["geometry"],
+    contract = attest._expected_contract()
+    assert attest._EVIDENCE_SCHEMA_VERSION == 2
+    assert contract == probe._exact_contract()
+    assert contract["case"] == ("qwen35_b1_t64_bf16_rms_gate_up_lora_swiglu_contiguous_v1")
+    assert contract["initial_tiles"] == {
         "block_m": 16,
-        "pair_block_n": 32,
-        "block_k": 64,
+        "block_physical_n": 64,
+        "block_k": 32,
+    }
+    assert contract["program_structures"] == _EXPECTED_PROGRAM_STRUCTURES
+    assert attest._expected_program_structures() == _EXPECTED_PROGRAM_STRUCTURES
+    assert probe._expected_program_structures() == _EXPECTED_PROGRAM_STRUCTURES
+    assert attest._exact_geometry() == {
+        **contract["geometry"],
+        "block_m": 16,
+        "block_physical_n": 64,
+        "block_k": 32,
     }
     repo = Path(attest.__file__).resolve().parent.parent
     code = (
@@ -138,6 +273,101 @@ def test_contract_matches_probe_and_import_does_not_load_jax() -> None:
         check=True,
         timeout=10,
     )
+
+
+def test_raw_result_schema_version_is_strict_v2_and_rejects_bool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw_result = _raw_result_fixture(2)
+    result_file = {"path": str(tmp_path / "result.json")}
+    monkeypatch.setattr(
+        attest,
+        "_read_private_json",
+        lambda *_args, **_kwargs: (raw_result, result_file),
+    )
+    monkeypatch.setattr(
+        attest,
+        "_validate_source_and_runtime",
+        lambda *_args, **_kwargs: ({}, {}, {}),
+    )
+    monkeypatch.setattr(attest, "_validate_preflight", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(attest, "_validate_compilation", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(attest, "_validate_prior_chain", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(attest, "_validate_progress", lambda *_args, **_kwargs: {})
+
+    validated = attest._validate_raw_result(
+        result_path=tmp_path / "result.json",
+        expected_mode="benchmark_smoke",
+        repo=tmp_path,
+    )
+    assert validated[0] == "benchmark_smoke"
+    assert type(raw_result["schema_version"]) is int
+
+    for invalid_version in (1, True, 2.0):
+        raw_result["schema_version"] = invalid_version
+        with pytest.raises(RuntimeError, match="raw result is not an exact"):
+            attest._validate_raw_result(
+                result_path=tmp_path / "result.json",
+                expected_mode="benchmark_smoke",
+                repo=tmp_path,
+            )
+
+
+def test_source_runtime_binds_exact_contiguous_v1_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = Path(attest.__file__).resolve().parent.parent
+    paths = {
+        "kernel": (repo / "skyrl" / "tx" / "kernels" / "rocm" / "bf16_rms_gate_up_lora_swiglu_contiguous.py"),
+        "probe": repo / "rocm" / "probe_bf16_rms_gate_up_lora_swiglu.py",
+        "profiler": repo / "rocm" / "profile_rocm.py",
+    }
+    git = {
+        "commit": "4" * 40,
+        "branch": "test",
+        "status_porcelain": [],
+        "clean": True,
+    }
+    packages = {"jax": "test"}
+    source = {
+        name: {
+            "path": str(path.resolve(strict=True)),
+            "sha256": attest.hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for name, path in paths.items()
+    }
+    source.update({"git": git, "packages": packages})
+    monkeypatch.setattr(attest, "_current_git_manifest", lambda _repo: git)
+    monkeypatch.setattr(attest, "_current_package_versions", lambda: packages)
+
+    source_only, validated_git, validated_packages = attest._validate_source_and_runtime(source, repo=repo)
+    assert source_only["kernel"] == source["kernel"]
+    assert validated_git == git
+    assert validated_packages == packages
+
+    legacy_source = json.loads(json.dumps(source))
+    legacy_source["kernel"] = {
+        "path": str(repo / "skyrl" / "tx" / "kernels" / "rocm" / "bf16_rms_gate_up_lora_swiglu.py"),
+        "sha256": "0" * 64,
+    }
+    with pytest.raises(RuntimeError, match="kernel source is not this exact source"):
+        attest._validate_source_and_runtime(legacy_source, repo=repo)
+
+
+def test_compilation_requires_exact_program_structure_manifests() -> None:
+    compilation = _compilation_fixture()
+    assert attest._validate_compilation(compilation) is compilation
+
+    for program in attest._PROGRAM_ORDER:
+        tampered = _compilation_fixture()
+        tampered[program]["program_structure"]["dot_general_count"] += 1
+        with pytest.raises(RuntimeError, match=f"{program} program structure is not exact"):
+            attest._validate_compilation(tampered)
+
+    missing = _compilation_fixture()
+    del missing["candidate_forward"]["program_structure"]
+    with pytest.raises(RuntimeError, match="candidate_forward compilation is not exact"):
+        attest._validate_compilation(missing)
 
 
 def test_private_reader_rejects_group_readable_input(tmp_path: Path) -> None:
@@ -192,11 +422,7 @@ def test_profile_recomputes_maxima_and_allows_telemetry_before_result(
             }
         },
         "source": {
-            "profiler": {
-                "sha256": attest.hashlib.sha256(
-                    (repo / "rocm" / "profile_rocm.py").read_bytes()
-                ).hexdigest()
-            }
+            "profiler": {"sha256": attest.hashlib.sha256((repo / "rocm" / "profile_rocm.py").read_bytes()).hexdigest()}
         },
     }
     command = attest._expected_profile_command(
@@ -247,10 +473,7 @@ def test_profile_recomputes_maxima_and_allows_telemetry_before_result(
         {**base, "phase": "measured", "wall_time_ns": 3},
     ]
     telemetry_path = private / "telemetry.jsonl"
-    telemetry_path.write_text(
-        "\n".join(json.dumps(item, sort_keys=True) for item in (manifest, *samples))
-        + "\n"
-    )
+    telemetry_path.write_text("\n".join(json.dumps(item, sort_keys=True) for item in (manifest, *samples)) + "\n")
     telemetry_path.chmod(0o600)
     os.utime(telemetry_path, ns=(90, 90))
     summary = {
@@ -262,14 +485,9 @@ def test_profile_recomputes_maxima_and_allows_telemetry_before_result(
         "returncode": 0,
         "received_signal": None,
         "kernel_log_available": True,
-        "metrics": {
-            name: {"measured_max": base[name]}
-            for name in attest._SAFETY_METRIC_LIMITS
-        },
+        "metrics": {name: {"measured_max": base[name]} for name in attest._SAFETY_METRIC_LIMITS},
     }
-    summary_path = _write_private_json(
-        private / "telemetry.jsonl.summary.json", summary
-    )
+    summary_path = _write_private_json(private / "telemetry.jsonl.summary.json", summary)
     os.utime(summary_path, ns=(110, 110))
     profile = attest._validate_profile(
         profile_summary_path=summary_path,
@@ -329,6 +547,14 @@ def test_full_profile_command_binds_smoke_before_tile_flags(tmp_path: Path) -> N
         "--smoke-profile-summary",
         "/tmp/smoke-summary.json",
     ]
+    assert command[block_index : block_index + 6] == [
+        "--block-m",
+        "16",
+        "--block-physical-n",
+        "64",
+        "--block-k",
+        "32",
+    ]
     assert command[-4:] == ["--warmups", "8", "--iterations", "32"]
 
 
@@ -367,6 +593,9 @@ def test_public_callable_is_only_passing_artifact_and_recurses_smoke(
         expected_mode="benchmark_smoke",
         write_output=False,
     )
+    assert smoke["schema_version"] == 2
+    assert type(smoke["schema_version"]) is int
+    assert smoke["attestation_type"] == ("bf16_rms_gate_up_lora_swiglu_contiguous_v1_" "benchmark_profile_attestation")
     assert smoke["passed"] is True
     assert smoke["attestation_passed"] is True
     assert smoke["performance_qualified"] is False
