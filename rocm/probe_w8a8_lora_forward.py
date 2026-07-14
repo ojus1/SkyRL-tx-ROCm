@@ -147,19 +147,19 @@ _EXPECTED_ORDERED_THUNKS_BM32 = (
 )
 _EXPECTED_EXECUTABLE_VARIANTS = {
     "lora_gemm_bm16_bn16": {
-        "contract_sha256": "b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57",
+        "contract_sha256": "d2859c3fd661ca42f7ce2231d3b090af59e53210fad860519df7695a7856a947",
         "normalized_executable_record_bytes": 52_909,
-        "normalized_executable_record_sha256": "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08",
+        "normalized_executable_record_sha256": "94e1a986416c6b1b0b3d249b5ff41c2fc11dec215612a66c21d28a15968d49bc",
         "normalized_hlo_module_bytes": 20_600,
-        "normalized_hlo_module_sha256": "1cac7332465fe69bd9d4ae2a53dbd0454a5f3ca4fd28bbdbd400a66a30dde1cd",
+        "normalized_hlo_module_sha256": "aca6770fd14a7d002ad465bfe8ac09c22f77b33b5d38ca0b2bd95c13734349d5",
         "ordered_thunks": _EXPECTED_ORDERED_THUNKS_BM16,
     },
     "lora_gemm_bm32_bn32": {
-        "contract_sha256": "75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7",
+        "contract_sha256": "749fff3d982c91f738c7b7c5c44d4d7120c9d24f439d10df90f20ae7a5890766",
         "normalized_executable_record_bytes": 53_166,
-        "normalized_executable_record_sha256": "4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985",
+        "normalized_executable_record_sha256": "989798f1183a243fe074491578827e4b04bf2d0eb25ca127f0a3b06f93050b94",
         "normalized_hlo_module_bytes": 20_600,
-        "normalized_hlo_module_sha256": "9978dc0830323f4331dcb7c537fcbc56d8263be070d6f545b43191a8e651085b",
+        "normalized_hlo_module_sha256": "577bdf1c685ce7553f3af8ff8ab6b2125247f2cc7a15ee47f4c0e7916277b03f",
         "ordered_thunks": _EXPECTED_ORDERED_THUNKS_BM32,
     },
 }
@@ -217,7 +217,7 @@ _EXPECTED_HOST_SHA256 = {
     "expected": "964b0c1fe5f5c4cdbd60658717fee50a835006adf03011717b4914061ab4f88f",
 }
 _EXPECTED_SOURCE_SHA256 = {
-    "isa_inspector": "7e2589d13017387b580fb460dcba71ec840c75a246ec8c69d79ef8f93608047f",
+    "isa_inspector": "65dea40366e9d7231c800537c4603d76d8c0e2af9a2cd6bd6660c69b27f37c57",
     "kernel": "af119fec39f53ba0dd0c500398589e0fc333a6fda752ffb464c2a578738bbded",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",

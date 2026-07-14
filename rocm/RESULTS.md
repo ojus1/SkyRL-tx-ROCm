@@ -237,19 +237,37 @@ Only thunk 2 differs: 7,922 bytes / SHA-256
 16,384 bytes LDS, and a 7,664-byte ELF / SHA-256
 `9ab0e3abac1983fcb44279f9fe1b40da01186a6d674e271b6c103cbb69c40b2a`.
 
-Offline qualification now pins two complete historical-artifact contracts:
+The first allowlist revision pinned two complete historical-artifact contracts:
 `lora_gemm_bm16_bn16` (`b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57`)
 and `lora_gemm_bm32_bn32`
 (`75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7`).
+Those two hashes are retained as historical evidence, not accepted by the
+current verifier.
+
+Three clean compile-only seeds from the frozen `0fec1b67` source layout then
+captured both same-layout outcomes. Runs `1784041485` and `1784041690` selected
+BM32 and reproduced normalized record/HLO SHA-256 values
+`989798f1183a243fe074491578827e4b04bf2d0eb25ca127f0a3b06f93050b94` /
+`577bdf1c685ce7553f3af8ff8ab6b2125247f2cc7a15ee47f4c0e7916277b03f`.
+Run `1784041853` selected BM16 with normalized record/HLO SHA-256 values
+`94e1a986416c6b1b0b3d249b5ff41c2fc11dec215612a66c21d28a15968d49bc` /
+`aca6770fd14a7d002ad465bfe8ac09c22f77b33b5d38ca0b2bd95c13734349d5`.
+The current accepted complete-contract hashes are
+`d2859c3fd661ca42f7ce2231d3b090af59e53210fad860519df7695a7856a947`
+(BM16) and
+`749fff3d982c91f738c7b7c5c44d4d7120c9d24f439d10df90f20ae7a5890766`
+(BM32). Equal-length pin changes preserved the candidate at source line 2,174.
+All three seeds compiled but invoked the candidate zero times; they peaked at
+118 W, 61 C, and 867,364,864 bytes VRAM with unchanged 24,576-byte swap and
+clean postflight/handoff.
+
 The selected name must match its complete normalized record/HLO, ordered
 thunks, launches, and nested ELFs in the inspector, child, and independent
-controller. Unknown or cross-paired variants are rejected. Because exact HLO
-source locations changed with the allowlist patch, current-source runtime is
-still blocked pending clean seeds of both autotune outcomes from one frozen
-layout and a clean post-pin compile/offline-inspection rerun. The child check
-is pre-dispatch; the controller's independent repeat is postflight. No W8 ISA
-check is relaxed, and the entries above remain compile/offline evidence rather
-than dispatch permission.
+controller. Unknown, historical, or cross-paired variants are rejected.
+Current-source runtime is still blocked pending a clean post-pin
+compile/offline-inspection rerun. The child check is pre-dispatch; the
+controller's independent repeat is postflight. No W8 ISA check is relaxed, and
+this remains compile/offline evidence rather than dispatch permission.
 
 Across the two earlier BM16 corrected builds, all six thunk serializations and
 all seven ELFs are byte-identical. The first four ELFs are also byte-identical to the

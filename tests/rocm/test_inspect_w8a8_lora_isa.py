@@ -724,21 +724,21 @@ def test_production_executable_variants_pin_both_complete_contracts() -> None:
 
     assert (
         bm16["normalized_executable_record_sha256"]
-        == "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08"
+        == "94e1a986416c6b1b0b3d249b5ff41c2fc11dec215612a66c21d28a15968d49bc"
     )
     assert (
         bm32["normalized_executable_record_sha256"]
-        == "4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985"
+        == "989798f1183a243fe074491578827e4b04bf2d0eb25ca127f0a3b06f93050b94"
     )
     assert bm16["thunks"][2]["shared_memory_bytes"] == 8_192
     assert bm16["thunks"][2]["elf_sha256"].startswith("c45a0fb7")
     assert bm32["thunks"][2]["shared_memory_bytes"] == 16_384
     assert bm32["thunks"][2]["elf_sha256"].startswith("9ab0e3ab")
     assert _ISA._variant_contract_sha256("lora_gemm_bm16_bn16", bm16) == (
-        "b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57"
+        "d2859c3fd661ca42f7ce2231d3b090af59e53210fad860519df7695a7856a947"
     )
     assert _ISA._variant_contract_sha256("lora_gemm_bm32_bn32", bm32) == (
-        "75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7"
+        "749fff3d982c91f738c7b7c5c44d4d7120c9d24f439d10df90f20ae7a5890766"
     )
 
 

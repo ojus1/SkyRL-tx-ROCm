@@ -420,20 +420,45 @@ its dynamic LDS is 16,384 bytes, and its 7,664-byte ELF has SHA-256
 The auxiliary ELF uses 14 SGPRs, 159 VGPRs, and no spills; the BM16 object
 uses 14 SGPRs, 164 VGPRs, and no spills.
 
-The offline verifier therefore recognizes exactly two atomic **historical
-artifact** variants: `lora_gemm_bm16_bn16` with complete-contract SHA-256
+The first allowlist revision recognized exactly two atomic historical-artifact
+variants: `lora_gemm_bm16_bn16` with complete-contract SHA-256
 `b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57`,
 and `lora_gemm_bm32_bn32` with complete-contract SHA-256
 `75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7`.
-Each name binds its normalized record, normalized HLO, all six thunk
-serializations and launches, and all six nested ELFs. Unknown configurations
-and mixed BM16/BM32 tuples fail closed. Source-line metadata is intentionally
-part of those hashes, so these retained contracts do not yet authorize an
-executable compiled from the later allowlist source layout. Runtime remains
-blocked until clean compile-only seeds capture both autotune outcomes from one
-frozen layout and a post-pin clean compile passes the child pre-dispatch
-inspector. The controller repeats that inspection independently as postflight
-attestation after the supervised child exits.
+Those hashes remain historical evidence rather than current accepted inputs.
+
+The allowlist source layout was then frozen at commit `0fec1b67`, with the
+candidate definition fixed at line 2,174. Three clean compile-only seeds under
+that identical layout completed in
+`/tmp/skyrl-w8a8-compile-1784041485`,
+`/tmp/skyrl-w8a8-compile-1784041690`, and
+`/tmp/skyrl-w8a8-compile-1784041853`. The first two independently selected
+BM32 and produced the same normalized 53,166-byte record SHA-256
+`989798f1183a243fe074491578827e4b04bf2d0eb25ca127f0a3b06f93050b94`
+and normalized 20,600-byte HLO SHA-256
+`577bdf1c685ce7553f3af8ff8ab6b2125247f2cc7a15ee47f4c0e7916277b03f`.
+The third selected BM16, with normalized 52,909-byte record SHA-256
+`94e1a986416c6b1b0b3d249b5ff41c2fc11dec215612a66c21d28a15968d49bc`
+and normalized HLO SHA-256
+`aca6770fd14a7d002ad465bfe8ac09c22f77b33b5d38ca0b2bd95c13734349d5`.
+All thunk serializations, launches, nested ELFs, and the exact W8 object match
+their historical BM16/BM32 counterparts.
+
+The verifier now accepts only these two current-layout atomic contracts:
+BM16 contract SHA-256
+`d2859c3fd661ca42f7ce2231d3b090af59e53210fad860519df7695a7856a947`
+and BM32 contract SHA-256
+`749fff3d982c91f738c7b7c5c44d4d7120c9d24f439d10df90f20ae7a5890766`.
+Unknown configurations, historical top hashes, and mixed BM16/BM32 tuples
+fail closed. Pin substitutions are equal-length and preserve every probe
+source line. Runtime remains blocked until a clean post-pin compile passes the
+child pre-dispatch inspector; the controller repeats that inspection
+independently as postflight attestation after the supervised child exits.
+
+Across the three seeds, candidate executable invocations remained zero. Peak
+sampled power was 118 W, peak junction temperature 61 C, peak VRAM 867,364,864
+bytes, and swap remained 24,576 bytes. Every run ended with a clean AMDGPU
+journal, no `/dev/kfd` owner, and the required idle handoff.
 
 Across the two earlier BM16 corrected builds, all six thunk serializations and
 all seven embedded ELFs are byte-identical. The first four objects also remain
