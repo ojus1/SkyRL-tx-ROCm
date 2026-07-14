@@ -74,6 +74,63 @@ from local_server_attestation import (  # noqa: E402
 )
 
 SCHEMA_VERSION = 1
+PROMPT_TEXT = (
+    "You are comparing optimizer designs for an AMD GPU training system. Avoid "
+    "obvious answers and be specific about which tensors stay on chip. In one "
+    "sentence, propose a surprising fused-kernel optimization and its tradeoff "
+    "for this specific training workload. Candidate idea:"
+)
+PROMPT_TOKEN_IDS = (
+    2523,
+    513,
+    25456,
+    24816,
+    14018,
+    364,
+    449,
+    23547,
+    21966,
+    4706,
+    1785,
+    13,
+    32879,
+    7783,
+    10926,
+    321,
+    381,
+    3050,
+    883,
+    864,
+    74451,
+    4565,
+    383,
+    15911,
+    13,
+    733,
+    799,
+    11316,
+    11,
+    28647,
+    264,
+    14431,
+    72115,
+    12283,
+    5283,
+    24460,
+    321,
+    1141,
+    6355,
+    1783,
+    364,
+    411,
+    3050,
+    4706,
+    51797,
+    13,
+    47914,
+    4374,
+    25,
+)
 PROMPT_TOKENS = 49
 MAX_NEW_TOKENS = 16
 GROUP_SIZE = 2
@@ -198,20 +255,19 @@ def _get_tokenizer(model_snapshot: Path) -> Any:
     return AutoTokenizer.from_pretrained(str(snapshot), local_files_only=True)
 
 
-def _repeat_tokens(seed: list[int], length: int) -> tuple[int, ...]:
-    if length <= 0:
-        raise ValueError("prompt token length must be positive")
-    if not seed:
-        raise ValueError("tokenizer returned no prompt tokens")
-    return tuple(int(seed[index % len(seed)]) for index in range(length))
-
-
 def _build_prompt(
     model_snapshot: Path, tokenizer: Any | None = None
 ) -> tuple[int, ...]:
     tokenizer = tokenizer or _get_tokenizer(model_snapshot)
-    seed = tokenizer.encode(" real sampler GRPO systems gate", add_special_tokens=False)
-    return _repeat_tokens(seed, PROMPT_TOKENS)
+    encoded = tuple(
+        int(token)
+        for token in tokenizer.encode(PROMPT_TEXT, add_special_tokens=False)
+    )
+    if encoded != PROMPT_TOKEN_IDS or len(encoded) != PROMPT_TOKENS:
+        raise RuntimeError(
+            "verified tokenizer did not produce the canonical nonperiodic prompt"
+        )
+    return encoded
 
 
 async def _save_exact_sampler_snapshot(training_client: Any) -> Any:

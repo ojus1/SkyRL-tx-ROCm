@@ -20,6 +20,102 @@ sys.modules[_SPEC.name] = _BENCH
 _SPEC.loader.exec_module(_BENCH)
 
 
+_EXPECTED_PROMPT_TEXT = (
+    "You are comparing optimizer designs for an AMD GPU training system. Avoid "
+    "obvious answers and be specific about which tensors stay on chip. In one "
+    "sentence, propose a surprising fused-kernel optimization and its tradeoff "
+    "for this specific training workload. Candidate idea:"
+)
+_EXPECTED_PROMPT_TOKEN_IDS = (
+    2523,
+    513,
+    25456,
+    24816,
+    14018,
+    364,
+    449,
+    23547,
+    21966,
+    4706,
+    1785,
+    13,
+    32879,
+    7783,
+    10926,
+    321,
+    381,
+    3050,
+    883,
+    864,
+    74451,
+    4565,
+    383,
+    15911,
+    13,
+    733,
+    799,
+    11316,
+    11,
+    28647,
+    264,
+    14431,
+    72115,
+    12283,
+    5283,
+    24460,
+    321,
+    1141,
+    6355,
+    1783,
+    364,
+    411,
+    3050,
+    4706,
+    51797,
+    13,
+    47914,
+    4374,
+    25,
+)
+
+
+class _CanonicalPromptTokenizer:
+    def __init__(self, token_ids=_EXPECTED_PROMPT_TOKEN_IDS):
+        self.token_ids = token_ids
+
+    def encode(self, text, *, add_special_tokens):
+        assert text == _EXPECTED_PROMPT_TEXT
+        assert add_special_tokens is False
+        return list(self.token_ids)
+
+
+def test_prompt_is_exact_nonperiodic_verified_tokenizer_encoding():
+    assert _BENCH.PROMPT_TEXT == _EXPECTED_PROMPT_TEXT
+    assert _BENCH.PROMPT_TOKEN_IDS == _EXPECTED_PROMPT_TOKEN_IDS
+
+    prompt = _BENCH._build_prompt(
+        Path("/verified/model/snapshot"),
+        tokenizer=_CanonicalPromptTokenizer(),
+    )
+
+    assert prompt == _EXPECTED_PROMPT_TOKEN_IDS
+    assert len(prompt) == _BENCH.PROMPT_TOKENS == 49
+    assert all(
+        any(prompt[index] != prompt[index % period] for index in range(period, 49))
+        for period in range(1, 25)
+    )
+
+
+def test_prompt_rejects_tokenizer_drift():
+    drifted = (*_EXPECTED_PROMPT_TOKEN_IDS[:-1], 26)
+
+    with pytest.raises(RuntimeError, match="canonical nonperiodic prompt"):
+        _BENCH._build_prompt(
+            Path("/verified/model/snapshot"),
+            tokenizer=_CanonicalPromptTokenizer(drifted),
+        )
+
+
 def _sample_response() -> SimpleNamespace:
     return SimpleNamespace(
         sequences=[
