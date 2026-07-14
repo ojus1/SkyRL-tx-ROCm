@@ -2509,7 +2509,7 @@ def _validate_numerics_evidence(
     invocation = evidence.get("invocation_contract")
     if (
         not isinstance(compilation, dict)
-        or tuple(compilation) != _PROGRAM_ORDER
+        or set(compilation) != set(_PROGRAM_ORDER)
         or any(
             not isinstance(manifest, dict)
             or type(manifest.get("lower_calls")) is not int

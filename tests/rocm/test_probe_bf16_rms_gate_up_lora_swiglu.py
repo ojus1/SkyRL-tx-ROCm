@@ -1160,7 +1160,7 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
         "postflight": {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
     }
     evidence = (tmp_path / "numerics.jsonl").resolve()
-    evidence.write_text(json.dumps(payload, allow_nan=False) + "\n")
+    evidence.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n")
     evidence.chmod(0o600)
     evidence_time = progress_time + 1_000_000
     os.utime(evidence, ns=(evidence_time, evidence_time))
@@ -1184,7 +1184,7 @@ def test_numerics_evidence_is_exactly_passing_and_prior_gate_bound(
     assert manifest["progress_path"] == str(progress)
 
     payload["numerics"]["errors"]["dx"]["relative_l2"] = 0.03
-    evidence.write_text(json.dumps(payload, allow_nan=False) + "\n")
+    evidence.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + "\n")
     evidence.chmod(0o600)
     os.utime(evidence, ns=(evidence_time, evidence_time))
     with pytest.raises(RuntimeError, match="misses the exact numerical gate"):
