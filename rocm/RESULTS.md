@@ -264,10 +264,23 @@ clean postflight/handoff.
 The selected name must match its complete normalized record/HLO, ordered
 thunks, launches, and nested ELFs in the inspector, child, and independent
 controller. Unknown, historical, or cross-paired variants are rejected.
-Current-source runtime is still blocked pending a clean post-pin
-compile/offline-inspection rerun. The child check is pre-dispatch; the
-controller's independent repeat is postflight. No W8 ISA check is relaxed, and
-this remains compile/offline evidence rather than dispatch permission.
+Clean post-pin compile-only run `1784042397` selected BM16 and passed the
+public offline verifier with zero invocations. It peaked at 118 W, 59 C, and
+867,364,864 bytes VRAM, retained 24,576-byte swap, and ended with clean
+postflight/handoff.
+
+Exactly one guarded runtime was then attempted in run `1784042574`. The child
+passed every pre-dispatch BM16 ISA check, released the executable, transferred
+all six inputs, and emitted `dispatch_started`, but the dispatch never emitted
+a post-attempt record. The five-second watchdog failed, killed the complete
+cgroup in 0.071221 seconds, and produced no device-get or numerical output.
+Peak telemetry was 105 W, 61 C, and 867,450,880 bytes VRAM; swap remained
+24,576 bytes. The journal stayed clean, three handoff samples restored the
+exact idle baseline, and `/dev/kfd` was unowned. W8 runtime is therefore
+NO-GO, must not be retried unchanged, and is not a SkyRL optimizer/model
+integration candidate. The child check is pre-dispatch; the controller's
+independent repeat would be postflight after a successful child exit. No W8
+ISA check was relaxed.
 
 Across the two earlier BM16 corrected builds, all six thunk serializations and
 all seven ELFs are byte-identical. The first four ELFs are also byte-identical to the

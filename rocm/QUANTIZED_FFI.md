@@ -451,14 +451,29 @@ and BM32 contract SHA-256
 `749fff3d982c91f738c7b7c5c44d4d7120c9d24f439d10df90f20ae7a5890766`.
 Unknown configurations, historical top hashes, and mixed BM16/BM32 tuples
 fail closed. Pin substitutions are equal-length and preserve every probe
-source line. Runtime remains blocked until a clean post-pin compile passes the
-child pre-dispatch inspector; the controller repeats that inspection
-independently as postflight attestation after the supervised child exits.
+source line. Clean post-pin compile-only run
+`/tmp/skyrl-w8a8-compile-1784042397` selected BM16 and passed the public
+offline verifier against this exact contract. It invoked the executable zero
+times and peaked at 118 W, 59 C, and 867,364,864 bytes VRAM with unchanged
+24,576-byte swap, a clean journal, and clean handoff.
 
 Across the three seeds, candidate executable invocations remained zero. Peak
 sampled power was 118 W, peak junction temperature 61 C, peak VRAM 867,364,864
 bytes, and swap remained 24,576 bytes. Every run ended with a clean AMDGPU
 journal, no `/dev/kfd` owner, and the required idle handoff.
+
+The resulting one-shot runtime rung in
+`/tmp/skyrl-w8a8-runtime-1784042574` passed the complete child pre-dispatch
+BM16 ISA gate, released the executable, transferred the six inputs, and
+recorded exactly one `dispatch_started`. The dispatch did not return within
+the five-second watchdog: there was no post-attempt checkpoint, completion,
+device-get, or numerical result. The controller killed the whole cgroup in
+0.071221 seconds and failed closed. Peak sampled telemetry before termination
+was 105 W, 61 C, and 867,450,880 bytes VRAM; swap remained 24,576 bytes. The
+whole-boot AMDGPU journal stayed clean, the GPU returned to its exact idle
+baseline for three samples, and `/dev/kfd` is unowned. This is a runtime NO-GO
+for the current W8 executable, not a correctness result. It must not be
+retried unchanged or integrated into the model.
 
 Across the two earlier BM16 corrected builds, all six thunk serializations and
 all seven embedded ELFs are byte-identical. The first four objects also remain
@@ -477,12 +492,12 @@ gap was 0.082857711 seconds, the whole-boot AMDGPU journal remained clean, and
 three handoff samples restored the exact suspended/unowned 27,947,008-byte
 VRAM and 15,966,208-byte GTT baseline.
 
-After the normalized pins, tests, and independent review, any separately
-authorized rung remains exactly one host-checked invocation of the corrected
-tiny forward. Only after that result will the ladder change one risk dimension
-at a time: signed base-only semantics;
-`K=128`; three row superblocks; small base/fused VJPs; K-scan lengths 8/40/144;
-N-scan lengths 8/32/128/288; then the first real `K=2560,N=18432` gate/up
+Further W8 runtime work is blocked on a kernel-level explanation and a changed
+executable that can be requalified from compile-only evidence. If that is
+resolved, the ladder can resume one risk dimension at a time: signed base-only
+semantics; `K=128`; three row superblocks; small base/fused VJPs; K-scan
+lengths 8/40/144; N-scan lengths 8/32/128/288; then the first real
+`K=2560,N=18432` gate/up
 rectangle. The artificial `K=9216,N=18432` rectangle is not a model shape and
 must not be run. Every rung retains a strict sub-100-ms candidate-dispatch gate
 and a fresh-process exact-idle handoff. The user's 3% allowance applies to
