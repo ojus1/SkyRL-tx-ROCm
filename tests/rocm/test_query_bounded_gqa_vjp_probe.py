@@ -268,6 +268,18 @@ def test_exact_contract_fixes_shape_dispatch_memory_and_numerical_gates():
             "model_invocations",
         )
     )
+    assert contract["numerical_gate_per_tensor"] == {
+        "finite_required": True,
+        "minimum_reference_l2_norm": 1e-8,
+        "relative_l2_strictly_below": {
+            "output": 0.01,
+            "dq": 0.03,
+            "dk": 0.03,
+            "dv": 0.03,
+        },
+        "minimum_cosine": 0.9999,
+        "maximum_absolute_error": 0.02,
+    }
 
 
 def test_valid385_contract_adds_only_host_case_and_validation_gates():
@@ -280,6 +292,7 @@ def test_valid385_contract_adds_only_host_case_and_validation_gates():
     assert padded["compile_gate"] == default["compile_gate"]
     assert padded["execution_contract"] == default["execution_contract"]
     assert padded["tiles"] == default["tiles"]
+    assert padded["numerical_gate_per_tensor"] == default["numerical_gate_per_tensor"]
     assert padded["affected_forward_output_rows_numerically_gated"] == [385, 512]
     assert all(padded["padded_zero_gates"].values())
 
@@ -289,6 +302,7 @@ def test_t1024_contract_fixes_two_chunks_memory_and_withholds_runtime():
     assert contract["case"] == "all_valid_t1024"
     assert contract["sequence_length"] == 1024
     assert contract["query_chunks"] == 2
+    assert contract["numerical_gate_per_tensor"] == _PROBE._numerical_gate_contract()
     assert [item["shape"] for item in contract["inputs"]] == [
         [1, 1024, 16, 256],
         [1, 1024, 4, 256],
@@ -391,7 +405,7 @@ def test_static_source_binding_and_kernel_api_are_exact(monkeypatch):
     )
     assert (
         proof["delegated_nonzero_probe_source_sha256"]
-        == "999e027d4cc35a8d59cc294020f8865036f8fb817a847ac38f96e36b597f74ac"
+        == "1758567bad19e261400d027c1aab51c28dffc621ce9ad6cd819f4a1575fff0f4"
     )
     path = _PROBE._source_files()["delegated_compile_probe_source_sha256"].resolve()
     original = _PROBE._file_sha256
@@ -2359,6 +2373,276 @@ def test_bf16_rounded_reference_passes_and_corrupted_gradient_fails(exact_case):
             _PROBE._completed_counters(),
             io.StringIO(),
         )
+
+
+def _synthetic_numerical_metrics(relative_l2: float) -> dict[str, object]:
+    return {
+        "finite": True,
+        "shape_dtype_nbytes_exact": True,
+        "reference_l2_norm": 1.0,
+        "relative_l2": relative_l2,
+        "cosine_raw": 1.0,
+        "cosine": 1.0,
+        "max_abs": 0.0,
+    }
+
+
+def _patch_tensor_metrics(monkeypatch, relative_l2_values: list[float]) -> None:
+    metrics = iter(_synthetic_numerical_metrics(value) for value in relative_l2_values)
+    monkeypatch.setattr(
+        _PROBE,
+        "_tensor_metrics",
+        lambda *_args, **_kwargs: next(metrics),
+    )
+
+
+def test_gradient_errors_between_one_and_three_percent_pass_full_vjp_gate(
+    monkeypatch,
+):
+    _patch_tensor_metrics(monkeypatch, [0.005, 0.02, 0.02, 0.02])
+
+    record = _PROBE._validate_candidate(
+        np,
+        (object(), object(), object(), object()),
+        (object(), object(), object(), object()),
+        0.01,
+        _PROBE._completed_counters(),
+        io.StringIO(),
+    )
+
+    assert record["gates"]["per_tensor_numerical_passed"] == {
+        "output": True,
+        "dq": True,
+        "dk": True,
+        "dv": True,
+    }
+    assert record["thresholds_per_tensor"]["relative_l2_strictly_below"] == {
+        "output": 0.01,
+        "dq": 0.03,
+        "dk": 0.03,
+        "dv": 0.03,
+    }
+
+
+def test_relative_l2_policy_lookup_is_exact_and_fails_closed() -> None:
+    assert {
+        name: _PROBE._relative_l2_limit(name) for name in ("output", "dq", "dk", "dv")
+    } == {"output": 0.01, "dq": 0.03, "dk": 0.03, "dv": 0.03}
+    with pytest.raises(RuntimeError, match="no exact relative-L2 policy"):
+        _PROBE._relative_l2_limit("gradient")
+
+
+def test_two_percent_output_error_still_fails_while_gradients_pass(monkeypatch):
+    _patch_tensor_metrics(monkeypatch, [0.02, 0.005, 0.005, 0.005])
+    output = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            (object(), object(), object(), object()),
+            (object(), object(), object(), object()),
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+        )
+
+    [record] = _records(output)
+    assert record["gates"]["per_tensor_numerical_passed"] == {
+        "output": False,
+        "dq": True,
+        "dk": True,
+        "dv": True,
+    }
+
+
+def test_exact_three_percent_gradient_error_fails_strict_boundary(monkeypatch):
+    _patch_tensor_metrics(monkeypatch, [0.005, 0.03, 0.03, 0.03])
+    output = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            (object(), object(), object(), object()),
+            (object(), object(), object(), object()),
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+        )
+
+    [record] = _records(output)
+    assert record["gates"]["per_tensor_numerical_passed"] == {
+        "output": True,
+        "dq": False,
+        "dk": False,
+        "dv": False,
+    }
+
+
+def _two_percent_bf16_perturbation(value):
+    fp32 = np.asarray(value, np.float32)
+    perturbation = np.clip(np.float32(0.02) * fp32, -0.014, 0.014)
+    return (fp32 + perturbation).astype(ml_dtypes.bfloat16)
+
+
+def test_real_array_two_percent_gradients_pass_but_output_fails(exact_case):
+    _inputs, _manifests, expected, _reference = exact_case
+    rounded = [item.astype(ml_dtypes.bfloat16) for item in expected]
+    gradient_candidate = (
+        rounded[0],
+        *(_two_percent_bf16_perturbation(item) for item in expected[1:]),
+    )
+
+    passed = _PROBE._validate_candidate(
+        np,
+        gradient_candidate,
+        expected,
+        0.01,
+        _PROBE._completed_counters(),
+        io.StringIO(),
+    )
+
+    for name in ("dq", "dk", "dv"):
+        metrics = passed["metrics"][name]
+        assert 0.01 < metrics["relative_l2"] < 0.03
+        assert metrics["cosine"] >= 0.9999
+        assert metrics["max_abs"] <= 0.02
+        assert passed["gates"]["per_tensor_numerical_passed"][name] is True
+
+    output_candidate = (
+        _two_percent_bf16_perturbation(expected[0]),
+        rounded[1],
+        rounded[2],
+        rounded[3],
+    )
+    output = io.StringIO()
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            output_candidate,
+            expected,
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+        )
+    [failed] = _records(output)
+    output_metrics = failed["metrics"]["output"]
+    assert 0.01 < output_metrics["relative_l2"] < 0.03
+    assert output_metrics["cosine"] >= 0.9999
+    assert output_metrics["max_abs"] <= 0.02
+    assert failed["gates"]["per_tensor_numerical_passed"]["output"] is False
+    assert all(
+        failed["gates"]["per_tensor_numerical_passed"][name]
+        for name in ("dq", "dk", "dv")
+    )
+
+
+def test_valid385_active_gradient_slices_use_three_percent_gate(
+    monkeypatch, valid385_case
+):
+    _inputs, _manifests, expected, _reference = valid385_case
+    actual = tuple(item.astype(ml_dtypes.bfloat16) for item in expected)
+    _patch_tensor_metrics(
+        monkeypatch,
+        [
+            0.005,
+            0.02,
+            0.02,
+            0.02,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.02,
+            0.02,
+            0.02,
+        ],
+    )
+    observed_limits = []
+    original_numerical_gate = _PROBE._numerical_metrics_pass
+
+    def record_limit(item, *, maximum_relative_l2):
+        observed_limits.append(maximum_relative_l2)
+        return original_numerical_gate(item, maximum_relative_l2=maximum_relative_l2)
+
+    monkeypatch.setattr(_PROBE, "_numerical_metrics_pass", record_limit)
+
+    record = _PROBE._validate_candidate(
+        np,
+        actual,
+        expected,
+        0.01,
+        _PROBE._completed_counters(),
+        io.StringIO(),
+        "valid385",
+    )
+
+    assert record["padded_validation"]["affected_output_rows_numerical_passed"]
+    assert all(
+        record["padded_validation"]["boundary_output_rows_numerical_passed"].values()
+    )
+    assert record["padded_validation"]["active_gradient_numerical_passed"] == {
+        "dq": True,
+        "dk": True,
+        "dv": True,
+    }
+    assert record["padded_validation"]["all_zero_tail_gates_passed"] is True
+    assert observed_limits == [
+        0.01,
+        0.03,
+        0.03,
+        0.03,
+        0.01,
+        0.01,
+        0.01,
+        0.01,
+        0.03,
+        0.03,
+        0.03,
+    ]
+
+
+def test_t1024_half_gates_route_output_and_gradient_limits(
+    monkeypatch, all_valid_t1024_case
+):
+    _inputs, _manifests, expected, _reference = all_valid_t1024_case
+    actual = tuple(item.astype(ml_dtypes.bfloat16) for item in expected)
+    _patch_tensor_metrics(
+        monkeypatch,
+        [
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.02,
+            0.005,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+        ],
+    )
+    output = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="numerical"):
+        _PROBE._validate_candidate(
+            np,
+            actual,
+            expected,
+            0.01,
+            _PROBE._completed_counters(),
+            output,
+            "all_valid_t1024",
+        )
+
+    [record] = _records(output)
+    halves = record["t1024_half_validation"]["per_half_numerical_passed"]
+    assert halves["output_query_rows_0_512"] is False
+    assert halves["output_query_rows_512_1024"] is True
+    assert all(
+        passed for name, passed in halves.items() if not name.startswith("output_")
+    )
 
 
 def test_t1024_bf16_reference_passes_full_and_every_half_gate(

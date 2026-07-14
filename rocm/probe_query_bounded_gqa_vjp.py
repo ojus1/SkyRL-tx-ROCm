@@ -95,7 +95,14 @@ _T1024_EXPECTED_ACCUMULATOR_LEAF_BYTES = 4_194_304
 _T1024_EXPECTED_ACCUMULATOR_PAIR_BYTES = 8_388_608
 _T1024_EXPECTED_TEMP_BYTES = 25_232_640
 _T1024_EXPECTED_OPTIMIZED_FUSION_HELPERS = 9
-_MAX_RELATIVE_L2 = 0.01
+_MAX_OUTPUT_RELATIVE_L2 = 0.01
+_MAX_GRADIENT_RELATIVE_L2 = 0.03
+_RELATIVE_L2_LIMITS = {
+    "output": _MAX_OUTPUT_RELATIVE_L2,
+    "dq": _MAX_GRADIENT_RELATIVE_L2,
+    "dk": _MAX_GRADIENT_RELATIVE_L2,
+    "dv": _MAX_GRADIENT_RELATIVE_L2,
+}
 _MIN_COSINE = 0.9999
 _MAX_ABSOLUTE_ERROR = 0.02
 _MIN_REFERENCE_NORM = 1e-8
@@ -111,7 +118,7 @@ _EXPECTED_COMPILE_PROBE_SOURCE_SHA256 = (
     "bf01187101d20362072c96f70fbb80b2f8eed88fa55e60cbf479abba6db012a2"
 )
 _EXPECTED_NONZERO_PROBE_SOURCE_SHA256 = (
-    "999e027d4cc35a8d59cc294020f8865036f8fb817a847ac38f96e36b597f74ac"
+    "1758567bad19e261400d027c1aab51c28dffc621ce9ad6cd819f4a1575fff0f4"
 )
 _EXPECTED_KERNEL_SOURCE_SHA256 = (
     "51e2fd91eb270f7b25ecdd117d7f06aa48a8e4af282a5a7e5e6b4c2a25dc52c9"
@@ -572,6 +579,23 @@ def _case_memory_contract(case: str) -> dict[str, int]:
     }
 
 
+def _relative_l2_limit(tensor_name: str) -> float:
+    try:
+        return _RELATIVE_L2_LIMITS[tensor_name]
+    except KeyError as error:
+        raise RuntimeError("tensor has no exact relative-L2 policy") from error
+
+
+def _numerical_gate_contract() -> dict[str, Any]:
+    return {
+        "finite_required": True,
+        "minimum_reference_l2_norm": _MIN_REFERENCE_NORM,
+        "relative_l2_strictly_below": dict(_RELATIVE_L2_LIMITS),
+        "minimum_cosine": _MIN_COSINE,
+        "maximum_absolute_error": _MAX_ABSOLUTE_ERROR,
+    }
+
+
 def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
     case = _normalize_case(case)
     sequence = _case_sequence_length(case)
@@ -698,13 +722,7 @@ def _exact_contract(case: str = _ALL_VALID_CASE) -> dict[str, Any]:
                 "dv": "probability.T @ dout grouped over query heads",
             },
         },
-        "numerical_gate_per_tensor": {
-            "finite_required": True,
-            "minimum_reference_l2_norm": _MIN_REFERENCE_NORM,
-            "relative_l2_strictly_below": _MAX_RELATIVE_L2,
-            "minimum_cosine": _MIN_COSINE,
-            "maximum_absolute_error": _MAX_ABSOLUTE_ERROR,
-        },
+        "numerical_gate_per_tensor": _numerical_gate_contract(),
         "candidate_total_seconds_strictly_below": _MAX_CANDIDATE_SECONDS,
         "promotion_total_seconds_strictly_below": (_MAX_PROMOTION_CANDIDATE_SECONDS),
     }
@@ -4151,13 +4169,13 @@ def _valid385_sensitivity_controls(
         },
     }
     affected_key_mask_decisive = (
-        affected_output_metrics["relative_l2"] >= _MAX_RELATIVE_L2
+        affected_output_metrics["relative_l2"] >= _MAX_OUTPUT_RELATIVE_L2
         or affected_output_metrics["cosine"] < _MIN_COSINE
         or affected_output_metrics["max_abs"] > _MAX_ABSOLUTE_ERROR
     )
     boundary_key_mask_decisive = {
         name: (
-            item["relative_l2"] >= _MAX_RELATIVE_L2
+            item["relative_l2"] >= _MAX_OUTPUT_RELATIVE_L2
             or item["cosine"] < _MIN_COSINE
             or item["max_abs"] > _MAX_ABSOLUTE_ERROR
         )
@@ -4165,7 +4183,7 @@ def _valid385_sensitivity_controls(
     }
     loss_gradient_failures = {
         name: (
-            item["relative_l2"] >= _MAX_RELATIVE_L2
+            item["relative_l2"] >= _MAX_GRADIENT_RELATIVE_L2
             or item["cosine"] < _MIN_COSINE
             or item["max_abs"] > _MAX_ABSOLUTE_ERROR
         )
@@ -4245,7 +4263,7 @@ def _t1024_reset_sensitivity_control(
     }
     first_half_failures = {
         name: (
-            item["relative_l2"] >= _MAX_RELATIVE_L2
+            item["relative_l2"] >= _MAX_GRADIENT_RELATIVE_L2
             or item["cosine"] < _MIN_COSINE
             or item["max_abs"] > _MAX_ABSOLUTE_ERROR
         )
@@ -4309,7 +4327,7 @@ def _t1024_omit_q512_sensitivity_control(
     }
     half_failures = {
         name: (
-            item["relative_l2"] >= _MAX_RELATIVE_L2
+            item["relative_l2"] >= _MAX_GRADIENT_RELATIVE_L2
             or item["cosine"] < _MIN_COSINE
             or item["max_abs"] > _MAX_ABSOLUTE_ERROR
         )
@@ -4684,13 +4702,15 @@ def _json_safe_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, dict[str
     }
 
 
-def _numerical_metrics_pass(item: dict[str, Any]) -> bool:
+def _numerical_metrics_pass(
+    item: dict[str, Any], *, maximum_relative_l2: float
+) -> bool:
     return bool(
         item["finite"]
         and item["shape_dtype_nbytes_exact"]
         and item["reference_l2_norm"] > _MIN_REFERENCE_NORM
         and math.isfinite(item["relative_l2"])
-        and item["relative_l2"] < _MAX_RELATIVE_L2
+        and item["relative_l2"] < maximum_relative_l2
         and math.isfinite(item["cosine_raw"])
         and item["cosine"] >= _MIN_COSINE
         and math.isfinite(item["max_abs"])
@@ -4754,7 +4774,13 @@ def _validate_candidate(
             strict=True,
         )
     }
-    per_tensor = {name: _numerical_metrics_pass(item) for name, item in metrics.items()}
+    per_tensor = {
+        name: _numerical_metrics_pass(
+            item,
+            maximum_relative_l2=_relative_l2_limit(name),
+        )
+        for name, item in metrics.items()
+    }
     padded_validation: dict[str, Any] | None = None
     padded_passed = True
     t1024_validation: dict[str, Any] | None = None
@@ -4781,7 +4807,10 @@ def _validate_candidate(
                 * 2
             ),
         )
-        affected_output_passed = _numerical_metrics_pass(affected_output_metrics)
+        affected_output_passed = _numerical_metrics_pass(
+            affected_output_metrics,
+            maximum_relative_l2=_MAX_OUTPUT_RELATIVE_L2,
+        )
         boundary_rows = (valid_tokens - 1, valid_tokens, _SEQUENCE_LENGTH - 1)
         boundary_output_metrics = {
             str(row): _tensor_metrics(
@@ -4794,7 +4823,9 @@ def _validate_candidate(
             for row in boundary_rows
         }
         boundary_output_passed = {
-            row: _numerical_metrics_pass(item)
+            row: _numerical_metrics_pass(
+                item, maximum_relative_l2=_MAX_OUTPUT_RELATIVE_L2
+            )
             for row, item in boundary_output_metrics.items()
         }
         active_gradient_metrics = {
@@ -4821,7 +4852,9 @@ def _validate_candidate(
             )
         }
         active_gradient_passed = {
-            name: _numerical_metrics_pass(item)
+            name: _numerical_metrics_pass(
+                item, maximum_relative_l2=_MAX_GRADIENT_RELATIVE_L2
+            )
             for name, item in active_gradient_metrics.items()
         }
         zero_tails = {
@@ -4870,33 +4903,36 @@ def _validate_candidate(
             "passed": padded_passed,
         }
     elif case == _ALL_VALID_T1024_CASE:
-        half_metrics = {
-            f"{name}_{axis}_rows_{start}_{stop}": _tensor_metrics(
-                np,
-                np.asarray(actual)[:, start:stop],
-                np.asarray(expected)[:, start:stop],
-                expected_shape=(
-                    _BATCH_SIZE,
-                    stop - start,
-                    heads,
-                    _HEAD_DIM,
-                ),
-                expected_actual_nbytes=(
-                    _BATCH_SIZE * (stop - start) * heads * _HEAD_DIM * 2
-                ),
-            )
-            for name, axis, actual, expected, heads in zip(
-                ("output", "dq", "dk", "dv"),
-                ("query", "query", "key", "key"),
-                actual_host,
-                expected_host,
-                (_QUERY_HEADS, _QUERY_HEADS, _KV_HEADS, _KV_HEADS),
-                strict=True,
-            )
-            for start, stop in ((0, 512), (512, 1024))
-        }
+        half_metrics = {}
+        half_limits = {}
+        for tensor_name, axis, actual, expected, heads in zip(
+            ("output", "dq", "dk", "dv"),
+            ("query", "query", "key", "key"),
+            actual_host,
+            expected_host,
+            (_QUERY_HEADS, _QUERY_HEADS, _KV_HEADS, _KV_HEADS),
+            strict=True,
+        ):
+            for start, stop in ((0, 512), (512, 1024)):
+                label = f"{tensor_name}_{axis}_rows_{start}_{stop}"
+                half_metrics[label] = _tensor_metrics(
+                    np,
+                    np.asarray(actual)[:, start:stop],
+                    np.asarray(expected)[:, start:stop],
+                    expected_shape=(
+                        _BATCH_SIZE,
+                        stop - start,
+                        heads,
+                        _HEAD_DIM,
+                    ),
+                    expected_actual_nbytes=(
+                        _BATCH_SIZE * (stop - start) * heads * _HEAD_DIM * 2
+                    ),
+                )
+                half_limits[label] = _relative_l2_limit(tensor_name)
         half_passed = {
-            name: _numerical_metrics_pass(item) for name, item in half_metrics.items()
+            name: _numerical_metrics_pass(item, maximum_relative_l2=half_limits[name])
+            for name, item in half_metrics.items()
         }
         t1024_passed = all(half_passed.values())
         t1024_validation = {
@@ -4931,13 +4967,7 @@ def _validate_candidate(
             else "failed"
         ),
         "metrics": _json_safe_metrics(metrics),
-        "thresholds_per_tensor": {
-            "finite_required": True,
-            "minimum_reference_l2_norm": _MIN_REFERENCE_NORM,
-            "relative_l2_strictly_below": _MAX_RELATIVE_L2,
-            "minimum_cosine": _MIN_COSINE,
-            "maximum_absolute_error": _MAX_ABSOLUTE_ERROR,
-        },
+        "thresholds_per_tensor": _numerical_gate_contract(),
         "duration_thresholds": {
             "candidate_total_seconds_strictly_below": _MAX_CANDIDATE_SECONDS,
             "promotion_total_seconds_strictly_below": (

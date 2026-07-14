@@ -903,11 +903,13 @@ not compare unrelated training trajectories.
 
 Initial numeric promotion thresholds are:
 
-| Candidate | Required paired result versus current BF16 JAX |
+| Candidate | Required paired result and reference boundary |
 |---|---|
-| BF16 fused stage | forward relative L2 at most `5e-3` and cosine at least `0.9999`; every LoRA/input-gradient relative L2 at most `1e-2` and cosine at least `0.999` |
+| Other BF16 fused stage | forward relative L2 at most `5e-3` and cosine at least `0.9999`; every LoRA/input-gradient relative L2 at most `1e-2` and cosine at least `0.999` versus current BF16 JAX |
+| Pallas attention versus FP32 oracle | forward-output relative L2 strictly below 1% (`<1%`, `1e-2`); each dQ/dK/dV relative L2 strictly below 3% (`<3%`, `3e-2`); established FP32-delta implementation retains its gradient regression gate of strictly below 1% (`<1%`, `1e-2`) |
 | FP32 GDN state/reduction | relative L2 at most `1e-4` on small recurrence references and at most `1e-3` through the longest tested sequence; no state-dtype demotion |
-| W8/A8/O8 stage | output cosine at least `0.995`, relative L2 at most `3e-2`, and no clipping beyond the scheme's recorded dynamic/calibration rule |
+| W8 implementation fidelity | custom kernel versus portable grouped-W8 oracle: output and every defined VJP relative L2 strictly below 1% (`<1%`, `1e-2`); forward cosine at least `0.9999` and forward maximum absolute error at most `0.25`; this excludes inherent quantization error |
+| W8/A8 quantization quality | portable quantized oracle versus BF16: output cosine at least `0.995`, relative L2 strictly below 3% (`<3%`, `3e-2`), and no clipping beyond the scheme's recorded dynamic/calibration rule; full-model gates still apply; O8 requires a separate oracle and qualification gate |
 | W4/A4 isolated oracle | output cosine at least `0.98` and relative L2 at most `0.20`; this looser unit gate does not relax the full-model gate below |
 | Quantized full model | target-logprob MAE at most `0.02` nat, p99 absolute error at most `0.1` nat, held-out NLL degradation at most 1%, LoRA-gradient cosine at least `0.99`, and gradient-norm ratio in `[0.95,1.05]` on the same batches |
 | INT8 optimizer moments | first-update direction cosine at least `0.999`, update-norm error at most 1%, all finite through a 100-step CPU replay, then the same short SFT loss gate as BF16 Adam |

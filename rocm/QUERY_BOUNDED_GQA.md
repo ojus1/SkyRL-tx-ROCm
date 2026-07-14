@@ -297,8 +297,8 @@ dispatch. A flushed `dispatch_started` record must first show one attempt and
 zero completions. The result is copied to the host and compared entirely in
 NumPy to the analytic cumulative-mean causal GQA result mapped by
 `query_head // 4`.
-The full output must be finite with relative L2 below 1%, cosine at least
-0.9999, and maximum absolute error at most 0.02.
+The full output must be finite with relative L2 strictly below 1% (`<1%`),
+cosine at least 0.9999, and maximum absolute error at most 0.02.
 
 There is no GPU reference, random input, replay, backward, padding case, or
 model-dispatcher connection in this first runtime gate. Any compile, memory,
@@ -378,9 +378,10 @@ probe compiles once and inherits the exact one-forward-call IR gate and the
 single-forward gate. Command buffers are proven disabled before backend use.
 
 The executable first runs as a candidate. Its synchronized duration must be
-below 100 ms; output must be finite with relative L2 below 1%, cosine at least
-0.9999, and maximum absolute error at most 0.02. Exact invocation counters and
-a clean current-boot journal checkpoint must also pass. Only then does the
+below 100 ms; output must be finite with relative L2 strictly below 1%
+(`<1%`), cosine at least 0.9999, and maximum absolute error at most 0.02. Exact
+invocation counters and a clean current-boot journal checkpoint must also pass.
+Only then does the
 probe issue an opaque one-shot replay authorization, bound by object identity
 to that exact executable and to clean candidate dispatch/device-get proofs.
 The first replay attempt consumes it, including an invalid attempt. The one
@@ -477,10 +478,10 @@ ROCm path must run in a fresh profiler-controlled process:
 
 The probe delegates the already-audited exact one-forward-call StableHLO,
 optimized-HLO, and compiled-memory release gates. Its synchronized candidate
-duration must be below 100 ms; output must be finite with relative L2 below
-1%, cosine at least 0.9999, and maximum absolute error at most 0.02. It remains
-unpromoted until the private child artifact and profiler telemetry receive an
-independent audit.
+duration must be below 100 ms; output must be finite with relative L2 strictly
+below 1% (`<1%`), cosine at least 0.9999, and maximum absolute error at most
+0.02. It remains unpromoted until the private child artifact and profiler
+telemetry receive an independent audit.
 
 ### ROCm 7.2.4 fully-IID result
 
@@ -822,9 +823,10 @@ this documentation change:
        --output /tmp/query-bounded-gqa-c256-t1024-nonzero-scale.jsonl
 ```
 
-Promotion required finite output, relative L2 below 0.01, cosine at least
-0.9999, maximum absolute error at most 0.02, candidate duration below the
-100 ms hard limit and 75 ms promotion ceiling, and a clean outer profiler.
+Promotion required finite output, relative L2 strictly below 1% (`<1%`,
+`0.01`), cosine at least 0.9999, maximum absolute error at most 0.02, candidate
+duration below the 100 ms hard limit and 75 ms promotion ceiling, and a clean
+outer profiler.
 The guarded run passed all gates. Its sole checked candidate dispatch took
 `6.87041300261626 ms`. The BF16 output SHA-256 was
 `590e462e2c0fc03e56ce72ee1aabd33ebbae09f8f1d309803ea9e486100f7f91`;
@@ -908,9 +910,9 @@ Runtime validation records aggregate metrics, the worst relative L2, cosine,
 maximum error, and mean error over individual query rows, plus exact metrics
 for the last unaffected, first affected, and second affected rows when those
 rows exist in the final chunk. Both aggregate and every-row gates require
-relative L2 below 0.01, cosine at least 0.9999, and maximum absolute error at
-most 0.02. Candidate duration must be below the 100 ms hard limit and 75 ms
-promotion ceiling.
+relative L2 strictly below 1% (`<1%`, `0.01`), cosine at least 0.9999, and
+maximum absolute error at most 0.02. Candidate duration must be below the
+100 ms hard limit and 75 ms promotion ceiling.
 
 The compile path pins and delegates the promoted nonzero-scale probe. It still
 requires one q768 ROCm Triton call in each IR dialect, exact parsed and
@@ -1095,6 +1097,12 @@ case is the separately pinned `valid385` loss-masked variant described below.
 The reference is an independent NumPy FP32 three-pass causal-GQA forward/VJP.
 It streams over 32-query by 32-key tiles, does not construct a full T-by-T
 matrix, and gates the forward output, dQ, dK, and dV separately.
+The current promotion policy keeps forward-output relative L2 strictly below
+1% (`<1%`) and permits each attention gradient only when relative L2 is
+strictly below 3% (`<3%`). Cosine, maximum-absolute-error, finiteness,
+shape/dtype, and padded exact numeric-zero gates are unchanged. The separately
+established FP32-delta monolithic attention path retains its stricter
+implementation-regression gate of strictly below 1% (`<1%`).
 
 The default path imports no JAX and emits only an abstract refusal. The guarded
 runtime command uses a fresh mode-`0600` artifact and the full practical VRAM
@@ -1372,8 +1380,10 @@ all gates pass in fresh, profiler-controlled processes:
 4. Run an arbitrary-cotangent VJP at the same buckets and compare sampled/full
    gradients where the reference fits. The all-valid T=512 arbitrary-cotangent
    gate and exact `valid385` loss-masked active-token-cotangent gate are
-   complete; every other padding boundary and every longer bucket remain
-   unpromoted.
+   complete under the historical stricter evidence. New promotion requires
+   output relative L2 strictly below 1% (`<1%`) and every dQ/dK/dV relative L2
+   strictly below 3% (`<3%`); every other padding boundary and every longer
+   bucket remain unpromoted.
 5. Repeat padding boundaries including valid lengths 1, `T-1`, and `T`.
 6. Repeat every promoted bucket enough times to expose replay and cleanup
    faults, with command buffers disabled and kernel/journal monitoring active.

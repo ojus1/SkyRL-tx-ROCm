@@ -43,8 +43,11 @@ ROCm effective (bucketed) context 512 and above must explicitly select
 `--attention-backend pallas`; the code refuses the quadratic XLA fallback.
 Before the FP32-delta patch, the isolated 2,048-token Pallas path passed the
 hardware safety gate but its `dq`/`dk` relative L2 remained about 1.1%, above
-the 1% numerical promotion threshold. A successful compile therefore proved
-capacity only, not numerical promotion for training.
+the then-current gradient promotion threshold of strictly below 1% (`<1%`)
+but below the now-authorized outer gradient threshold of strictly below 3%
+(`<3%`). That runtime evidence remained unpromoted under the then-current
+policy. Independently, the successful compile proved capacity only because it
+executed no numerical comparison.
 
 The attention integration now installs a narrow, fail-closed JAX 0.10.2 patch
 that casts only the Pallas backward delta preprocess's loaded `O` and `dO`
@@ -52,9 +55,11 @@ tiles to FP32 before their product and reduction. In CPU interpret mode at the
 exact Qwen3.5 geometry `T=64, Hq=16, Hkv=4, D=256`, seed 0 `dq`/`dk`
 relative L2 improved from `0.00763/0.00782` to `0.00317/0.00420`; forward,
 `dV`, and the bounded FP32 reference were unchanged. Both patched gradients
-pass the existing 1% gate without relaxing it. The guarded ROCm qualification
-below subsequently promoted this patch through the full reference-supported
-512/1,024/2,048-token ladder.
+pass the retained FP32-delta regression gate of strictly below 1% (`<1%`),
+nested inside the outer gradient gate of strictly below 3% (`<3%`); forward
+retains its output gate of strictly below 1% (`<1%`). The guarded ROCm
+qualification below subsequently promoted this patch through the full
+reference-supported 512/1,024/2,048-token ladder.
 
 ## ROCm 7.2.4 hardware results
 
@@ -77,7 +82,10 @@ patched Pallas forward and gradients with the bounded FP32 reference. Each
 process used exact BF16
 `B=1, Hq=16, Hkv=4, D=256`, one warmup, one measured repeat, BFC growth with a
 0.75 fraction, command buffers disabled, and the 4 GiB/80 C telemetry limits.
-The 1% relative-L2 promotion threshold was not relaxed.
+These evidence runs required output and gradients strictly below 1% (`<1%`).
+Current policy requires output strictly below 1% (`<1%`), permits gradients
+only strictly below 3% (`<3%`), and retains the FP32-delta
+implementation-regression gate of strictly below 1% (`<1%`).
 
 | T / valid / seed | output rel-L2 | dQ rel-L2 | dK rel-L2 | dV rel-L2 | steady forward / backward | Physical VRAM | Junction / power max |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -90,8 +98,9 @@ The 1% relative-L2 promotion threshold was not relaxed.
 
 All outputs and gradients were finite and every reference comparison passed.
 The worst result was dK at seed 1, `0.003628` (0.363%), leaving about 2.76x
-margin to the 1% gate. All profiler summaries completed with return code zero,
-swap stayed at zero, and the kernel log stayed available and fault-free. After
+margin to the stricter FP32-delta regression gate of strictly below 1%
+(`<1%`). All profiler summaries completed with return code zero, swap stayed
+at zero, and the kernel log stayed available and fault-free. After
 every process, separate point-in-time postchecks found the boot quarantine
 clean, `/dev/kfd` and the AMD render node unowned, and the card back in runtime
 suspend. The single-repeat latencies are promotion smoke measurements, not

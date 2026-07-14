@@ -182,7 +182,7 @@ def test_static_binding_pins_promoted_nonzero_gate(monkeypatch):
     assert proof["nonzero_scale_helper_resolved_file_matches_expected"] is True
     assert (
         proof["delegated_nonzero_scale_probe_source_sha256"]
-        == "999e027d4cc35a8d59cc294020f8865036f8fb817a847ac38f96e36b597f74ac"
+        == "1758567bad19e261400d027c1aab51c28dffc621ce9ad6cd819f4a1575fff0f4"
     )
     path = _PROBE._source_files()[
         "delegated_nonzero_scale_probe_source_sha256"
