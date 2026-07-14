@@ -225,8 +225,34 @@ custom-kernel thunks:
 | 4 | `skyrl_qwen35_w8a8_lora_forward` | `1x2x1` | `128x1x1` | 1,024 | 7,160 / `87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f` |
 | 5 | `wrapped_slice` | `1x1x1` | `51x1x1` | 0 | 3,416 / `476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799` |
 
-All six thunk serializations and all seven ELFs are byte-identical across the
-two corrected builds. The first four ELFs are also byte-identical to the
+Fresh compile `/tmp/skyrl-w8a8-compile-1784038127` exposed one bounded
+autotune variant. StableHLO and the W8 Pallas thunk/ELF remain byte-identical,
+while the separate LoRA-A BF16 GEMM selected `block_m=block_n=32`. The
+normalized executable is 53,166 bytes with SHA-256
+`4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985`;
+its normalized HLO hash is
+`9978dc0830323f4331dcb7c537fcbc56d8263be070d6f545b43191a8e651085b`.
+Only thunk 2 differs: 7,922 bytes / SHA-256
+`0a6c802363f4c8dc30ddfebb195cccc66d4dadc4138db5860736c879de132a2d`,
+16,384 bytes LDS, and a 7,664-byte ELF / SHA-256
+`9ab0e3abac1983fcb44279f9fe1b40da01186a6d674e271b6c103cbb69c40b2a`.
+
+Offline qualification now pins two complete historical-artifact contracts:
+`lora_gemm_bm16_bn16` (`b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57`)
+and `lora_gemm_bm32_bn32`
+(`75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7`).
+The selected name must match its complete normalized record/HLO, ordered
+thunks, launches, and nested ELFs in the inspector, child, and independent
+controller. Unknown or cross-paired variants are rejected. Because exact HLO
+source locations changed with the allowlist patch, current-source runtime is
+still blocked pending clean seeds of both autotune outcomes from one frozen
+layout and a clean post-pin compile/offline-inspection rerun. The child check
+is pre-dispatch; the controller's independent repeat is postflight. No W8 ISA
+check is relaxed, and the entries above remain compile/offline evidence rather
+than dispatch permission.
+
+Across the two earlier BM16 corrected builds, all six thunk serializations and
+all seven ELFs are byte-identical. The first four ELFs are also byte-identical to the
 masked executable. The corrected Pallas object is 7,160 bytes, targets
 gfx1100, uses 34 SGPRs and 105 VGPRs, and reports no spills. Its disassembly
 has exactly four signed IU8-WMMA instructions and nine barriers; its sole

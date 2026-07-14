@@ -402,8 +402,41 @@ custom-kernel thunks:
 | 4 | `skyrl_qwen35_w8a8_lora_forward` | `1x2x1` | `128x1x1` | 1,024 | 7,160 / `87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f` |
 | 5 | `wrapped_slice` | `1x1x1` | `51x1x1` | 0 | 3,416 / `476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799` |
 
-All six thunk serializations and all seven embedded ELFs are byte-identical
-across the two corrected builds. The first four objects also remain
+The later fresh compile at commit
+`5981d493d0edefd9b01c92ef8cfff6c6c2be4cee` in
+`/tmp/skyrl-w8a8-compile-1784038127` retained the identical 15,351-byte
+StableHLO and exact W8 Pallas object, but the per-fusion autotuner selected
+`block_m=block_n=32` rather than 16 for the separate LoRA-A BF16 GEMM. Its
+cache is 18,839 bytes with SHA-256
+`13d349e2bbbde57f1b84e2116ca120cab217b89ef49db13964660c02abe657dc`;
+the normalized executable is 53,166 bytes with SHA-256
+`4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985`,
+and its normalized 20,600-byte HLO field has SHA-256
+`9978dc0830323f4331dcb7c537fcbc56d8263be070d6f545b43191a8e651085b`.
+Only thunk 2 changes: its serialization is 7,922 bytes with SHA-256
+`0a6c802363f4c8dc30ddfebb195cccc66d4dadc4138db5860736c879de132a2d`,
+its dynamic LDS is 16,384 bytes, and its 7,664-byte ELF has SHA-256
+`9ab0e3abac1983fcb44279f9fe1b40da01186a6d674e271b6c103cbb69c40b2a`.
+The auxiliary ELF uses 14 SGPRs, 159 VGPRs, and no spills; the BM16 object
+uses 14 SGPRs, 164 VGPRs, and no spills.
+
+The offline verifier therefore recognizes exactly two atomic **historical
+artifact** variants: `lora_gemm_bm16_bn16` with complete-contract SHA-256
+`b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57`,
+and `lora_gemm_bm32_bn32` with complete-contract SHA-256
+`75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7`.
+Each name binds its normalized record, normalized HLO, all six thunk
+serializations and launches, and all six nested ELFs. Unknown configurations
+and mixed BM16/BM32 tuples fail closed. Source-line metadata is intentionally
+part of those hashes, so these retained contracts do not yet authorize an
+executable compiled from the later allowlist source layout. Runtime remains
+blocked until clean compile-only seeds capture both autotune outcomes from one
+frozen layout and a post-pin clean compile passes the child pre-dispatch
+inspector. The controller repeats that inspection independently as postflight
+attestation after the supervised child exits.
+
+Across the two earlier BM16 corrected builds, all six thunk serializations and
+all seven embedded ELFs are byte-identical. The first four objects also remain
 byte-identical to the masked build. The corrected Pallas object targets
 gfx1100, uses 34 SGPRs and 105 VGPRs, reports no spills, and contains exactly
 four signed IU8 WMMAs and nine barriers. Its sole forward branch is after all

@@ -207,9 +207,16 @@ def test_operational_controller_accepts_phase_bound_run_directory_layout(
     assert parsed.run_dir == run_dir
 
 
-def _exact_independent_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
+def _exact_independent_isa_evidence(
+    cache: Path,
+    cache_sha: str,
+    executable_variant: str = "lora_gemm_bm16_bn16",
+) -> dict[str, object]:
+    variant = _CONTROLLER._EXPECTED_EXECUTABLE_VARIANTS[executable_variant]
     return {
         "status": "passed_offline_isa_verification",
+        "executable_variant": executable_variant,
+        "executable_variant_contract_sha256": variant["contract_sha256"],
         "offline_only": True,
         "device_access_performed": False,
         "jax_modules_imported_by_verifier": False,
@@ -225,12 +232,16 @@ def _exact_independent_isa_evidence(cache: Path, cache_sha: str) -> dict[str, ob
             "written_elf": None,
         },
         "elf_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": variant["contract_sha256"],
             "elf_count": 7,
             "nested_elf_count": 6,
             "unique_exact_symbol_candidate_count": 1,
             "ordered_nested_contract_matched": True,
         },
         "thunk_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": variant["contract_sha256"],
             "executable_record_sha256_is_path_dependent": True,
             "caller_bound_autotune_cache_path": str(
                 cache.parent / "xla_gpu_per_fusion_autotune_cache_dir"
@@ -239,10 +250,14 @@ def _exact_independent_isa_evidence(cache: Path, cache_sha: str) -> dict[str, ob
             "caller_bound_autotune_cache_path_normalized": True,
             "caller_bound_autotune_cache_path_field_offset": 19_901,
             "caller_bound_autotune_cache_path_record_offset": 19_905,
-            "normalized_executable_record_bytes": 52_909,
-            "normalized_executable_record_sha256": (
-                _CONTROLLER._EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
-            ),
+            "normalized_executable_record_bytes": variant[
+                "normalized_executable_record_bytes"
+            ],
+            "normalized_executable_record_sha256": variant[
+                "normalized_executable_record_sha256"
+            ],
+            "normalized_hlo_module_bytes": variant["normalized_hlo_module_bytes"],
+            "normalized_hlo_module_sha256": variant["normalized_hlo_module_sha256"],
             "thunk_count": 6,
             "all_thunks_are_exact_custom_kernels": True,
             "sequential_wrapper_present": False,
@@ -250,13 +265,24 @@ def _exact_independent_isa_evidence(cache: Path, cache_sha: str) -> dict[str, ob
             "ordered_thunks": [
                 {
                     "kernel": kernel,
+                    "bytes": thunk_bytes,
+                    "sha256": thunk_sha256,
                     "grid": grid,
                     "threads": threads,
                     "shared_memory_bytes": shared,
+                    "elf_bytes": elf_bytes,
+                    "elf_sha256": elf_sha256,
                 }
-                for kernel, grid, threads, shared in (
-                    _CONTROLLER._EXPECTED_ORDERED_THUNK_LAUNCHES
-                )
+                for (
+                    kernel,
+                    thunk_bytes,
+                    thunk_sha256,
+                    grid,
+                    threads,
+                    shared,
+                    elf_bytes,
+                    elf_sha256,
+                ) in variant["ordered_thunks"]
             ],
         },
         "isa": {
@@ -286,11 +312,15 @@ def _independent_isa_case() -> tuple[Path, dict[str, object], Path, str]:
     return artifact_root, inventory, artifact_root / relative, cache_sha
 
 
+@pytest.mark.parametrize(
+    "executable_variant",
+    ["lora_gemm_bm16_bn16", "lora_gemm_bm32_bn32"],
+)
 def test_independent_fresh_isa_qualification_consumes_normalized_contract(
-    monkeypatch,
+    monkeypatch, executable_variant: str
 ) -> None:
     artifact_root, inventory, cache, cache_sha = _independent_isa_case()
-    evidence = _exact_independent_isa_evidence(cache, cache_sha)
+    evidence = _exact_independent_isa_evidence(cache, cache_sha, executable_variant)
     import rocm.inspect_w8a8_lora_isa as inspector
 
     monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
@@ -300,6 +330,7 @@ def test_independent_fresh_isa_qualification_consumes_normalized_contract(
     )
 
     assert qualification["passed"] is True
+    assert qualification["evidence"]["executable_variant"] == executable_variant
     assert qualification["checks"]["six_ordered_custom_kernel_thunks"] is True
 
 
@@ -308,6 +339,7 @@ def test_independent_fresh_isa_qualification_consumes_normalized_contract(
     [
         ("normalized_executable_record_bytes", 52_908),
         ("normalized_executable_record_sha256", "0" * 64),
+        ("normalized_hlo_module_sha256", "0" * 64),
         ("executable_record_sha256_is_path_dependent", False),
         ("caller_bound_autotune_cache_path", "/tmp/wrong"),
         ("caller_bound_autotune_cache_path_occurrences", 2),
@@ -326,6 +358,65 @@ def test_independent_fresh_isa_qualification_rejects_normalization_mutation(
 
     monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
 
+    with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
+        _CONTROLLER._independent_fresh_isa_qualification(artifact_root, inventory)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("shared_memory_bytes", 16_385), ("elf_sha256", "0" * 64)],
+)
+def test_independent_fresh_isa_qualification_rejects_altered_variant_thunk(
+    monkeypatch, field: str, value: object
+) -> None:
+    artifact_root, inventory, cache, cache_sha = _independent_isa_case()
+    evidence = _exact_independent_isa_evidence(cache, cache_sha, "lora_gemm_bm32_bn32")
+    evidence["thunk_inventory"]["ordered_thunks"][2][field] = value  # type: ignore[index]
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
+    with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
+        _CONTROLLER._independent_fresh_isa_qualification(artifact_root, inventory)
+
+
+def test_independent_fresh_isa_qualification_rejects_bool_in_integer_grid(
+    monkeypatch,
+) -> None:
+    artifact_root, inventory, cache, cache_sha = _independent_isa_case()
+    evidence = _exact_independent_isa_evidence(cache, cache_sha)
+    evidence["thunk_inventory"]["ordered_thunks"][0]["grid"] = [True, 1, 1]  # type: ignore[index]
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
+    with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
+        _CONTROLLER._independent_fresh_isa_qualification(artifact_root, inventory)
+
+
+def test_independent_fresh_isa_qualification_rejects_unknown_or_mixed_variant(
+    monkeypatch,
+) -> None:
+    artifact_root, inventory, cache, cache_sha = _independent_isa_case()
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    unknown = _exact_independent_isa_evidence(cache, cache_sha)
+    unknown["executable_variant"] = "unknown"
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: unknown)
+    with pytest.raises(RuntimeError, match="executable_variant_exact"):
+        _CONTROLLER._independent_fresh_isa_qualification(artifact_root, inventory)
+
+    mixed = _exact_independent_isa_evidence(cache, cache_sha)
+    bm32 = _CONTROLLER._EXPECTED_EXECUTABLE_VARIANTS["lora_gemm_bm32_bn32"]
+    mixed["executable_variant"] = "lora_gemm_bm32_bn32"
+    mixed["executable_variant_contract_sha256"] = bm32["contract_sha256"]
+    mixed["thunk_inventory"]["executable_variant"] = "lora_gemm_bm32_bn32"  # type: ignore[index]
+    mixed["thunk_inventory"]["executable_variant_contract_sha256"] = bm32[  # type: ignore[index]
+        "contract_sha256"
+    ]
+    mixed["elf_inventory"]["executable_variant"] = "lora_gemm_bm32_bn32"  # type: ignore[index]
+    mixed["elf_inventory"]["executable_variant_contract_sha256"] = bm32[  # type: ignore[index]
+        "contract_sha256"
+    ]
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: mixed)
     with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
         _CONTROLLER._independent_fresh_isa_qualification(artifact_root, inventory)
 
@@ -2097,6 +2188,8 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
     artifact_inventory = _CONTROLLER._independent_compiler_artifact_inventory(
         artifact_root
     )
+    executable_variant = "lora_gemm_bm16_bn16"
+    variant = _CONTROLLER._EXPECTED_EXECUTABLE_VARIANTS[executable_variant]
     isa = {
         "symbol": _CONTROLLER._EXPECTED_KERNEL_NAME,
         "amdgpu_target": _CONTROLLER._EXPECTED_NESTED_ELF_TARGET,
@@ -2115,6 +2208,8 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
     }
     isa_evidence = {
         "status": "passed_offline_isa_verification",
+        "executable_variant": executable_variant,
+        "executable_variant_contract_sha256": variant["contract_sha256"],
         "offline_only": True,
         "device_access_performed": False,
         "jax_modules_imported_by_verifier": False,
@@ -2131,12 +2226,16 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "written_elf": None,
         },
         "elf_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": variant["contract_sha256"],
             "elf_count": 7,
             "nested_elf_count": 6,
             "unique_exact_symbol_candidate_count": 1,
             "ordered_nested_contract_matched": True,
         },
         "thunk_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": variant["contract_sha256"],
             "executable_record_sha256_is_path_dependent": True,
             "caller_bound_autotune_cache_path": str(
                 cache.parent / "xla_gpu_per_fusion_autotune_cache_dir"
@@ -2145,10 +2244,14 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "caller_bound_autotune_cache_path_normalized": True,
             "caller_bound_autotune_cache_path_field_offset": 19901,
             "caller_bound_autotune_cache_path_record_offset": 19905,
-            "normalized_executable_record_bytes": 52909,
-            "normalized_executable_record_sha256": (
-                _CONTROLLER._EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
-            ),
+            "normalized_executable_record_bytes": variant[
+                "normalized_executable_record_bytes"
+            ],
+            "normalized_executable_record_sha256": variant[
+                "normalized_executable_record_sha256"
+            ],
+            "normalized_hlo_module_bytes": variant["normalized_hlo_module_bytes"],
+            "normalized_hlo_module_sha256": variant["normalized_hlo_module_sha256"],
             "thunk_count": 6,
             "all_thunks_are_exact_custom_kernels": True,
             "sequential_wrapper_present": False,
@@ -2156,11 +2259,24 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "ordered_thunks": [
                 {
                     "kernel": kernel,
+                    "bytes": thunk_bytes,
+                    "sha256": thunk_sha256,
                     "grid": grid,
                     "threads": threads,
                     "shared_memory_bytes": shared,
+                    "elf_bytes": elf_bytes,
+                    "elf_sha256": elf_sha256,
                 }
-                for kernel, grid, threads, shared in _CONTROLLER._EXPECTED_ORDERED_THUNK_LAUNCHES
+                for (
+                    kernel,
+                    thunk_bytes,
+                    thunk_sha256,
+                    grid,
+                    threads,
+                    shared,
+                    elf_bytes,
+                    elf_sha256,
+                ) in variant["ordered_thunks"]
             ],
         },
         "isa": isa,
@@ -2229,6 +2345,7 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "offline_inspector",
             "caller_bound_fresh_cache",
             "one_unique_exact_symbol_candidate",
+            "executable_variant_exact",
             "six_ordered_custom_kernel_thunks",
             "candidate_bytes_exact",
             "candidate_sha256_exact",

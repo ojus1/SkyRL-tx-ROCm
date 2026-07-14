@@ -281,6 +281,8 @@ def _synthetic_gpu_executable(
     *,
     grid_override: tuple[int, int, int] | None = None,
     non_custom_thunk_index: int | None = None,
+    gemm_shared_memory_bytes: int | None = None,
+    gemm_text_size: int = 8,
     cache_path: Path = _SYNTHETIC_CACHE_PATH,
     autotune_path_copies: int = 1,
     preexisting_normalized_path: bool = False,
@@ -290,13 +292,15 @@ def _synthetic_gpu_executable(
     expected_thunks = []
     for index, source in enumerate(_ISA._EXPECTED_THUNKS):
         expected = dict(source)
+        if index == 2 and gemm_shared_memory_bytes is not None:
+            expected["shared_memory_bytes"] = gemm_shared_memory_bytes
         kernel_name = str(expected["kernel"])
         annotation = str(expected["annotation"])
         arguments = int(expected["arguments"])
         grid = tuple(expected["grid"])
         encoded_grid = grid_override if index == 4 and grid_override else grid
         threads = tuple(expected["threads"])
-        elf = _elf(kernel_name)
+        elf = _elf(kernel_name, text_size=gemm_text_size if index == 2 else 8)
         loader = b"".join(
             (
                 _bytes_field(2, _bytes_field(1, elf)),
@@ -359,37 +363,48 @@ def _bind_synthetic_thunks(
     *,
     cache_path: Path = _SYNTHETIC_CACHE_PATH,
 ) -> None:
-    monkeypatch.setattr(_ISA, "_EXPECTED_THUNKS", expected)
+    _bind_synthetic_variants(
+        monkeypatch,
+        {"synthetic": (executable, expected)},
+        cache_path=cache_path,
+    )
+
+
+def _bind_synthetic_variants(
+    monkeypatch,
+    variants: dict[str, tuple[bytes, tuple[dict[str, object], ...]]],
+    *,
+    cache_path: Path = _SYNTHETIC_CACHE_PATH,
+) -> None:
     autotune_cache_path = os.fsencode(
         cache_path.parent / os.fsdecode(_ISA._AUTOTUNE_CACHE_DIRECTORY)
     )
-    normalized = executable.replace(
-        autotune_cache_path, _ISA._NORMALIZED_AUTOTUNE_CACHE_PATH
-    )
-    fields = _ISA._wire_fields(executable, label="synthetic", max_fields=32)
+    contracts = {}
+    first_executable = next(iter(variants.values()))[0]
+    fields = _ISA._wire_fields(first_executable, label="synthetic", max_fields=32)
     hlo_module = fields[0][2]
     assert isinstance(hlo_module, bytes)
-    normalized_fields = _ISA._wire_fields(
-        normalized, label="normalized synthetic", max_fields=32
-    )
-    normalized_hlo_module = normalized_fields[0][2]
-    assert isinstance(normalized_hlo_module, bytes)
-    monkeypatch.setattr(
-        _ISA, "_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_BYTES", len(normalized)
-    )
-    monkeypatch.setattr(
-        _ISA,
-        "_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256",
-        hashlib.sha256(normalized).hexdigest(),
-    )
-    monkeypatch.setattr(
-        _ISA, "_EXPECTED_NORMALIZED_HLO_MODULE_BYTES", len(normalized_hlo_module)
-    )
-    monkeypatch.setattr(
-        _ISA,
-        "_EXPECTED_NORMALIZED_HLO_MODULE_SHA256",
-        hashlib.sha256(normalized_hlo_module).hexdigest(),
-    )
+    for name, (executable, expected) in variants.items():
+        normalized = executable.replace(
+            autotune_cache_path, _ISA._NORMALIZED_AUTOTUNE_CACHE_PATH
+        )
+        normalized_fields = _ISA._wire_fields(
+            normalized, label=f"normalized synthetic {name}", max_fields=32
+        )
+        normalized_hlo_module = normalized_fields[0][2]
+        assert isinstance(normalized_hlo_module, bytes)
+        contracts[name] = {
+            "normalized_executable_record_bytes": len(normalized),
+            "normalized_executable_record_sha256": hashlib.sha256(
+                normalized
+            ).hexdigest(),
+            "normalized_hlo_module_bytes": len(normalized_hlo_module),
+            "normalized_hlo_module_sha256": hashlib.sha256(
+                normalized_hlo_module
+            ).hexdigest(),
+            "thunks": expected,
+        }
+    monkeypatch.setattr(_ISA, "_EXPECTED_EXECUTABLE_VARIANTS", contracts)
     monkeypatch.setattr(_ISA, "_EXPECTED_AUTOTUNE_PATH_BYTES", len(autotune_cache_path))
     monkeypatch.setattr(
         _ISA,
@@ -399,7 +414,7 @@ def _bind_synthetic_thunks(
     monkeypatch.setattr(
         _ISA,
         "_EXPECTED_AUTOTUNE_PATH_RECORD_OFFSET",
-        executable.find(autotune_cache_path),
+        first_executable.find(autotune_cache_path),
     )
 
 
@@ -671,6 +686,11 @@ def test_thunk_decoder_pins_six_ordered_custom_kernel_launches(monkeypatch) -> N
     assert evidence["all_thunks_are_exact_custom_kernels"] is True
     assert evidence["sequential_wrapper_present"] is False
     assert evidence["device_to_device_copy_thunk_present"] is False
+    assert evidence["executable_variant"] == "synthetic"
+    contract = _ISA._EXPECTED_EXECUTABLE_VARIANTS["synthetic"]
+    assert evidence["executable_variant_contract_sha256"] == (
+        _ISA._variant_contract_sha256("synthetic", contract)
+    )
     assert evidence["executable_record_sha256_is_path_dependent"] is True
     assert evidence["caller_bound_autotune_cache_path_normalized"] is True
     assert evidence["caller_bound_autotune_cache_path_occurrences"] == 1
@@ -682,11 +702,11 @@ def test_thunk_decoder_pins_six_ordered_custom_kernel_launches(monkeypatch) -> N
     )
     assert (
         evidence["normalized_hlo_module_bytes"]
-        == _ISA._EXPECTED_NORMALIZED_HLO_MODULE_BYTES
+        == contract["normalized_hlo_module_bytes"]
     )
     assert (
         evidence["normalized_hlo_module_sha256"]
-        == _ISA._EXPECTED_NORMALIZED_HLO_MODULE_SHA256
+        == contract["normalized_hlo_module_sha256"]
     )
     ordered = evidence["ordered_thunks"]
     assert [item["thunk_id"] for item in ordered] == [1, 2, 3, 4, 5, 6]
@@ -696,6 +716,116 @@ def test_thunk_decoder_pins_six_ordered_custom_kernel_launches(monkeypatch) -> N
     assert ordered[4]["shared_memory_bytes"] == 1024
     assert ordered[5]["kernel"] == "wrapped_slice"
     assert ordered[5]["threads"] == [51, 1, 1]
+
+
+def test_production_executable_variants_pin_both_complete_contracts() -> None:
+    bm16 = _ISA._EXPECTED_EXECUTABLE_VARIANTS["lora_gemm_bm16_bn16"]
+    bm32 = _ISA._EXPECTED_EXECUTABLE_VARIANTS["lora_gemm_bm32_bn32"]
+
+    assert (
+        bm16["normalized_executable_record_sha256"]
+        == "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08"
+    )
+    assert (
+        bm32["normalized_executable_record_sha256"]
+        == "4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985"
+    )
+    assert bm16["thunks"][2]["shared_memory_bytes"] == 8_192
+    assert bm16["thunks"][2]["elf_sha256"].startswith("c45a0fb7")
+    assert bm32["thunks"][2]["shared_memory_bytes"] == 16_384
+    assert bm32["thunks"][2]["elf_sha256"].startswith("9ab0e3ab")
+    assert _ISA._variant_contract_sha256("lora_gemm_bm16_bn16", bm16) == (
+        "b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57"
+    )
+    assert _ISA._variant_contract_sha256("lora_gemm_bm32_bn32", bm32) == (
+        "75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7"
+    )
+
+
+def test_thunk_decoder_accepts_both_atomic_executable_variants(monkeypatch) -> None:
+    bm16 = _synthetic_gpu_executable()
+    bm32 = _synthetic_gpu_executable(gemm_shared_memory_bytes=16_384, gemm_text_size=16)
+    variants = {"bm16": bm16, "bm32": bm32}
+    _bind_synthetic_variants(monkeypatch, variants)
+
+    for name, (executable, _expected) in variants.items():
+        records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
+        evidence = _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
+        assert evidence["executable_variant"] == name
+        assert evidence["executable_variant_contract_sha256"] == (
+            _ISA._variant_contract_sha256(
+                name, _ISA._EXPECTED_EXECUTABLE_VARIANTS[name]
+            )
+        )
+    assert (
+        _ISA._EXPECTED_EXECUTABLE_VARIANTS["bm16"]["thunks"][2]["shared_memory_bytes"]
+        == 8_192
+    )
+    assert (
+        _ISA._EXPECTED_EXECUTABLE_VARIANTS["bm32"]["thunks"][2]["shared_memory_bytes"]
+        == 16_384
+    )
+
+
+def test_thunk_decoder_rejects_unknown_and_mixed_executable_variants(
+    monkeypatch,
+) -> None:
+    bm16_executable, bm16_expected = _synthetic_gpu_executable()
+    bm32_executable, bm32_expected = _synthetic_gpu_executable(
+        gemm_shared_memory_bytes=16_384, gemm_text_size=16
+    )
+    records = [
+        _ISA._EXPECTED_SPLIT_MANIFEST,
+        b"",
+        b"wrapper",
+        b"",
+        bm32_executable,
+    ]
+
+    _bind_synthetic_variants(monkeypatch, {"bm16": (bm16_executable, bm16_expected)})
+    with pytest.raises(_ISA.VerificationError, match="one exact full-tile variant"):
+        _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
+
+    _bind_synthetic_variants(monkeypatch, {"mixed": (bm32_executable, bm16_expected)})
+    with pytest.raises(_ISA.VerificationError, match="serialization changed"):
+        _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
+
+    assert bm32_expected != bm16_expected
+
+
+def test_thunk_decoder_rejects_variant_with_altered_lds_or_elf(monkeypatch) -> None:
+    lds_executable, lds_expected = _synthetic_gpu_executable(
+        gemm_shared_memory_bytes=16_385, gemm_text_size=16
+    )
+    lds_contract = tuple(dict(item) for item in lds_expected)
+    lds_contract[2]["shared_memory_bytes"] = 16_384
+    _bind_synthetic_variants(
+        monkeypatch, {"altered_lds": (lds_executable, lds_contract)}
+    )
+    with pytest.raises(_ISA.VerificationError, match="LDS allocation changed"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", lds_executable],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
+
+    elf_executable, elf_expected = _synthetic_gpu_executable(
+        gemm_shared_memory_bytes=16_384, gemm_text_size=24
+    )
+    reference_executable, reference_expected = _synthetic_gpu_executable(
+        gemm_shared_memory_bytes=16_384, gemm_text_size=16
+    )
+    del reference_executable
+    elf_contract = tuple(dict(item) for item in elf_expected)
+    elf_contract[2]["elf_bytes"] = reference_expected[2]["elf_bytes"]
+    elf_contract[2]["elf_sha256"] = reference_expected[2]["elf_sha256"]
+    _bind_synthetic_variants(
+        monkeypatch, {"altered_elf": (elf_executable, elf_contract)}
+    )
+    with pytest.raises(_ISA.VerificationError, match="embedded gfx1100 object changed"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", elf_executable],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
 
 
 def test_thunk_decoder_normalizes_only_the_caller_bound_run_path(monkeypatch) -> None:
@@ -1245,6 +1375,17 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
         _ISA, "_EXPECTED_METADATA_SHA256", hashlib.sha256(metadata).hexdigest()
     )
     _bind_synthetic_wrapper(monkeypatch, records)
+    synthetic_variant_contract = {
+        "thunks": tuple(
+            {"kernel": kernel, "elf_bytes": size, "elf_sha256": digest}
+            for kernel, size, digest in _ISA._EXPECTED_NESTED_ELFS
+        )
+    }
+    monkeypatch.setattr(
+        _ISA,
+        "_EXPECTED_EXECUTABLE_VARIANTS",
+        {"synthetic": synthetic_variant_contract},
+    )
     monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_BYTES", len(candidate))
     monkeypatch.setattr(_ISA, "_EXPECTED_HSACO_SHA256", expected_elf)
 
@@ -1256,6 +1397,8 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
         _ISA,
         "_inspect_thunks",
         lambda _records, *, cache_path: {
+            "executable_variant": "synthetic",
+            "executable_variant_contract_sha256": "f" * 64,
             "executable_record_bytes": len(records[4]),
             "executable_record_sha256": hashlib.sha256(records[4]).hexdigest(),
             "normalized_executable_record_bytes": len(records[4]),
@@ -1296,6 +1439,7 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
 
     json.dumps(evidence)
     assert evidence["status"] == "passed_offline_isa_verification"
+    assert evidence["executable_variant"] == "synthetic"
     assert evidence["offline_only"] is True
     assert evidence["device_access_performed"] is False
     assert evidence["candidate"] == {

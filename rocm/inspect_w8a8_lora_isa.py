@@ -16,7 +16,9 @@ identifier as evidence, and pins the caller-path-normalized complete executable
 record, ordered thunk serializations, launch dimensions, embedded gfx1100
 objects, forward resource contract, and the full-tile kernel's barrier/branch
 epilogue.  The forward object must contain exactly four IU8 WMMA instructions
-with the expected ``neg_lo`` operand modifier.
+with the expected ``neg_lo`` operand modifier.  Two complete executable
+variants are admitted atomically because fresh autotuning can select either
+exact auxiliary LoRA GEMM tile; the W8 forward object is identical in both.
 """
 
 from __future__ import annotations
@@ -73,6 +75,8 @@ _EXPECTED_NORMALIZED_HLO_MODULE_BYTES = 20_600
 _EXPECTED_NORMALIZED_HLO_MODULE_SHA256 = (
     "1cac7332465fe69bd9d4ae2a53dbd0454a5f3ca4fd28bbdbd400a66a30dde1cd"
 )
+_EXECUTABLE_VARIANT_BM16 = "lora_gemm_bm16_bn16"
+_EXECUTABLE_VARIANT_BM32 = "lora_gemm_bm32_bn32"
 _AUTOTUNE_CACHE_DIRECTORY = b"xla_gpu_per_fusion_autotune_cache_dir"
 _NORMALIZED_AUTOTUNE_CACHE_PATH = (
     b"/tmp/skyrl-w8a8-neutral-0000000000/compiler-artifacts/jax-cache/"
@@ -180,6 +184,49 @@ _EXPECTED_THUNKS = (
         "elf_sha256": "476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799",
     },
 )
+_EXPECTED_BM32_THUNKS = (
+    _EXPECTED_THUNKS[0],
+    _EXPECTED_THUNKS[1],
+    {
+        "annotation": "gemm_fusion_dot_general.1",
+        "kernel": "gemm_fusion_dot_general_1",
+        "id": 3,
+        "bytes": 7_922,
+        "sha256": "0a6c802363f4c8dc30ddfebb195cccc66d4dadc4138db5860736c879de132a2d",
+        "arguments": 3,
+        "written": (0, 0, 1),
+        "grid": (1, 1, 1),
+        "threads": (128, 1, 1),
+        "shared_memory_bytes": 16_384,
+        "elf_bytes": 7_664,
+        "elf_sha256": "9ab0e3abac1983fcb44279f9fe1b40da01186a6d674e271b6c103cbb69c40b2a",
+    },
+    *_EXPECTED_THUNKS[3:],
+)
+_EXPECTED_EXECUTABLE_VARIANTS = {
+    _EXECUTABLE_VARIANT_BM16: {
+        "normalized_executable_record_bytes": (
+            _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_BYTES
+        ),
+        "normalized_executable_record_sha256": (
+            _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
+        ),
+        "normalized_hlo_module_bytes": _EXPECTED_NORMALIZED_HLO_MODULE_BYTES,
+        "normalized_hlo_module_sha256": _EXPECTED_NORMALIZED_HLO_MODULE_SHA256,
+        "thunks": _EXPECTED_THUNKS,
+    },
+    _EXECUTABLE_VARIANT_BM32: {
+        "normalized_executable_record_bytes": 53_166,
+        "normalized_executable_record_sha256": (
+            "4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985"
+        ),
+        "normalized_hlo_module_bytes": 20_600,
+        "normalized_hlo_module_sha256": (
+            "9978dc0830323f4331dcb7c537fcbc56d8263be070d6f545b43191a8e651085b"
+        ),
+        "thunks": _EXPECTED_BM32_THUNKS,
+    },
+}
 _EXPECTED_NESTED_ELFS = tuple(
     (
         thunk["kernel"],
@@ -246,6 +293,50 @@ _EXPECTED_RESOURCES = {
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _variant_contract_sha256(name: str, contract: dict[str, Any]) -> str:
+    payload = {
+        "executable_variant": name,
+        "normalized_executable_record_bytes": contract[
+            "normalized_executable_record_bytes"
+        ],
+        "normalized_executable_record_sha256": contract[
+            "normalized_executable_record_sha256"
+        ],
+        "normalized_hlo_module_bytes": contract["normalized_hlo_module_bytes"],
+        "normalized_hlo_module_sha256": contract["normalized_hlo_module_sha256"],
+        "thunks": contract["thunks"],
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return _sha256(encoded)
+
+
+def _select_executable_variant(
+    normalized_executable: bytes, normalized_hlo_module: bytes
+) -> tuple[str, dict[str, Any]]:
+    executable_bytes = len(normalized_executable)
+    executable_sha256 = _sha256(normalized_executable)
+    hlo_bytes = len(normalized_hlo_module)
+    hlo_sha256 = _sha256(normalized_hlo_module)
+    matches = [
+        (name, contract)
+        for name, contract in _EXPECTED_EXECUTABLE_VARIANTS.items()
+        if executable_bytes == contract["normalized_executable_record_bytes"]
+        and executable_sha256 == contract["normalized_executable_record_sha256"]
+        and hlo_bytes == contract["normalized_hlo_module_bytes"]
+        and hlo_sha256 == contract["normalized_hlo_module_sha256"]
+    ]
+    if len(matches) != 1:
+        raise VerificationError(
+            "normalized GPU executable record is not one exact full-tile variant"
+        )
+    return matches[0]
 
 
 def _read_varint(data: bytes, offset: int, *, label: str) -> tuple[int, int]:
@@ -770,29 +861,29 @@ def _inspect_thunks(records: list[bytes], *, cache_path: Path) -> dict[str, Any]
     if _field_signature(normalized_fields) != _EXPECTED_GPU_EXECUTABLE_FIELD_SIGNATURE:
         raise VerificationError("normalized GpuExecutableProto field sequence changed")
     normalized_hlo_module = normalized_fields[0][2]
-    if (
-        len(normalized_executable) != _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_BYTES
-        or _sha256(normalized_executable)
-        != _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
-        or normalized_executable.count(_NORMALIZED_AUTOTUNE_CACHE_PATH) != 1
-        or not isinstance(normalized_hlo_module, bytes)
-        or len(normalized_hlo_module) != _EXPECTED_NORMALIZED_HLO_MODULE_BYTES
-        or _sha256(normalized_hlo_module) != _EXPECTED_NORMALIZED_HLO_MODULE_SHA256
-    ):
+    if normalized_executable.count(
+        _NORMALIZED_AUTOTUNE_CACHE_PATH
+    ) != 1 or not isinstance(normalized_hlo_module, bytes):
         raise VerificationError(
-            "normalized GPU executable record is not the fixed full-tile object"
+            "normalized GPU executable record is not one exact full-tile variant"
         )
+    executable_variant, variant_contract = _select_executable_variant(
+        normalized_executable, normalized_hlo_module
+    )
+    expected_thunks = variant_contract["thunks"]
+    if not isinstance(expected_thunks, tuple):
+        raise VerificationError("internal executable variant thunk contract changed")
     encoded_thunks = [
         value for field, wire, value in fields if (field, wire) == (13, 2)
     ]
-    if len(encoded_thunks) != len(_EXPECTED_THUNKS) or not all(
+    if len(encoded_thunks) != len(expected_thunks) or not all(
         isinstance(item, bytes) for item in encoded_thunks
     ):
         raise VerificationError("ordered thunk count or wire type changed")
 
     inventory: list[dict[str, Any]] = []
     for index, (encoded, expected) in enumerate(
-        zip(encoded_thunks, _EXPECTED_THUNKS, strict=True)
+        zip(encoded_thunks, expected_thunks, strict=True)
     ):
         assert isinstance(encoded, bytes)
         label = f"ThunkProto[{index}]"
@@ -927,6 +1018,10 @@ def _inspect_thunks(records: list[bytes], *, cache_path: Path) -> dict[str, Any]
             }
         )
     return {
+        "executable_variant": executable_variant,
+        "executable_variant_contract_sha256": _variant_contract_sha256(
+            executable_variant, variant_contract
+        ),
         "executable_record_bytes": len(executable),
         "executable_record_sha256": _sha256(executable),
         "executable_record_sha256_is_path_dependent": True,
@@ -1092,7 +1187,11 @@ def _parse_elf(
     }
 
 
-def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
+def _inventory_elfs(
+    records: list[bytes],
+    *,
+    expected_nested_elfs: Sequence[tuple[str, int, str]] | None = None,
+) -> tuple[bytes, list[dict[str, Any]]]:
     if len(records) != 5 or records[1] or records[3]:
         raise VerificationError("split-proto record layout changed")
     inventory: list[dict[str, Any]] = []
@@ -1198,7 +1297,12 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
         raise VerificationError(
             "expected symbol does not identify one unique nested ELF"
         )
-    if tuple(observed_nested) != _EXPECTED_NESTED_ELFS:
+    expected_inventory = (
+        _EXPECTED_NESTED_ELFS
+        if expected_nested_elfs is None
+        else tuple(expected_nested_elfs)
+    )
+    if tuple(observed_nested) != expected_inventory:
         raise VerificationError("ordered nested gfx1100 object inventory changed")
     candidate = candidates[0]
     if (
@@ -1688,7 +1792,20 @@ def inspect_cache(
     cache_manifest["expected_sha256_matched"] = True
     records, serialization = _extract_cache_records(decompressed, _Snappy().decompress)
     thunk_inventory = _inspect_thunks(records, cache_path=cache_path)
-    candidate, elf_inventory = _inventory_elfs(records)
+    executable_variant = thunk_inventory.get("executable_variant")
+    if not isinstance(executable_variant, str):
+        raise VerificationError("inspector selected an invalid executable variant")
+    variant_contract = _EXPECTED_EXECUTABLE_VARIANTS.get(executable_variant)
+    if variant_contract is None:
+        raise VerificationError("inspector selected an unknown executable variant")
+    expected_thunks = variant_contract["thunks"]
+    expected_nested_elfs = tuple(
+        (thunk["kernel"], thunk["elf_bytes"], thunk["elf_sha256"])
+        for thunk in expected_thunks
+    )
+    candidate, elf_inventory = _inventory_elfs(
+        records, expected_nested_elfs=expected_nested_elfs
+    )
     candidate_descriptor = _make_sealed_memfd(candidate)
     try:
         readobj, _ = _run_bounded(
@@ -1733,6 +1850,10 @@ def inspect_cache(
     return {
         "schema": _SCHEMA,
         "status": "passed_offline_isa_verification",
+        "executable_variant": executable_variant,
+        "executable_variant_contract_sha256": thunk_inventory[
+            "executable_variant_contract_sha256"
+        ],
         "offline_only": True,
         "jax_modules_loaded_before": bool(jax_modules_before),
         "jax_modules_imported_by_verifier": False,
@@ -1742,6 +1863,10 @@ def inspect_cache(
         "serialization": serialization,
         "thunk_inventory": thunk_inventory,
         "elf_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": thunk_inventory[
+                "executable_variant_contract_sha256"
+            ],
             "elf_count": len(elf_inventory),
             "nested_elf_count": len(elf_inventory) - 1,
             "unique_exact_symbol_candidate_count": sum(

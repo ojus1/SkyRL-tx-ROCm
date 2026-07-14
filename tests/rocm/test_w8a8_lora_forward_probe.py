@@ -988,9 +988,16 @@ def _fresh_cache_artifacts(
     return root, cache, inventory, cache_sha
 
 
-def _exact_fresh_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
+def _exact_fresh_isa_evidence(
+    cache: Path,
+    cache_sha: str,
+    executable_variant: str = "lora_gemm_bm16_bn16",
+) -> dict[str, object]:
+    variant = _PROBE._EXPECTED_EXECUTABLE_VARIANTS[executable_variant]
     return {
         "status": "passed_offline_isa_verification",
+        "executable_variant": executable_variant,
+        "executable_variant_contract_sha256": variant["contract_sha256"],
         "offline_only": True,
         "device_access_performed": False,
         "jax_modules_imported_by_verifier": False,
@@ -1000,22 +1007,30 @@ def _exact_fresh_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
             "expected_sha256_matched": True,
         },
         "elf_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": variant["contract_sha256"],
             "elf_count": 7,
             "nested_elf_count": 6,
             "unique_exact_symbol_candidate_count": 1,
             "ordered_nested_contract_matched": True,
         },
         "thunk_inventory": {
+            "executable_variant": executable_variant,
+            "executable_variant_contract_sha256": variant["contract_sha256"],
             "executable_record_sha256_is_path_dependent": True,
             "caller_bound_autotune_cache_path": str(
                 cache.parent / "xla_gpu_per_fusion_autotune_cache_dir"
             ),
             "caller_bound_autotune_cache_path_occurrences": 1,
             "caller_bound_autotune_cache_path_normalized": True,
-            "normalized_executable_record_bytes": 52909,
-            "normalized_executable_record_sha256": (
-                _PROBE._EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
-            ),
+            "normalized_executable_record_bytes": variant[
+                "normalized_executable_record_bytes"
+            ],
+            "normalized_executable_record_sha256": variant[
+                "normalized_executable_record_sha256"
+            ],
+            "normalized_hlo_module_bytes": variant["normalized_hlo_module_bytes"],
+            "normalized_hlo_module_sha256": variant["normalized_hlo_module_sha256"],
             "thunk_count": 6,
             "all_thunks_are_exact_custom_kernels": True,
             "sequential_wrapper_present": False,
@@ -1023,11 +1038,24 @@ def _exact_fresh_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
             "ordered_thunks": [
                 {
                     "kernel": kernel,
+                    "bytes": thunk_bytes,
+                    "sha256": thunk_sha256,
                     "grid": grid,
                     "threads": threads,
                     "shared_memory_bytes": shared,
+                    "elf_bytes": elf_bytes,
+                    "elf_sha256": elf_sha256,
                 }
-                for kernel, grid, threads, shared in _PROBE._EXPECTED_ORDERED_THUNK_LAUNCHES
+                for (
+                    kernel,
+                    thunk_bytes,
+                    thunk_sha256,
+                    grid,
+                    threads,
+                    shared,
+                    elf_bytes,
+                    elf_sha256,
+                ) in variant["ordered_thunks"]
             ],
         },
         "candidate": {
@@ -1066,15 +1094,19 @@ def _set_nested(
     target[path[-1]] = value
 
 
+@pytest.mark.parametrize(
+    "executable_variant",
+    ["lora_gemm_bm16_bn16", "lora_gemm_bm32_bn32"],
+)
 def test_fresh_isa_helper_binds_inventory_digest_and_exact_native_contract(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, executable_variant: str
 ) -> None:
     root, cache, inventory, cache_sha = _fresh_cache_artifacts(tmp_path)
     observed = {}
 
     def inspect_cache(path, **kwargs):
         observed.update({"path": path, **kwargs})
-        return _exact_fresh_isa_evidence(cache, cache_sha)
+        return _exact_fresh_isa_evidence(cache, cache_sha, executable_variant)
 
     import rocm.inspect_w8a8_lora_isa as inspector
 
@@ -1085,6 +1117,8 @@ def test_fresh_isa_helper_binds_inventory_digest_and_exact_native_contract(
     assert observed["path"] == cache
     assert observed["expected_cache_sha256"] == cache_sha
     assert observed["expected_elf_sha256"] == _PROBE._EXPECTED_NESTED_ELF_SHA256
+    assert result["evidence"]["executable_variant"] == executable_variant
+    assert set(result["checks"]) == _CONTROLLER._EXPECTED_CHILD_ISA_CHECK_NAMES
 
 
 @pytest.mark.parametrize("candidate_count", [0, 2])
@@ -1126,6 +1160,22 @@ def test_fresh_isa_helper_rejects_zero_or_two_cache_candidates_without_inspectio
 @pytest.mark.parametrize(
     ("path", "value", "failed_check"),
     [
+        (("executable_variant",), "unknown", "executable_variant_exact"),
+        (
+            ("executable_variant_contract_sha256",),
+            "0" * 64,
+            "executable_variant_exact",
+        ),
+        (
+            ("thunk_inventory", "executable_variant"),
+            "lora_gemm_bm32_bn32",
+            "executable_variant_exact",
+        ),
+        (
+            ("elf_inventory", "executable_variant"),
+            "lora_gemm_bm32_bn32",
+            "executable_variant_exact",
+        ),
         (("cache", "sha256"), "0" * 64, "caller_bound_fresh_cache"),
         (("elf_inventory", "elf_count"), 5, "one_unique_exact_symbol_candidate"),
         (
@@ -1146,6 +1196,11 @@ def test_fresh_isa_helper_rejects_zero_or_two_cache_candidates_without_inspectio
         ),
         (
             ("thunk_inventory", "normalized_executable_record_sha256"),
+            "0" * 64,
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (
+            ("thunk_inventory", "normalized_hlo_module_sha256"),
             "0" * 64,
             "six_ordered_custom_kernel_thunks",
         ),
@@ -1230,6 +1285,46 @@ def test_fresh_isa_helper_fails_closed_on_nested_evidence_mutation(
 
     monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
     with pytest.raises(RuntimeError, match=failed_check):
+        _PROBE._qualify_fresh_nested_elf(root, inventory)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("shared_memory_bytes", 16_385), ("elf_sha256", "0" * 64)],
+)
+def test_fresh_isa_helper_rejects_altered_variant_thunk_contract(
+    monkeypatch, tmp_path: Path, field: str, value: object
+) -> None:
+    root, cache, inventory, cache_sha = _fresh_cache_artifacts(tmp_path)
+    evidence = _exact_fresh_isa_evidence(cache, cache_sha, "lora_gemm_bm32_bn32")
+    evidence["thunk_inventory"]["ordered_thunks"][2][field] = value  # type: ignore[index]
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
+    with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
+        _PROBE._qualify_fresh_nested_elf(root, inventory)
+
+
+def test_fresh_isa_helper_rejects_mixed_known_variant_tuple(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root, cache, inventory, cache_sha = _fresh_cache_artifacts(tmp_path)
+    evidence = _exact_fresh_isa_evidence(cache, cache_sha)
+    bm32 = _PROBE._EXPECTED_EXECUTABLE_VARIANTS["lora_gemm_bm32_bn32"]
+    evidence["executable_variant"] = "lora_gemm_bm32_bn32"
+    evidence["executable_variant_contract_sha256"] = bm32["contract_sha256"]
+    evidence["thunk_inventory"]["executable_variant"] = "lora_gemm_bm32_bn32"  # type: ignore[index]
+    evidence["thunk_inventory"]["executable_variant_contract_sha256"] = bm32[  # type: ignore[index]
+        "contract_sha256"
+    ]
+    evidence["elf_inventory"]["executable_variant"] = "lora_gemm_bm32_bn32"  # type: ignore[index]
+    evidence["elf_inventory"]["executable_variant_contract_sha256"] = bm32[  # type: ignore[index]
+        "contract_sha256"
+    ]
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
+    with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
         _PROBE._qualify_fresh_nested_elf(root, inventory)
 
 

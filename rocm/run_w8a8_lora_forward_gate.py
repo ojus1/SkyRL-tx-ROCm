@@ -60,17 +60,118 @@ _EXPECTED_NESTED_ELF_SHA256 = (
     "87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f"
 )
 _EXPECTED_NESTED_ELF_TARGET = "amdgcn--amdhsa-amdgiz-gfx1100"
-_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256 = (
-    "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08"
+_EXPECTED_ORDERED_THUNKS_BM16 = (
+    (
+        "input_pad_reduce_fusion",
+        4_321,
+        "8d43b0bf40b73b8e37d5bf14bc0f417e533ea939210d2e8bdc122d245cef632b",
+        [2, 1, 1],
+        [256, 1, 1],
+        0,
+        4_080,
+        "06a6035fabadbc8de4d7d201fa51ad2b9383a37faa84e4a0b51d9587fa3d8c7f",
+    ),
+    (
+        "loop_convert_fusion",
+        4_176,
+        "a1758d210fb4e8b0bba3db81670d2e7b4f3330c5b9d0c3663c1c4a6c1fa9233c",
+        [8, 1, 1],
+        [128, 1, 1],
+        0,
+        3_944,
+        "8db071b2d0e93475f713c566d984a940155ed293e63adf53b62a53288fada685",
+    ),
+    (
+        "gemm_fusion_dot_general_1",
+        7_665,
+        "2d60624dfa9c9eaf151d4d218e8114d7005e97cc4037102683dfb181db2b2cd1",
+        [1, 1, 1],
+        [128, 1, 1],
+        8_192,
+        7_408,
+        "c45a0fb7f236f7b16dbdfedb905dd116a02006c16c43d6dd687c30ccedf2eaf1",
+    ),
+    (
+        "loop_select_fusion",
+        3_604,
+        "7ac3140403063e8050d1e6ac41d3b0936badc61fb37c5ccff20239adb19bec05",
+        [1, 1, 1],
+        [16, 1, 1],
+        0,
+        3_424,
+        "8e7f454a584324b303ab299d22e4a3d4ee956f29bc36c64c030256fd24068a71",
+    ),
+    (
+        _EXPECTED_KERNEL_NAME,
+        7_606,
+        "70cbc851866ea28d1bf542da9ea59dd2780abed6283a47f76370c3595166603e",
+        [1, 2, 1],
+        [128, 1, 1],
+        1_024,
+        7_160,
+        _EXPECTED_NESTED_ELF_SHA256,
+    ),
+    (
+        "wrapped_slice",
+        3_588,
+        "2b1c407360aadc991d88b84a053c223a6521422aa45bb014adc2b29fdb971b1c",
+        [1, 1, 1],
+        [51, 1, 1],
+        0,
+        3_416,
+        "476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799",
+    ),
 )
-_EXPECTED_ORDERED_THUNK_LAUNCHES = (
-    ("input_pad_reduce_fusion", [2, 1, 1], [256, 1, 1], 0),
-    ("loop_convert_fusion", [8, 1, 1], [128, 1, 1], 0),
-    ("gemm_fusion_dot_general_1", [1, 1, 1], [128, 1, 1], 8_192),
-    ("loop_select_fusion", [1, 1, 1], [16, 1, 1], 0),
-    (_EXPECTED_KERNEL_NAME, [1, 2, 1], [128, 1, 1], 1_024),
-    ("wrapped_slice", [1, 1, 1], [51, 1, 1], 0),
+_EXPECTED_ORDERED_THUNKS_BM32 = (
+    _EXPECTED_ORDERED_THUNKS_BM16[0],
+    _EXPECTED_ORDERED_THUNKS_BM16[1],
+    (
+        "gemm_fusion_dot_general_1",
+        7_922,
+        "0a6c802363f4c8dc30ddfebb195cccc66d4dadc4138db5860736c879de132a2d",
+        [1, 1, 1],
+        [128, 1, 1],
+        16_384,
+        7_664,
+        "9ab0e3abac1983fcb44279f9fe1b40da01186a6d674e271b6c103cbb69c40b2a",
+    ),
+    *_EXPECTED_ORDERED_THUNKS_BM16[3:],
 )
+_EXPECTED_EXECUTABLE_VARIANTS = {
+    "lora_gemm_bm16_bn16": {
+        "contract_sha256": "b7d543d6bf2aff9913221b1a438851fc7eec825d98cc9427b7178804d143db57",
+        "normalized_executable_record_bytes": 52_909,
+        "normalized_executable_record_sha256": "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08",
+        "normalized_hlo_module_bytes": 20_600,
+        "normalized_hlo_module_sha256": "1cac7332465fe69bd9d4ae2a53dbd0454a5f3ca4fd28bbdbd400a66a30dde1cd",
+        "ordered_thunks": _EXPECTED_ORDERED_THUNKS_BM16,
+    },
+    "lora_gemm_bm32_bn32": {
+        "contract_sha256": "75ce7e3c82b4219a17391f3f3019c3fbef84dfdf6c924cb3051d4b7d884ae0c7",
+        "normalized_executable_record_bytes": 53_166,
+        "normalized_executable_record_sha256": "4a7fc5e78b508cca93db2abfe209100a56153a123372bb25aa964c0cbb124985",
+        "normalized_hlo_module_bytes": 20_600,
+        "normalized_hlo_module_sha256": "9978dc0830323f4331dcb7c537fcbc56d8263be070d6f545b43191a8e651085b",
+        "ordered_thunks": _EXPECTED_ORDERED_THUNKS_BM32,
+    },
+}
+_EXPECTED_CHILD_ISA_CHECK_NAMES = {
+    "status_exact",
+    "offline_inspector",
+    "caller_bound_fresh_cache",
+    "one_unique_exact_symbol_candidate",
+    "executable_variant_exact",
+    "six_ordered_custom_kernel_thunks",
+    "candidate_bytes_exact",
+    "candidate_sha256_exact",
+    "candidate_not_written_to_disk",
+    "symbol_exact",
+    "target_exact",
+    "four_static_signed_iu8_wmma",
+    "registers_exact",
+    "full_tile_control_flow_exact",
+    "zero_spills_and_private_segment",
+}
 _EXPECTED_CONTROL_FLOW = {
     "barrier_count": 9,
     "all_barriers_before_exec_mask": True,
@@ -229,8 +330,8 @@ namespace = {
 exec(compile(payload, profile, "exec"), namespace)
 """
 _EXPECTED_SOURCE_SHA256 = {
-    "child": "427e8f497cb8d5860b701779085bb2551a0572658c8e37b523c9e01acb3848bf",
-    "isa_inspector": "c8299c341e241b3723e00efcaa7157f29743b73cbaaa8b2cabd7d9ce14d001b6",
+    "child": "fbfc6bb23dd97bc7ead9d0fa41b12b0acbf8f3e20cf97e1153a2c052590421cb",
+    "isa_inspector": "7e2589d13017387b580fb460dcba71ec840c75a246ec8c69d79ef8f93608047f",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
     "handoff": "4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392",
     "profiler": "ed230758101a2a540b3a09e7f84ac92256d2bb41c70dbc399b9466fe0b979684",
@@ -320,7 +421,7 @@ def _json_exact(value: Any, expected: Any) -> bool:
         return set(value) == set(expected) and all(
             _json_exact(value[key], expected[key]) for key in expected
         )
-    if isinstance(expected, list):
+    if isinstance(expected, (list, tuple)):
         return len(value) == len(expected) and all(
             _json_exact(observed, wanted)
             for observed, wanted in zip(value, expected, strict=True)
@@ -2627,15 +2728,25 @@ def _independent_fresh_isa_qualification(
     ordered_thunks = thunk_inventory.get("ordered_thunks", [])
     if not isinstance(ordered_thunks, list):
         ordered_thunks = []
-    observed_thunk_launches = tuple(
+    observed_thunks = tuple(
         (
             item.get("kernel"),
+            item.get("bytes"),
+            item.get("sha256"),
             item.get("grid"),
             item.get("threads"),
             item.get("shared_memory_bytes"),
+            item.get("elf_bytes"),
+            item.get("elf_sha256"),
         )
         for item in ordered_thunks
         if isinstance(item, dict)
+    )
+    executable_variant = evidence.get("executable_variant")
+    expected_variant = (
+        _EXPECTED_EXECUTABLE_VARIANTS.get(executable_variant)
+        if isinstance(executable_variant, str)
+        else None
     )
     checks = {
         "status_exact": evidence.get("status") == "passed_offline_isa_verification",
@@ -2653,6 +2764,15 @@ def _independent_fresh_isa_qualification(
         and _exact_int(elf_inventory.get("nested_elf_count"), 6)
         and _exact_int(elf_inventory.get("unique_exact_symbol_candidate_count"), 1)
         and elf_inventory.get("ordered_nested_contract_matched") is True,
+        "executable_variant_exact": expected_variant is not None
+        and thunk_inventory.get("executable_variant") == executable_variant
+        and elf_inventory.get("executable_variant") == executable_variant
+        and evidence.get("executable_variant_contract_sha256")
+        == expected_variant["contract_sha256"]
+        and thunk_inventory.get("executable_variant_contract_sha256")
+        == expected_variant["contract_sha256"]
+        and elf_inventory.get("executable_variant_contract_sha256")
+        == expected_variant["contract_sha256"],
         "six_ordered_custom_kernel_thunks": _exact_int(
             thunk_inventory.get("thunk_count"), 6
         )
@@ -2675,11 +2795,21 @@ def _independent_fresh_isa_qualification(
             19_905,
         )
         and _exact_int(
-            thunk_inventory.get("normalized_executable_record_bytes"), 52_909
+            thunk_inventory.get("normalized_executable_record_bytes"),
+            expected_variant["normalized_executable_record_bytes"]
+            if expected_variant is not None
+            else -1,
         )
+        and expected_variant is not None
         and thunk_inventory.get("normalized_executable_record_sha256")
-        == _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
-        and _json_exact(observed_thunk_launches, _EXPECTED_ORDERED_THUNK_LAUNCHES),
+        == expected_variant["normalized_executable_record_sha256"]
+        and _exact_int(
+            thunk_inventory.get("normalized_hlo_module_bytes"),
+            expected_variant["normalized_hlo_module_bytes"],
+        )
+        and thunk_inventory.get("normalized_hlo_module_sha256")
+        == expected_variant["normalized_hlo_module_sha256"]
+        and _json_exact(observed_thunks, expected_variant["ordered_thunks"]),
         "isa_identity_exact": isa.get("symbol") == _EXPECTED_KERNEL_NAME
         and isa.get("amdgpu_target") == _EXPECTED_NESTED_ELF_TARGET,
         "wmma_exact": isa.get("instruction") == "v_wmma_i32_16x16x16_iu8"
@@ -3172,22 +3302,6 @@ def _audit_runtime_profile_outputs(
         "maximum_absolute_error_inclusive": 0.25,
         "maximum_dispatch_seconds_exclusive": 1.0,
     }
-    expected_child_isa_checks = {
-        "status_exact",
-        "offline_inspector",
-        "caller_bound_fresh_cache",
-        "one_unique_exact_symbol_candidate",
-        "six_ordered_custom_kernel_thunks",
-        "candidate_bytes_exact",
-        "candidate_sha256_exact",
-        "candidate_not_written_to_disk",
-        "symbol_exact",
-        "target_exact",
-        "four_static_signed_iu8_wmma",
-        "registers_exact",
-        "full_tile_control_flow_exact",
-        "zero_spills_and_private_segment",
-    }
     checks = {
         "wait_supervisor_passed": wait_audit.get("passed") is True,
         "dispatch_watchdog_passed": wait_audit.get("dispatch_watchdog", {}).get(
@@ -3575,7 +3689,7 @@ def _audit_runtime_profile_outputs(
         and compiled.get("optimized_hlo_artifact", {}).get("sha256")
         == optimized_ir["sha256"],
         "child_fresh_isa_exact": child_isa.get("passed") is True
-        and set(child_isa.get("checks", {})) == expected_child_isa_checks
+        and set(child_isa.get("checks", {})) == _EXPECTED_CHILD_ISA_CHECK_NAMES
         and all(value is True for value in child_isa.get("checks", {}).values())
         and _exact_int(fresh_isa.get("isa_qualification_attempts"), 1)
         and _exact_int(fresh_isa.get("isa_qualification_completions"), 1)
