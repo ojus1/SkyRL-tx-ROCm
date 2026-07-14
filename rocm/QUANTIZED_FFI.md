@@ -153,16 +153,17 @@ compile phase invokes no returned executable. A separately guarded
 former masked-`N=17` artifact hit the exact five-second dispatch watchdog and
 was killed/reaped without an AMDGPU fault or reset; the bracket contained five
 GPU kernels plus output readiness, so it does not prove that Pallas itself
-stalled. The corrected full-tile source has since been freshly compiled and
-audited offline, but it has not run. Its current offline GO authorizes only
-repinning the exact nested gfx1100 object and six-thunk inventory; it does not
-release an executable. After those pins and their tests receive independent
-review, a separately authorized rung may permit one six-leaf input transfer,
-one compiled forward invocation with readiness, one output transfer, and a
-host-only comparison against the immutable oracle. The gate exposes no
-backward, warmup, repetition, replay, GPU reference, device-side error
-reduction, graph, model, or benchmark path, and it cannot promote the runtime
-or model path.
+stalled. The corrected full-tile source has since been freshly compiled twice
+and audited offline, but it has not run. The exact nested gfx1100 object and
+six-thunk inventory were committed at `e4152`; the latest compile then exposed
+one caller-derived run path inside the otherwise pinned executable record. The
+equal-length normalized whole-record pins, CPU regressions, and independent
+source review are now complete. This still does not release an executable. A
+separately authorized rung may permit one six-leaf input transfer, one compiled
+forward invocation with readiness, one output transfer, and a host-only
+comparison against the immutable oracle. The gate exposes no backward,
+warmup, repetition, replay, GPU reference, device-side error reduction, graph,
+model, or benchmark path, and it cannot promote the runtime or model path.
 
 The controller fixes sampled-sysfs thresholds of 2 GiB VRAM, 90 C junction,
 and 315 W `power1_average`, plus an 85 C child launch gate, 300-second child
@@ -199,10 +200,10 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
 ```
 
 The exact former masked execute capability was consumed and must not be
-retried. The corrected source is committed, freshly compiled, and has received
-an offline GO only for repinning. The inspector, probe, and controller pins
-must first be updated, tested, and independently reviewed. Only then, and only
-with separate authorization, may a new one-shot request use this command form:
+retried. The corrected source is committed and freshly compiled. Its exact
+object/thunk and caller-path-normalized record pins are updated, CPU-tested,
+and independently reviewed. That offline GO is not execution authorization;
+only a separate one-shot request may use this command form:
 
 ```bash
 umask 077
@@ -355,24 +356,42 @@ fault or reset. This cannot identify the stalled stage and supplies no
 correctness or performance result. The exact masked 8,440-byte object and this
 timed-out executable must never be retried.
 
-Exact revision `f6b26775456e5c2aa92dd621b26f3752f111ad00` subsequently
-completed the corrected compile-only rung in
-`/tmp/skyrl-w8a8-compile-1783984330`. The controller returned
-`passed_compile_diagnostic_unpromoted`, with zero returned-executable
-invocations, device transfers, or dispatches. Lowering took 1.143570072 seconds
-and compilation took 0.722381366 seconds. The 15,351-byte StableHLO has SHA-256
+Exact revision `f6b26775456e5c2aa92dd621b26f3752f111ad00` first completed the
+corrected full-tile compile. After committing the exact six-thunk and native
+object pins at `e4152e47900086bfe2f58acf94d9f9a765b99aa5`, a fresh
+compile-only qualification completed in
+`/tmp/skyrl-w8a8-compile-1783987495`. The controller returned
+`passed_compile_diagnostic_unpromoted`, with zero ISA qualifications,
+returned-executable invocations, device transfers, dispatches, or releases.
+Lowering took 1.112806747 seconds and compilation took 0.720117240 seconds.
+The 15,351-byte StableHLO has SHA-256
 `3eac9283c56d35e9df7f3fb42d7ab62fba851b74ca7f5ea09ee746f1587f1772`;
 the 22,853-byte optimized HLO has SHA-256
-`f04d417e17e5b861fae860fb027691d82d28694883e05565ca691388848a33f6`.
-Both prove one physical `[16,32]` Pallas result followed by the final
-`wrapped_slice` to logical `[3,17]`. The compiler reports 4,036 bytes of
-arguments, 102 bytes of output, 3,600 bytes of temporaries, 7,738 bytes total,
-and 1,920 bytes of generated code.
+`f05cc7cefb15832b90a24088fad868175034874534b8193e82430d4840899406`.
+The optimized-HLO difference from the first corrected compile is source-line
+metadata. Both prove one physical `[16,32]` Pallas result followed by the final
+`wrapped_slice` to logical `[3,17]`. Compiler accounting remains 4,036 bytes
+of arguments, 102 bytes of output, 3,600 bytes of temporaries, 7,738 bytes
+total, and 1,920 bytes of generated code.
 
-The retained cache is 19,336 bytes with SHA-256
-`af70b579f0f876767bd824d9372b8b39e4887032430ef0bfba259b6af02d4d05`.
-Its decoded record sizes are `[56, 0, 1920, 0, 52909]`, and a bounded CPU-only
-wire/ELF audit found exactly six ordered custom-kernel thunks:
+The fresh retained cache is 19,332 bytes with SHA-256
+`bf40785e7dd4d0a07336ba814e8d7fde59c2d5525e50f8317134999119802604`.
+Its decoded record sizes are `[56, 0, 1920, 0, 52909]`. The raw executable
+record is 52,909 bytes with path-dependent SHA-256
+`696fa3761f183e49139ca957c1d8bd337699451560f8f233df5e0b4cbdea556b`.
+The CPU-only inspector requires exactly one caller-derived canonical 101-byte
+autotune-cache path at field-one/record offsets 19,901/19,905 and replaces only
+that byte range with an equal-length neutral token. The normalized record is
+still a valid 52,909-byte protobuf and has SHA-256
+`8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08`;
+its normalized 20,600-byte field one has SHA-256
+`1cac7332465fe69bd9d4ae2a53dbd0454a5f3ca4fd28bbdbd400a66a30dde1cd`.
+The whole normalized-record hash pins every non-path byte, framing, thunk, and
+embedded ELF. The prior corrected cache fails this fresh normalized hash due
+to its different probe source-line metadata. Because the two builds used
+different source, they do not empirically prove same-source path-only
+reproducibility. A bounded wire/ELF audit found exactly six ordered
+custom-kernel thunks:
 
 | Order | Kernel | Grid | Threads | LDS (bytes) | ELF bytes / SHA-256 |
 |---:|---|---|---:|---:|---|
@@ -383,26 +402,27 @@ wire/ELF audit found exactly six ordered custom-kernel thunks:
 | 4 | `skyrl_qwen35_w8a8_lora_forward` | `1x2x1` | `128x1x1` | 1,024 | 7,160 / `87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f` |
 | 5 | `wrapped_slice` | `1x1x1` | `51x1x1` | 0 | 3,416 / `476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799` |
 
-The first four objects remain byte-identical to the masked build. The corrected
-Pallas object targets gfx1100, uses 34 SGPRs and 105 VGPRs, reports no spills,
-and contains exactly four signed IU8 WMMAs and nine barriers. Its one forward
-branch is after all barriers. The former final D2D copy is now the actual
-`wrapped_slice` kernel. This complete offline evidence gives a GO to replace
-the old exact inspector/probe/controller pins, not a GO to dispatch. It proves
-no runtime correctness, throughput, realized memory saving, backward, or
-promotion.
+All six thunk serializations and all seven embedded ELFs are byte-identical
+across the two corrected builds. The first four objects also remain
+byte-identical to the masked build. The corrected Pallas object targets
+gfx1100, uses 34 SGPRs and 105 VGPRs, reports no spills, and contains exactly
+four signed IU8 WMMAs and nine barriers. Its sole forward branch is after all
+barriers. The former final D2D copy is the actual `wrapped_slice` kernel. This
+complete offline evidence gives a GO for the normalized exact
+inspector/probe/controller pins, not a GO to dispatch. It proves no runtime
+correctness, throughput, realized memory saving, backward, or promotion.
 
-The corrected compile peaked at 867,364,864 bytes physical VRAM, 22,405,120
-bytes GTT, 6,202,449,920 bytes host RAM used, 52 C junction temperature, and
-113 W sampled average power. Swap remained exactly 20,480 bytes, the maximum
-sample gap was 0.089058 seconds, every monitored limit passed, the whole-boot
-AMDGPU journal remained clean, and three handoff samples restored the exact
-suspended/unowned 27,947,008-byte VRAM and 15,966,208-byte GTT baseline.
+The fresh compile peaked at 867,352,576 bytes physical VRAM, 22,405,120 bytes
+GTT, 6,423,089,152 bytes host RAM used, 51 C junction temperature, and 113 W
+sampled average power. Swap remained exactly 20,480 bytes, the maximum sample
+gap was 0.082857711 seconds, the whole-boot AMDGPU journal remained clean, and
+three handoff samples restored the exact suspended/unowned 27,947,008-byte
+VRAM and 15,966,208-byte GTT baseline.
 
-After the new pins, tests, and independent review, any separately authorized
-rung would remain exactly one host-checked invocation of the corrected tiny
-forward. Only after that result will the ladder change one risk dimension at a
-time: signed base-only semantics;
+After the normalized pins, tests, and independent review, any separately
+authorized rung remains exactly one host-checked invocation of the corrected
+tiny forward. Only after that result will the ladder change one risk dimension
+at a time: signed base-only semantics;
 `K=128`; three row superblocks; small base/fused VJPs; K-scan lengths 8/40/144;
 N-scan lengths 8/32/128/288; then the first real `K=2560,N=18432` gate/up
 rectangle. The artificial `K=9216,N=18432` rectangle is not a model shape and

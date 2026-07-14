@@ -130,10 +130,8 @@ def test_scope_and_limits_cannot_be_broadened(
     assert message in result.stderr
 
 
-def test_operational_controller_refuses_nonisolated_startup_before_run_dir(
-    tmp_path: Path,
-) -> None:
-    run_dir = (tmp_path / "never-created").resolve()
+def test_operational_controller_refuses_nonisolated_startup_before_run_dir() -> None:
+    run_dir = Path(f"/tmp/skyrl-w8a8-compile-{os.getpid():010d}")
 
     result = _run(
         "--platform",
@@ -146,6 +144,190 @@ def test_operational_controller_refuses_nonisolated_startup_before_run_dir(
     assert result.returncode == 2
     assert "requires exact -I -S -B -X isolation" in result.stderr
     assert not run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("phase", "run_dir"),
+    [
+        ("compile", "/tmp/skyrl-w8a8-runtime-1234567890"),
+        ("execute", "/tmp/skyrl-w8a8-compile-1234567890"),
+        ("compile", "/tmp/skyrl-w8a8-compile-123456789"),
+        ("execute", "/tmp/nested/skyrl-w8a8-runtime-1234567890"),
+        ("compile", "skyrl-w8a8-compile-1234567890"),
+    ],
+)
+def test_operational_controller_rejects_noncanonical_run_directory_before_isolation(
+    monkeypatch, phase: str, run_dir: str
+) -> None:
+    monkeypatch.setattr(
+        _CONTROLLER,
+        "_require_isolated_controller",
+        lambda _run_dir: pytest.fail("isolation check must not run"),
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _CONTROLLER._parse_args(
+            [
+                "--platform",
+                "rocm",
+                "--phase",
+                phase,
+                "--allow-gpu",
+                "--run-dir",
+                run_dir,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "run_kind"), (("compile", "compile"), ("execute", "runtime"))
+)
+def test_operational_controller_accepts_phase_bound_run_directory_layout(
+    monkeypatch, phase: str, run_kind: str
+) -> None:
+    monkeypatch.setattr(
+        _CONTROLLER,
+        "_require_isolated_controller",
+        lambda run_dir: {"run_dir": run_dir},
+    )
+    run_dir = Path(f"/tmp/skyrl-w8a8-{run_kind}-{os.getpid():010d}")
+
+    parsed = _CONTROLLER._parse_args(
+        [
+            "--platform",
+            "rocm",
+            "--phase",
+            phase,
+            "--allow-gpu",
+            "--run-dir",
+            str(run_dir),
+        ]
+    )
+
+    assert parsed.run_dir == run_dir
+
+
+def _exact_independent_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
+    return {
+        "status": "passed_offline_isa_verification",
+        "offline_only": True,
+        "device_access_performed": False,
+        "jax_modules_imported_by_verifier": False,
+        "cache": {
+            "path": str(cache),
+            "sha256": cache_sha,
+            "expected_sha256_matched": True,
+        },
+        "candidate": {
+            "bytes": _CONTROLLER._EXPECTED_NESTED_ELF_BYTES,
+            "sha256": _CONTROLLER._EXPECTED_NESTED_ELF_SHA256,
+            "expected_sha256_matched": True,
+            "written_elf": None,
+        },
+        "elf_inventory": {
+            "elf_count": 7,
+            "nested_elf_count": 6,
+            "unique_exact_symbol_candidate_count": 1,
+            "ordered_nested_contract_matched": True,
+        },
+        "thunk_inventory": {
+            "executable_record_sha256_is_path_dependent": True,
+            "caller_bound_autotune_cache_path": str(
+                cache.parent / "xla_gpu_per_fusion_autotune_cache_dir"
+            ),
+            "caller_bound_autotune_cache_path_occurrences": 1,
+            "caller_bound_autotune_cache_path_normalized": True,
+            "caller_bound_autotune_cache_path_field_offset": 19_901,
+            "caller_bound_autotune_cache_path_record_offset": 19_905,
+            "normalized_executable_record_bytes": 52_909,
+            "normalized_executable_record_sha256": (
+                _CONTROLLER._EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
+            ),
+            "thunk_count": 6,
+            "all_thunks_are_exact_custom_kernels": True,
+            "sequential_wrapper_present": False,
+            "device_to_device_copy_thunk_present": False,
+            "ordered_thunks": [
+                {
+                    "kernel": kernel,
+                    "grid": grid,
+                    "threads": threads,
+                    "shared_memory_bytes": shared,
+                }
+                for kernel, grid, threads, shared in (
+                    _CONTROLLER._EXPECTED_ORDERED_THUNK_LAUNCHES
+                )
+            ],
+        },
+        "isa": {
+            "symbol": _CONTROLLER._EXPECTED_KERNEL_NAME,
+            "amdgpu_target": _CONTROLLER._EXPECTED_NESTED_ELF_TARGET,
+            "instruction": "v_wmma_i32_16x16x16_iu8",
+            "static_instruction_count": 4,
+            "signed_neg_lo": [1, 1, 0],
+            "resources": {
+                "sgpr_count": 34,
+                "vgpr_count": 105,
+                "sgpr_spill_count": 0,
+                "vgpr_spill_count": 0,
+                "private_segment_fixed_size": 0,
+            },
+            "control_flow": copy.deepcopy(_CONTROLLER._EXPECTED_CONTROL_FLOW),
+            "tail_store": copy.deepcopy(_CONTROLLER._EXPECTED_TAIL_STORE),
+        },
+    }
+
+
+def _independent_isa_case() -> tuple[Path, dict[str, object], Path, str]:
+    artifact_root = Path("/tmp/skyrl-w8a8-runtime-1234567890/compiler-artifacts")
+    relative = f"jax-cache/jit_candidate-{'a' * 64}-cache"
+    cache_sha = "b" * 64
+    inventory: dict[str, object] = {"files": [{"path": relative, "sha256": cache_sha}]}
+    return artifact_root, inventory, artifact_root / relative, cache_sha
+
+
+def test_independent_fresh_isa_qualification_consumes_normalized_contract(
+    monkeypatch,
+) -> None:
+    artifact_root, inventory, cache, cache_sha = _independent_isa_case()
+    evidence = _exact_independent_isa_evidence(cache, cache_sha)
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
+
+    qualification = _CONTROLLER._independent_fresh_isa_qualification(
+        artifact_root, inventory
+    )
+
+    assert qualification["passed"] is True
+    assert qualification["checks"]["six_ordered_custom_kernel_thunks"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("normalized_executable_record_bytes", 52_908),
+        ("normalized_executable_record_sha256", "0" * 64),
+        ("executable_record_sha256_is_path_dependent", False),
+        ("caller_bound_autotune_cache_path", "/tmp/wrong"),
+        ("caller_bound_autotune_cache_path_occurrences", 2),
+        ("caller_bound_autotune_cache_path_normalized", False),
+        ("caller_bound_autotune_cache_path_field_offset", 19_902),
+        ("caller_bound_autotune_cache_path_record_offset", 19_906),
+    ],
+)
+def test_independent_fresh_isa_qualification_rejects_normalization_mutation(
+    monkeypatch, field: str, value: object
+) -> None:
+    artifact_root, inventory, cache, cache_sha = _independent_isa_case()
+    evidence = _exact_independent_isa_evidence(cache, cache_sha)
+    evidence["thunk_inventory"][field] = value  # type: ignore[index]
+    import rocm.inspect_w8a8_lora_isa as inspector
+
+    monkeypatch.setattr(inspector, "inspect_cache", lambda *_args, **_kwargs: evidence)
+
+    with pytest.raises(RuntimeError, match="six_ordered_custom_kernel_thunks"):
+        _CONTROLLER._independent_fresh_isa_qualification(artifact_root, inventory)
 
 
 def test_operational_controller_accepts_exact_isolated_startup_contract(
@@ -1955,8 +2137,18 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "ordered_nested_contract_matched": True,
         },
         "thunk_inventory": {
-            "executable_record_bytes": 52909,
-            "executable_record_sha256": _CONTROLLER._EXPECTED_EXECUTABLE_RECORD_SHA256,
+            "executable_record_sha256_is_path_dependent": True,
+            "caller_bound_autotune_cache_path": str(
+                cache.parent / "xla_gpu_per_fusion_autotune_cache_dir"
+            ),
+            "caller_bound_autotune_cache_path_occurrences": 1,
+            "caller_bound_autotune_cache_path_normalized": True,
+            "caller_bound_autotune_cache_path_field_offset": 19901,
+            "caller_bound_autotune_cache_path_record_offset": 19905,
+            "normalized_executable_record_bytes": 52909,
+            "normalized_executable_record_sha256": (
+                _CONTROLLER._EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
+            ),
             "thunk_count": 6,
             "all_thunks_are_exact_custom_kernels": True,
             "sequential_wrapper_present": False,

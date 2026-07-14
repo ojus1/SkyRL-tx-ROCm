@@ -60,8 +60,8 @@ _EXPECTED_NESTED_ELF_SHA256 = (
     "87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f"
 )
 _EXPECTED_NESTED_ELF_TARGET = "amdgcn--amdhsa-amdgiz-gfx1100"
-_EXPECTED_EXECUTABLE_RECORD_SHA256 = (
-    "35b0d10450a490910bb817529fd06e3c9f5e884b647d073f4207c33f0baff748"
+_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256 = (
+    "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08"
 )
 _EXPECTED_ORDERED_THUNK_LAUNCHES = (
     ("input_pad_reduce_fusion", [2, 1, 1], [256, 1, 1], 0),
@@ -229,8 +229,8 @@ namespace = {
 exec(compile(payload, profile, "exec"), namespace)
 """
 _EXPECTED_SOURCE_SHA256 = {
-    "child": "48da314323ca7fdfe397925e98717eabf05960144b52da54d3f4a608bec913d4",
-    "isa_inspector": "9806e33a6e59f32bf9a6b1093a20629e3a868f00e6c7ffb783361589949d4548",
+    "child": "38cb842cea95e82e99b092c64a749fcf096899b20e2680991b4e6fa9ac0343ab",
+    "isa_inspector": "c8299c341e241b3723e00efcaa7157f29743b73cbaaa8b2cabd7d9ce14d001b6",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
     "handoff": "4d6c7e665219ce125d840e68b0e2cb7e8b1b5f98552ff65a2d07a153b3cd1392",
     "profiler": "ed230758101a2a540b3a09e7f84ac92256d2bb41c70dbc399b9466fe0b979684",
@@ -401,6 +401,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--platform rocm requires a fresh absolute --run-dir")
     if args.platform == "abstract" and args.run_dir is not None:
         parser.error("--run-dir is only valid with --platform rocm")
+    if args.run_dir is not None:
+        run_kind = "compile" if args.phase == "compile" else "runtime"
+        run_name = re.fullmatch(
+            rf"skyrl-w8a8-{run_kind}-[0-9]{{10}}", args.run_dir.name
+        )
+        if (
+            not args.run_dir.is_absolute()
+            or args.run_dir.parent != Path("/tmp")
+            or run_name is None
+        ):
+            parser.error(
+                "--run-dir must exactly match the selected phase's fresh "
+                f"/tmp/skyrl-w8a8-{run_kind}-<10 digits> layout"
+            )
     if args.run_dir is not None and args.run_dir.exists():
         parser.error(f"refusing existing --run-dir: {args.run_dir}")
     if args.platform == "rocm":
@@ -2645,9 +2659,26 @@ def _independent_fresh_isa_qualification(
         and thunk_inventory.get("all_thunks_are_exact_custom_kernels") is True
         and thunk_inventory.get("sequential_wrapper_present") is False
         and thunk_inventory.get("device_to_device_copy_thunk_present") is False
-        and _exact_int(thunk_inventory.get("executable_record_bytes"), 52_909)
-        and thunk_inventory.get("executable_record_sha256")
-        == _EXPECTED_EXECUTABLE_RECORD_SHA256
+        and thunk_inventory.get("executable_record_sha256_is_path_dependent") is True
+        and thunk_inventory.get("caller_bound_autotune_cache_path")
+        == str(cache_path.parent / "xla_gpu_per_fusion_autotune_cache_dir")
+        and _exact_int(
+            thunk_inventory.get("caller_bound_autotune_cache_path_occurrences"), 1
+        )
+        and thunk_inventory.get("caller_bound_autotune_cache_path_normalized") is True
+        and _exact_int(
+            thunk_inventory.get("caller_bound_autotune_cache_path_field_offset"),
+            19_901,
+        )
+        and _exact_int(
+            thunk_inventory.get("caller_bound_autotune_cache_path_record_offset"),
+            19_905,
+        )
+        and _exact_int(
+            thunk_inventory.get("normalized_executable_record_bytes"), 52_909
+        )
+        and thunk_inventory.get("normalized_executable_record_sha256")
+        == _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
         and _json_exact(observed_thunk_launches, _EXPECTED_ORDERED_THUNK_LAUNCHES),
         "isa_identity_exact": isa.get("symbol") == _EXPECTED_KERNEL_NAME
         and isa.get("amdgpu_target") == _EXPECTED_NESTED_ELF_TARGET,

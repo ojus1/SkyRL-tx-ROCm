@@ -12,11 +12,11 @@ ELF plus the 16-byte timestamp/random module identifier that OpenXLA appends
 to ROCm binaries.  The generated code objects and six ordered custom-kernel
 thunks are nested in the final split-proto record.  Qualification therefore
 pins the deterministic empty ELF while treating the caller-hash-bound module
-identifier as evidence, and pins the complete executable record, ordered thunk
-serializations, launch dimensions, embedded gfx1100 objects, forward resource
-contract, and the full-tile kernel's barrier/branch epilogue.  The forward
-object must contain exactly four IU8 WMMA instructions with the expected
-``neg_lo`` operand modifier.
+identifier as evidence, and pins the caller-path-normalized complete executable
+record, ordered thunk serializations, launch dimensions, embedded gfx1100
+objects, forward resource contract, and the full-tile kernel's barrier/branch
+epilogue.  The forward object must contain exactly four IU8 WMMA instructions
+with the expected ``neg_lo`` operand modifier.
 """
 
 from __future__ import annotations
@@ -65,10 +65,24 @@ _EXPECTED_EMPTY_WRAPPER_ELF_SHA256 = (
 )
 _EXPECTED_WRAPPER_RECORD_BYTES = 1_920
 _EXPECTED_ROCM_MODULE_IDENTIFIER_BYTES = 16
-_EXPECTED_EXECUTABLE_RECORD_BYTES = 52_909
-_EXPECTED_EXECUTABLE_RECORD_SHA256 = (
-    "35b0d10450a490910bb817529fd06e3c9f5e884b647d073f4207c33f0baff748"
+_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_BYTES = 52_909
+_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256 = (
+    "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08"
 )
+_EXPECTED_NORMALIZED_HLO_MODULE_BYTES = 20_600
+_EXPECTED_NORMALIZED_HLO_MODULE_SHA256 = (
+    "1cac7332465fe69bd9d4ae2a53dbd0454a5f3ca4fd28bbdbd400a66a30dde1cd"
+)
+_AUTOTUNE_CACHE_DIRECTORY = b"xla_gpu_per_fusion_autotune_cache_dir"
+_NORMALIZED_AUTOTUNE_CACHE_PATH = (
+    b"/tmp/skyrl-w8a8-neutral-0000000000/compiler-artifacts/jax-cache/"
+    + _AUTOTUNE_CACHE_DIRECTORY
+)
+_EXPECTED_AUTOTUNE_PATH_BYTES = 101
+_EXPECTED_AUTOTUNE_PATH_FIELD_OFFSET = 19_901
+_EXPECTED_AUTOTUNE_PATH_RECORD_OFFSET = 19_905
+_RUN_DIRECTORY_NAME = re.compile(r"skyrl-w8a8-(?:compile|runtime)-[0-9]{10}")
+_CACHE_ENTRY_NAME = re.compile(r"jit_candidate-[0-9a-f]{64}-cache")
 _EXPECTED_GPU_EXECUTABLE_FIELD_SIGNATURE = (
     (1, 2),
     (2, 2),
@@ -707,21 +721,67 @@ def _decode_dim3d(
     return result  # type: ignore[return-value]
 
 
-def _inspect_thunks(records: list[bytes]) -> dict[str, Any]:
+def _inspect_thunks(records: list[bytes], *, cache_path: Path) -> dict[str, Any]:
     """Decode and pin the complete ordered custom-kernel launch sequence."""
     if len(records) != 5:
         raise VerificationError("split-proto record count changed before thunk audit")
     executable = records[4]
+    run_directory = cache_path.parent.parent.parent
     if (
-        len(executable) != _EXPECTED_EXECUTABLE_RECORD_BYTES
-        or _sha256(executable) != _EXPECTED_EXECUTABLE_RECORD_SHA256
+        not cache_path.is_absolute()
+        or cache_path.parent.name != "jax-cache"
+        or cache_path.parent.parent.name != "compiler-artifacts"
+        or run_directory.parent != Path("/tmp")
+        or _RUN_DIRECTORY_NAME.fullmatch(run_directory.name) is None
+        or _CACHE_ENTRY_NAME.fullmatch(cache_path.name) is None
     ):
         raise VerificationError(
-            "GPU executable record is not the fixed full-tile object"
+            "cache is not under the exact fresh /tmp run-scoped artifact layout"
         )
+    autotune_cache_path = os.fsencode(
+        cache_path.parent / os.fsdecode(_AUTOTUNE_CACHE_DIRECTORY)
+    )
     fields = _wire_fields(executable, label="GpuExecutableProto", max_fields=32)
     if _field_signature(fields) != _EXPECTED_GPU_EXECUTABLE_FIELD_SIGNATURE:
         raise VerificationError("GpuExecutableProto field sequence changed")
+    hlo_module = fields[0][2]
+    assert isinstance(hlo_module, bytes)
+    if (
+        len(_NORMALIZED_AUTOTUNE_CACHE_PATH) != _EXPECTED_AUTOTUNE_PATH_BYTES
+        or len(autotune_cache_path) != _EXPECTED_AUTOTUNE_PATH_BYTES
+        or _NORMALIZED_AUTOTUNE_CACHE_PATH in executable
+        or executable.count(_AUTOTUNE_CACHE_DIRECTORY) != 1
+        or executable.count(autotune_cache_path) != 1
+        or hlo_module.count(autotune_cache_path) != 1
+        or hlo_module.find(autotune_cache_path) != _EXPECTED_AUTOTUNE_PATH_FIELD_OFFSET
+        or executable.find(autotune_cache_path) != _EXPECTED_AUTOTUNE_PATH_RECORD_OFFSET
+    ):
+        raise VerificationError(
+            "executable autotune-cache path is not uniquely caller-bound"
+        )
+    normalized_executable = executable.replace(
+        autotune_cache_path, _NORMALIZED_AUTOTUNE_CACHE_PATH
+    )
+    normalized_fields = _wire_fields(
+        normalized_executable,
+        label="normalized GpuExecutableProto",
+        max_fields=32,
+    )
+    if _field_signature(normalized_fields) != _EXPECTED_GPU_EXECUTABLE_FIELD_SIGNATURE:
+        raise VerificationError("normalized GpuExecutableProto field sequence changed")
+    normalized_hlo_module = normalized_fields[0][2]
+    if (
+        len(normalized_executable) != _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_BYTES
+        or _sha256(normalized_executable)
+        != _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
+        or normalized_executable.count(_NORMALIZED_AUTOTUNE_CACHE_PATH) != 1
+        or not isinstance(normalized_hlo_module, bytes)
+        or len(normalized_hlo_module) != _EXPECTED_NORMALIZED_HLO_MODULE_BYTES
+        or _sha256(normalized_hlo_module) != _EXPECTED_NORMALIZED_HLO_MODULE_SHA256
+    ):
+        raise VerificationError(
+            "normalized GPU executable record is not the fixed full-tile object"
+        )
     encoded_thunks = [
         value for field, wire, value in fields if (field, wire) == (13, 2)
     ]
@@ -869,6 +929,20 @@ def _inspect_thunks(records: list[bytes]) -> dict[str, Any]:
     return {
         "executable_record_bytes": len(executable),
         "executable_record_sha256": _sha256(executable),
+        "executable_record_sha256_is_path_dependent": True,
+        "normalized_executable_record_bytes": len(normalized_executable),
+        "normalized_executable_record_sha256": _sha256(normalized_executable),
+        "normalized_hlo_module_bytes": len(normalized_hlo_module),
+        "normalized_hlo_module_sha256": _sha256(normalized_hlo_module),
+        "caller_bound_autotune_cache_path": os.fsdecode(autotune_cache_path),
+        "caller_bound_autotune_cache_path_occurrences": 1,
+        "caller_bound_autotune_cache_path_normalized": True,
+        "caller_bound_autotune_cache_path_field_offset": (
+            _EXPECTED_AUTOTUNE_PATH_FIELD_OFFSET
+        ),
+        "caller_bound_autotune_cache_path_record_offset": (
+            _EXPECTED_AUTOTUNE_PATH_RECORD_OFFSET
+        ),
         "thunk_count": len(inventory),
         "all_thunks_are_exact_custom_kernels": True,
         "sequential_wrapper_present": False,
@@ -1613,7 +1687,7 @@ def inspect_cache(
     cache_manifest["sha256"] = observed_cache_sha256
     cache_manifest["expected_sha256_matched"] = True
     records, serialization = _extract_cache_records(decompressed, _Snappy().decompress)
-    thunk_inventory = _inspect_thunks(records)
+    thunk_inventory = _inspect_thunks(records, cache_path=cache_path)
     candidate, elf_inventory = _inventory_elfs(records)
     candidate_descriptor = _make_sealed_memfd(candidate)
     try:

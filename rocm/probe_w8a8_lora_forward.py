@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """Fail-closed gfx1100 qualification for one bounded W8A8+LoRA tile.
 
-The default abstract mode emits a refusal without importing JAX.  The sole
-ROCm contract is one logical ``M=3,K=64,N=17`` BF16/W8-group64/rank-8 forward,
-using full physical ``M=16,N=32`` Pallas tiles before the logical output slice.
-A controller must hold and pass SkyRL's global ROCm lock through
-``profile_rocm.py``.  The child validates that inherited descriptor, the exact
-RX 7900 XTX and render node, a clean boot, a headless AMD card, the exact sole
-command-buffer-disable flag, and a hardware power cap no greater than 315 W.
-
-The compile phase lowers and compiles but never invokes the executable.  The
-separately guarded execute phase first requalifies the exact fresh nested gfx1100
-code object, then performs exactly one input transfer, one compiled invocation,
-one output transfer, and a host-only numerical comparison.  There is no
-backward, warmup, replay, benchmark, model dispatch, graph API, or command-buffer
-API in this probe.  Both phases require the outer telemetry and idle-handoff
-controller.
+Abstract mode refuses without JAX.  The sole ROCm contract is one logical
+``M=3,K=64,N=17`` BF16/W8-group64/rank-8 forward using full physical
+``M=16,N=32`` Pallas tiles.  A controller holds SkyRL's global ROCm lock and
+the child validates the exact headless RX 7900 XTX, clean boot, sole
+command-buffer-disable flag, and hardware power cap no greater than 315 W.
+Compile never invokes the executable.  Execute requalifies the fresh gfx1100
+object, then performs one input transfer, one invocation, one output transfer,
+and a host comparison.  This probe has no backward, warmup, replay, benchmark,
+model dispatch, graph, or command-buffer API; both phases require outer
+telemetry and idle handoff.
 """
 
 from __future__ import annotations
@@ -73,8 +68,8 @@ _EXPECTED_NESTED_ELF_TARGET = "amdgcn--amdhsa-amdgiz-gfx1100"
 _EXPECTED_INT8_WMMA_COUNT = 4
 _EXPECTED_SGPR_COUNT = 34
 _EXPECTED_VGPR_COUNT = 105
-_EXPECTED_EXECUTABLE_RECORD_SHA256 = (
-    "35b0d10450a490910bb817529fd06e3c9f5e884b647d073f4207c33f0baff748"
+_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256 = (
+    "8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08"
 )
 _EXPECTED_ORDERED_THUNK_LAUNCHES = (
     ("input_pad_reduce_fusion", [2, 1, 1], [256, 1, 1], 0),
@@ -138,7 +133,7 @@ _EXPECTED_HOST_SHA256 = {
     "expected": "964b0c1fe5f5c4cdbd60658717fee50a835006adf03011717b4914061ab4f88f",
 }
 _EXPECTED_SOURCE_SHA256 = {
-    "isa_inspector": "9806e33a6e59f32bf9a6b1093a20629e3a868f00e6c7ffb783361589949d4548",
+    "isa_inspector": "c8299c341e241b3723e00efcaa7157f29743b73cbaaa8b2cabd7d9ce14d001b6",
     "kernel": "af119fec39f53ba0dd0c500398589e0fc333a6fda752ffb464c2a578738bbded",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
@@ -1924,9 +1919,14 @@ def _qualify_fresh_nested_elf(
         and thunk_inventory.get("all_thunks_are_exact_custom_kernels") is True
         and thunk_inventory.get("sequential_wrapper_present") is False
         and thunk_inventory.get("device_to_device_copy_thunk_present") is False
-        and thunk_inventory.get("executable_record_bytes") == 52_909
-        and thunk_inventory.get("executable_record_sha256")
-        == _EXPECTED_EXECUTABLE_RECORD_SHA256
+        and thunk_inventory.get("executable_record_sha256_is_path_dependent") is True
+        and thunk_inventory.get("caller_bound_autotune_cache_path")
+        == str(cache_path.parent / "xla_gpu_per_fusion_autotune_cache_dir")
+        and thunk_inventory.get("caller_bound_autotune_cache_path_occurrences") == 1
+        and thunk_inventory.get("caller_bound_autotune_cache_path_normalized") is True
+        and thunk_inventory.get("normalized_executable_record_bytes") == 52_909
+        and thunk_inventory.get("normalized_executable_record_sha256")
+        == _EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
         and observed_thunk_launches == _EXPECTED_ORDERED_THUNK_LAUNCHES,
         "candidate_bytes_exact": candidate.get("bytes") == _EXPECTED_NESTED_ELF_BYTES,
         "candidate_sha256_exact": candidate.get("sha256") == _EXPECTED_NESTED_ELF_SHA256

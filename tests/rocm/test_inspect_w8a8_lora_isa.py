@@ -18,6 +18,10 @@ _SPEC = importlib.util.spec_from_file_location("inspect_w8a8_lora_isa", _MODULE_
 assert _SPEC is not None and _SPEC.loader is not None
 _ISA = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_ISA)
+_SYNTHETIC_CACHE_PATH = Path(
+    "/tmp/skyrl-w8a8-compile-1234567890/compiler-artifacts/jax-cache/"
+    f"jit_candidate-{'a' * 64}-cache"
+)
 
 
 def _varint(value: int) -> bytes:
@@ -277,6 +281,10 @@ def _synthetic_gpu_executable(
     *,
     grid_override: tuple[int, int, int] | None = None,
     non_custom_thunk_index: int | None = None,
+    cache_path: Path = _SYNTHETIC_CACHE_PATH,
+    autotune_path_copies: int = 1,
+    preexisting_normalized_path: bool = False,
+    duplicate_directory_token: bool = False,
 ) -> tuple[bytes, tuple[dict[str, object], ...]]:
     thunks = []
     expected_thunks = []
@@ -326,8 +334,18 @@ def _synthetic_gpu_executable(
         )
         thunks.append(thunk)
         expected_thunks.append(expected)
-    executable = b"".join(
-        _bytes_field(field, b"fixed") for field in (1, 2, 6, 8, 9, 10, 11)
+    autotune_cache_path = os.fsencode(
+        cache_path.parent / os.fsdecode(_ISA._AUTOTUNE_CACHE_DIRECTORY)
+    )
+    hlo_module = b"fixed-prefix" + autotune_cache_path * autotune_path_copies
+    if preexisting_normalized_path:
+        hlo_module += _ISA._NORMALIZED_AUTOTUNE_CACHE_PATH
+    if duplicate_directory_token:
+        hlo_module += _ISA._AUTOTUNE_CACHE_DIRECTORY
+    hlo_module += b"-fixed-suffix"
+    executable = _bytes_field(1, hlo_module)
+    executable += b"".join(
+        _bytes_field(field, b"fixed") for field in (2, 6, 8, 9, 10, 11)
     )
     executable += b"".join(_bytes_field(13, thunk) for thunk in thunks)
     executable += _bytes_field(14, b"fixed")
@@ -335,14 +353,53 @@ def _synthetic_gpu_executable(
 
 
 def _bind_synthetic_thunks(
-    monkeypatch, executable: bytes, expected: tuple[dict[str, object], ...]
+    monkeypatch,
+    executable: bytes,
+    expected: tuple[dict[str, object], ...],
+    *,
+    cache_path: Path = _SYNTHETIC_CACHE_PATH,
 ) -> None:
     monkeypatch.setattr(_ISA, "_EXPECTED_THUNKS", expected)
-    monkeypatch.setattr(_ISA, "_EXPECTED_EXECUTABLE_RECORD_BYTES", len(executable))
+    autotune_cache_path = os.fsencode(
+        cache_path.parent / os.fsdecode(_ISA._AUTOTUNE_CACHE_DIRECTORY)
+    )
+    normalized = executable.replace(
+        autotune_cache_path, _ISA._NORMALIZED_AUTOTUNE_CACHE_PATH
+    )
+    fields = _ISA._wire_fields(executable, label="synthetic", max_fields=32)
+    hlo_module = fields[0][2]
+    assert isinstance(hlo_module, bytes)
+    normalized_fields = _ISA._wire_fields(
+        normalized, label="normalized synthetic", max_fields=32
+    )
+    normalized_hlo_module = normalized_fields[0][2]
+    assert isinstance(normalized_hlo_module, bytes)
+    monkeypatch.setattr(
+        _ISA, "_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_BYTES", len(normalized)
+    )
     monkeypatch.setattr(
         _ISA,
-        "_EXPECTED_EXECUTABLE_RECORD_SHA256",
-        hashlib.sha256(executable).hexdigest(),
+        "_EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256",
+        hashlib.sha256(normalized).hexdigest(),
+    )
+    monkeypatch.setattr(
+        _ISA, "_EXPECTED_NORMALIZED_HLO_MODULE_BYTES", len(normalized_hlo_module)
+    )
+    monkeypatch.setattr(
+        _ISA,
+        "_EXPECTED_NORMALIZED_HLO_MODULE_SHA256",
+        hashlib.sha256(normalized_hlo_module).hexdigest(),
+    )
+    monkeypatch.setattr(_ISA, "_EXPECTED_AUTOTUNE_PATH_BYTES", len(autotune_cache_path))
+    monkeypatch.setattr(
+        _ISA,
+        "_EXPECTED_AUTOTUNE_PATH_FIELD_OFFSET",
+        hlo_module.find(autotune_cache_path),
+    )
+    monkeypatch.setattr(
+        _ISA,
+        "_EXPECTED_AUTOTUNE_PATH_RECORD_OFFSET",
+        executable.find(autotune_cache_path),
     )
 
 
@@ -608,12 +665,29 @@ def test_thunk_decoder_pins_six_ordered_custom_kernel_launches(monkeypatch) -> N
     _bind_synthetic_thunks(monkeypatch, executable, expected)
     records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
 
-    evidence = _ISA._inspect_thunks(records)
+    evidence = _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
 
     assert evidence["thunk_count"] == 6
     assert evidence["all_thunks_are_exact_custom_kernels"] is True
     assert evidence["sequential_wrapper_present"] is False
     assert evidence["device_to_device_copy_thunk_present"] is False
+    assert evidence["executable_record_sha256_is_path_dependent"] is True
+    assert evidence["caller_bound_autotune_cache_path_normalized"] is True
+    assert evidence["caller_bound_autotune_cache_path_occurrences"] == 1
+    assert evidence["caller_bound_autotune_cache_path_field_offset"] == (
+        _ISA._EXPECTED_AUTOTUNE_PATH_FIELD_OFFSET
+    )
+    assert evidence["caller_bound_autotune_cache_path_record_offset"] == (
+        _ISA._EXPECTED_AUTOTUNE_PATH_RECORD_OFFSET
+    )
+    assert (
+        evidence["normalized_hlo_module_bytes"]
+        == _ISA._EXPECTED_NORMALIZED_HLO_MODULE_BYTES
+    )
+    assert (
+        evidence["normalized_hlo_module_sha256"]
+        == _ISA._EXPECTED_NORMALIZED_HLO_MODULE_SHA256
+    )
     ordered = evidence["ordered_thunks"]
     assert [item["thunk_id"] for item in ordered] == [1, 2, 3, 4, 5, 6]
     assert ordered[4]["kernel"] == _ISA._EXPECTED_SYMBOL
@@ -624,6 +698,140 @@ def test_thunk_decoder_pins_six_ordered_custom_kernel_launches(monkeypatch) -> N
     assert ordered[5]["threads"] == [51, 1, 1]
 
 
+def test_thunk_decoder_normalizes_only_the_caller_bound_run_path(monkeypatch) -> None:
+    runtime_cache = Path(
+        "/tmp/skyrl-w8a8-runtime-9876543210/compiler-artifacts/jax-cache/"
+        f"jit_candidate-{'b' * 64}-cache"
+    )
+    compile_executable, expected = _synthetic_gpu_executable()
+    runtime_executable, _ = _synthetic_gpu_executable(cache_path=runtime_cache)
+    _bind_synthetic_thunks(monkeypatch, compile_executable, expected)
+    compile_autotune_path = os.fsencode(
+        _SYNTHETIC_CACHE_PATH.parent / os.fsdecode(_ISA._AUTOTUNE_CACHE_DIRECTORY)
+    )
+    assert len(compile_autotune_path) == _ISA._EXPECTED_AUTOTUNE_PATH_BYTES
+    assert len(_ISA._NORMALIZED_AUTOTUNE_CACHE_PATH) == len(compile_autotune_path)
+
+    compile_evidence = _ISA._inspect_thunks(
+        [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", compile_executable],
+        cache_path=_SYNTHETIC_CACHE_PATH,
+    )
+    runtime_evidence = _ISA._inspect_thunks(
+        [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", runtime_executable],
+        cache_path=runtime_cache,
+    )
+
+    assert (
+        compile_evidence["executable_record_sha256"]
+        != runtime_evidence["executable_record_sha256"]
+    )
+    assert (
+        compile_evidence["normalized_executable_record_sha256"]
+        == runtime_evidence["normalized_executable_record_sha256"]
+    )
+
+
+def test_thunk_decoder_rejects_path_mismatch_duplicate_and_noncanonical_layout(
+    monkeypatch,
+) -> None:
+    executable, expected = _synthetic_gpu_executable()
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
+    mismatched_cache = Path(
+        "/tmp/skyrl-w8a8-compile-1234567891/compiler-artifacts/jax-cache/"
+        f"jit_candidate-{'a' * 64}-cache"
+    )
+
+    with pytest.raises(_ISA.VerificationError, match="uniquely caller-bound"):
+        _ISA._inspect_thunks(records, cache_path=mismatched_cache)
+
+    noncanonical_cache = Path(
+        "/tmp/arbitrary-run-1234567890/compiler-artifacts/jax-cache/"
+        f"jit_candidate-{'a' * 64}-cache"
+    )
+    noncanonical, noncanonical_expected = _synthetic_gpu_executable(
+        cache_path=noncanonical_cache
+    )
+    _bind_synthetic_thunks(
+        monkeypatch,
+        noncanonical,
+        noncanonical_expected,
+        cache_path=noncanonical_cache,
+    )
+    with pytest.raises(_ISA.VerificationError, match="fresh /tmp run-scoped"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", noncanonical],
+            cache_path=noncanonical_cache,
+        )
+
+    wrong_basename = _SYNTHETIC_CACHE_PATH.with_name("arbitrary-cache-entry")
+    with pytest.raises(_ISA.VerificationError, match="fresh /tmp run-scoped"):
+        _ISA._inspect_thunks(records, cache_path=wrong_basename)
+
+    duplicate, duplicate_expected = _synthetic_gpu_executable(autotune_path_copies=2)
+    _bind_synthetic_thunks(monkeypatch, duplicate, duplicate_expected)
+    with pytest.raises(_ISA.VerificationError, match="uniquely caller-bound"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", duplicate],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
+
+
+def test_thunk_decoder_rejects_moved_or_preexisting_normalized_path(
+    monkeypatch,
+) -> None:
+    executable, expected = _synthetic_gpu_executable()
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    fields = _ISA._wire_fields(executable, label="synthetic", max_fields=32)
+    hlo_module = fields[0][2]
+    assert isinstance(hlo_module, bytes)
+    encoded_hlo = _bytes_field(1, hlo_module)
+    moved = executable.replace(encoded_hlo, _bytes_field(1, b"x" + hlo_module[:-1]), 1)
+    with pytest.raises(_ISA.VerificationError, match="uniquely caller-bound"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", moved],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
+
+    preexisting, preexisting_expected = _synthetic_gpu_executable(
+        preexisting_normalized_path=True
+    )
+    _bind_synthetic_thunks(monkeypatch, preexisting, preexisting_expected)
+    with pytest.raises(_ISA.VerificationError, match="uniquely caller-bound"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", preexisting],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
+
+    duplicate_token, duplicate_token_expected = _synthetic_gpu_executable(
+        duplicate_directory_token=True
+    )
+    _bind_synthetic_thunks(monkeypatch, duplicate_token, duplicate_token_expected)
+    with pytest.raises(_ISA.VerificationError, match="uniquely caller-bound"):
+        _ISA._inspect_thunks(
+            [
+                _ISA._EXPECTED_SPLIT_MANIFEST,
+                b"",
+                b"wrapper",
+                b"",
+                duplicate_token,
+            ],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
+
+
+def test_thunk_decoder_rejects_nonpath_record_mutation(monkeypatch) -> None:
+    executable, expected = _synthetic_gpu_executable()
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    mutated = executable.replace(b"fixed", b"fIxed", 1)
+
+    with pytest.raises(_ISA.VerificationError, match="normalized GPU executable"):
+        _ISA._inspect_thunks(
+            [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", mutated],
+            cache_path=_SYNTHETIC_CACHE_PATH,
+        )
+
+
 def test_thunk_decoder_rejects_changed_pallas_grid_after_exact_raw_rebind(
     monkeypatch,
 ) -> None:
@@ -632,7 +840,7 @@ def test_thunk_decoder_rejects_changed_pallas_grid_after_exact_raw_rebind(
     records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
 
     with pytest.raises(_ISA.VerificationError, match="launch dimensions"):
-        _ISA._inspect_thunks(records)
+        _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
 
 
 def test_thunk_decoder_rejects_a_seventh_thunk(monkeypatch) -> None:
@@ -642,7 +850,7 @@ def test_thunk_decoder_rejects_a_seventh_thunk(monkeypatch) -> None:
     records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
 
     with pytest.raises(_ISA.VerificationError, match="field sequence"):
-        _ISA._inspect_thunks(records)
+        _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
 
 
 def test_thunk_decoder_rejects_non_custom_kind_with_six_thunks(monkeypatch) -> None:
@@ -651,7 +859,7 @@ def test_thunk_decoder_rejects_non_custom_kind_with_six_thunks(monkeypatch) -> N
     records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
 
     with pytest.raises(_ISA.VerificationError, match="not the exact custom-kernel"):
-        _ISA._inspect_thunks(records)
+        _ISA._inspect_thunks(records, cache_path=_SYNTHETIC_CACHE_PATH)
 
 
 def test_inventory_selects_symbol_not_position_and_classifies_empty_wrapper(
@@ -1047,9 +1255,13 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
     monkeypatch.setattr(
         _ISA,
         "_inspect_thunks",
-        lambda _records: {
+        lambda _records, *, cache_path: {
             "executable_record_bytes": len(records[4]),
             "executable_record_sha256": hashlib.sha256(records[4]).hexdigest(),
+            "normalized_executable_record_bytes": len(records[4]),
+            "normalized_executable_record_sha256": hashlib.sha256(
+                records[4]
+            ).hexdigest(),
             "thunk_count": 2,
             "all_thunks_are_exact_custom_kernels": True,
             "sequential_wrapper_present": False,

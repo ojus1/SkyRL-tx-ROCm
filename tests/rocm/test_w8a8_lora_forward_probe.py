@@ -1004,8 +1004,16 @@ def _exact_fresh_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
             "ordered_nested_contract_matched": True,
         },
         "thunk_inventory": {
-            "executable_record_bytes": 52909,
-            "executable_record_sha256": _PROBE._EXPECTED_EXECUTABLE_RECORD_SHA256,
+            "executable_record_sha256_is_path_dependent": True,
+            "caller_bound_autotune_cache_path": str(
+                cache.parent / "xla_gpu_per_fusion_autotune_cache_dir"
+            ),
+            "caller_bound_autotune_cache_path_occurrences": 1,
+            "caller_bound_autotune_cache_path_normalized": True,
+            "normalized_executable_record_bytes": 52909,
+            "normalized_executable_record_sha256": (
+                _PROBE._EXPECTED_NORMALIZED_EXECUTABLE_RECORD_SHA256
+            ),
             "thunk_count": 6,
             "all_thunks_are_exact_custom_kernels": True,
             "sequential_wrapper_present": False,
@@ -1129,6 +1137,36 @@ def test_fresh_isa_helper_rejects_zero_or_two_cache_candidates_without_inspectio
             "one_unique_exact_symbol_candidate",
         ),
         (("thunk_inventory", "thunk_count"), 5, "six_ordered_custom_kernel_thunks"),
+        (
+            ("thunk_inventory", "normalized_executable_record_bytes"),
+            52_908,
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (
+            ("thunk_inventory", "normalized_executable_record_sha256"),
+            "0" * 64,
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (
+            ("thunk_inventory", "caller_bound_autotune_cache_path"),
+            "/tmp/wrong/xla_gpu_per_fusion_autotune_cache_dir",
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (
+            ("thunk_inventory", "caller_bound_autotune_cache_path_occurrences"),
+            2,
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (
+            ("thunk_inventory", "caller_bound_autotune_cache_path_normalized"),
+            False,
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (
+            ("thunk_inventory", "executable_record_sha256_is_path_dependent"),
+            False,
+            "six_ordered_custom_kernel_thunks",
+        ),
         (
             ("thunk_inventory", "device_to_device_copy_thunk_present"),
             True,

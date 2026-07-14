@@ -15,8 +15,11 @@ fatal AMDGPU journal monitoring.
 - The validated growth-mode training baseline disables JAX preallocation and
   keeps Pallas attention opt-in. Fixed-85% BFC preallocation is used only by
   the explicitly guarded capacity probes described below.
-- Junction temperature is capped at 90 C, VRAM at 23 GiB, minimum available
-  host memory at 4 GiB, and swap use at zero.
+- Junction temperature is capped at 90 C and configured GPU power at 315 W.
+  Full VRAM plus CPU/RAM/disk offload are permitted; individual qualification
+  rungs may retain tighter workload-specific caps when their expected footprint
+  is much smaller. There is no longer a global zero-swap or 4 GiB
+  host-available promotion rule.
 - The AMD display connectors must be disconnected and `/dev/kfd` unowned
   before launch. A 60-second cold-start sensor grace accommodates a
   runtime-suspended headless GPU.
@@ -169,26 +172,45 @@ coverage now proves bitwise tail-forward equivalence, the retained 1% W8
 gradient gates, physical call shapes, and absence of `lt`/`and` tail predicates
 in both kernel JAXPRs.
 
-Revision `f6b26775456e5c2aa92dd621b26f3752f111ad00` then completed the
-corrected compile-only rung in `/tmp/skyrl-w8a8-compile-1783984330`. The
-controller returned `passed_compile_diagnostic_unpromoted`; the returned
-executable was invoked zero times and no device transfer, dispatch, or ISA
-release gate ran. Lowering and compilation took 1.143570072 and 0.722381366
-seconds. The 15,351-byte StableHLO and 22,853-byte optimized HLO have SHA-256
-values
-`3eac9283c56d35e9df7f3fb42d7ab62fba851b74ca7f5ea09ee746f1587f1772`
-and
-`f04d417e17e5b861fae860fb027691d82d28694883e05565ca691388848a33f6`.
-They independently bind the sole Pallas call to physical BF16 `[16,32]` and
-the public result to logical BF16 `[3,17]` through the final
-`wrapped_slice`. The compiler reports 4,036 bytes of arguments, 102 bytes of
-output, 3,600 bytes of temporaries, 7,738 bytes total, and 1,920 bytes of
-generated code.
+Revision `f6b26775456e5c2aa92dd621b26f3752f111ad00` first completed the
+corrected full-tile compile. After the six-thunk, embedded-object, resource,
+and control-flow pins were committed at
+`e4152e47900086bfe2f58acf94d9f9a765b99aa5`, a second fresh compile-only
+qualification completed in `/tmp/skyrl-w8a8-compile-1783987495`. The
+controller returned `passed_compile_diagnostic_unpromoted`; there were zero
+ISA qualifications, input/output transfers, returned-executable invocations,
+or releases. Lowering and compilation took 1.112806747 and 0.720117240
+seconds. The 15,351-byte StableHLO has SHA-256
+`3eac9283c56d35e9df7f3fb42d7ab62fba851b74ca7f5ea09ee746f1587f1772`;
+the 22,853-byte optimized HLO has SHA-256
+`f05cc7cefb15832b90a24088fad868175034874534b8193e82430d4840899406`.
+The optimized-HLO change from the first corrected compile is confined to
+source-location line metadata. Both artifacts bind the sole Pallas call to
+physical BF16 `[16,32]` and the public result to logical BF16 `[3,17]` through
+the final `wrapped_slice`. Compiler accounting remains 4,036 bytes of
+arguments, 102 bytes of output, 3,600 bytes of temporaries, 7,738 bytes total,
+and 1,920 bytes of generated code.
 
-The retained 19,336-byte cache has SHA-256
-`af70b579f0f876767bd824d9372b8b39e4887032430ef0bfba259b6af02d4d05`
-and decoded record sizes `[56, 0, 1920, 0, 52909]`. A bounded, CPU-only audit
-decoded exactly these six ordered custom-kernel thunks:
+The fresh retained cache is 19,332 bytes with SHA-256
+`bf40785e7dd4d0a07336ba814e8d7fde59c2d5525e50f8317134999119802604`
+and decoded record sizes `[56, 0, 1920, 0, 52909]`. Its raw 52,909-byte
+executable record has the run-path-dependent SHA-256
+`696fa3761f183e49139ca957c1d8bd337699451560f8f233df5e0b4cbdea556b`.
+A bounded CPU-only schema audit requires the sole embedded autotune-cache path
+to equal the caller-derived canonical 101-byte path at field-one/record
+offsets 19,901/19,905, then replaces exactly those 101 bytes with an
+equal-length neutral token. The still-parseable normalized record is 52,909
+bytes with SHA-256
+`8060df67a90b7e0827672aa4c349d66f51a50b13120345e698ea95454c6acc08`;
+its normalized 20,600-byte field one has SHA-256
+`1cac7332465fe69bd9d4ae2a53dbd0454a5f3ca4fd28bbdbd400a66a30dde1cd`.
+The whole normalized-record hash remains authoritative and therefore pins all
+non-path bytes, protobuf framing, thunks, and embedded ELFs. The older cache
+fails this fresh normalized hash because its probe source-line metadata is
+different. These two builds are not a same-source reproducibility pair, so
+path-only variability under identical source remains inferred rather than
+empirically repeated. The fresh audit decoded exactly these six ordered
+custom-kernel thunks:
 
 | Order | Kernel | Grid | Threads | LDS (bytes) | ELF bytes / SHA-256 |
 |---:|---|---|---:|---:|---|
@@ -199,21 +221,23 @@ decoded exactly these six ordered custom-kernel thunks:
 | 4 | `skyrl_qwen35_w8a8_lora_forward` | `1x2x1` | `128x1x1` | 1,024 | 7,160 / `87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f` |
 | 5 | `wrapped_slice` | `1x1x1` | `51x1x1` | 0 | 3,416 / `476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799` |
 
-The first four ELFs are byte-identical to the masked executable. The corrected
-Pallas object is instead 7,160 bytes, targets gfx1100, uses 34 SGPRs and 105
-VGPRs, and reports no spills. Its disassembly retains exactly four signed
-IU8-WMMA instructions and nine barriers; its one forward branch occurs after
-all barriers. The former final D2D copy is now the real `wrapped_slice` kernel
-shown above. This is an offline GO to repin the exact inspector and runtime
-release gates for the corrected artifact. It is not permission to execute it
-and proves no runtime correctness, speed, memory saving, or promotion.
+All six thunk serializations and all seven ELFs are byte-identical across the
+two corrected builds. The first four ELFs are also byte-identical to the
+masked executable. The corrected Pallas object is 7,160 bytes, targets
+gfx1100, uses 34 SGPRs and 105 VGPRs, and reports no spills. Its disassembly
+has exactly four signed IU8-WMMA instructions and nine barriers; its sole
+forward branch occurs after every barrier. The former final D2D copy is the
+real `wrapped_slice` kernel shown above. This is an offline GO for the exact
+normalized inspector and release-gate pins. It is not permission to execute
+the object and proves no runtime correctness, speed, memory saving, backward,
+or promotion.
 
-The corrected compile peaked at 867,364,864 bytes physical VRAM, 22,405,120
-bytes GTT, 6,202,449,920 bytes host RAM used, 52 C junction temperature, and
-113 W sampled average power. Swap stayed exactly 20,480 bytes, the maximum
-measured sample gap was 0.089058 seconds, all limits passed, the AMDGPU journal
-remained clean, and handoff restored the exact suspended/unowned baseline of
-27,947,008 bytes VRAM and 15,966,208 bytes GTT after three samples.
+The fresh compile peaked at 867,352,576 bytes physical VRAM, 22,405,120 bytes
+GTT, 6,423,089,152 bytes host RAM used, 51 C junction temperature, and 113 W
+sampled average power. Swap stayed exactly 20,480 bytes, the maximum measured
+sample gap was 0.082857711 seconds, the AMDGPU journal remained clean, and
+handoff restored the exact suspended/unowned baseline of 27,947,008 bytes VRAM
+and 15,966,208 bytes GTT after three samples.
 
 For the original compile-only artifacts under
 `/tmp/skyrl-w8a8-compile-1783972228`, peak observed physical VRAM, junction
@@ -223,8 +247,10 @@ the device returned to its exact suspended/unowned idle baseline. That
 historical compile evidence justified the now-consumed one-shot rung; it does
 not authorize another invocation of the same artifact. The old masked
 8,440-byte object and its timed-out executable must never be retried. The
-corrected object has not been executed; repinning and independent review must
-precede any separately authorized guarded request.
+corrected object has not been executed. The normalized pins and their CPU-only
+regressions have received independent review in this source revision. That
+offline GO is not execution authorization; any guarded request remains a
+separate one-shot decision.
 
 ### Stable-source T1024 executable-cache qualification
 
