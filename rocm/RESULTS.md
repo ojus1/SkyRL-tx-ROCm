@@ -167,9 +167,53 @@ For the qualification case this changes logical `N=17` to physical `N=32`;
 aligned Qwen projection sizes require no padding. CPU/interpreter and mock
 coverage now proves bitwise tail-forward equivalence, the retained 1% W8
 gradient gates, physical call shapes, and absence of `lt`/`and` tail predicates
-in both kernel JAXPRs. This corrected source has not yet been compiled or
-executed on the GPU; a fresh compile, complete thunk/ISA audit, and explicit
-offline GO remain mandatory before any further dispatch.
+in both kernel JAXPRs.
+
+Revision `f6b26775456e5c2aa92dd621b26f3752f111ad00` then completed the
+corrected compile-only rung in `/tmp/skyrl-w8a8-compile-1783984330`. The
+controller returned `passed_compile_diagnostic_unpromoted`; the returned
+executable was invoked zero times and no device transfer, dispatch, or ISA
+release gate ran. Lowering and compilation took 1.143570072 and 0.722381366
+seconds. The 15,351-byte StableHLO and 22,853-byte optimized HLO have SHA-256
+values
+`3eac9283c56d35e9df7f3fb42d7ab62fba851b74ca7f5ea09ee746f1587f1772`
+and
+`f04d417e17e5b861fae860fb027691d82d28694883e05565ca691388848a33f6`.
+They independently bind the sole Pallas call to physical BF16 `[16,32]` and
+the public result to logical BF16 `[3,17]` through the final
+`wrapped_slice`. The compiler reports 4,036 bytes of arguments, 102 bytes of
+output, 3,600 bytes of temporaries, 7,738 bytes total, and 1,920 bytes of
+generated code.
+
+The retained 19,336-byte cache has SHA-256
+`af70b579f0f876767bd824d9372b8b39e4887032430ef0bfba259b6af02d4d05`
+and decoded record sizes `[56, 0, 1920, 0, 52909]`. A bounded, CPU-only audit
+decoded exactly these six ordered custom-kernel thunks:
+
+| Order | Kernel | Grid | Threads | LDS (bytes) | ELF bytes / SHA-256 |
+|---:|---|---|---:|---:|---|
+| 0 | `input_pad_reduce_fusion` | `2x1x1` | `256x1x1` | 0 | 4,080 / `06a6035fabadbc8de4d7d201fa51ad2b9383a37faa84e4a0b51d9587fa3d8c7f` |
+| 1 | `loop_convert_fusion` | `8x1x1` | `128x1x1` | 0 | 3,944 / `8db071b2d0e93475f713c566d984a940155ed293e63adf53b62a53288fada685` |
+| 2 | `gemm_fusion_dot_general_1` | `1x1x1` | `128x1x1` | 8,192 | 7,408 / `c45a0fb7f236f7b16dbdfedb905dd116a02006c16c43d6dd687c30ccedf2eaf1` |
+| 3 | `loop_select_fusion` | `1x1x1` | `16x1x1` | 0 | 3,424 / `8e7f454a584324b303ab299d22e4a3d4ee956f29bc36c64c030256fd24068a71` |
+| 4 | `skyrl_qwen35_w8a8_lora_forward` | `1x2x1` | `128x1x1` | 1,024 | 7,160 / `87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f` |
+| 5 | `wrapped_slice` | `1x1x1` | `51x1x1` | 0 | 3,416 / `476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799` |
+
+The first four ELFs are byte-identical to the masked executable. The corrected
+Pallas object is instead 7,160 bytes, targets gfx1100, uses 34 SGPRs and 105
+VGPRs, and reports no spills. Its disassembly retains exactly four signed
+IU8-WMMA instructions and nine barriers; its one forward branch occurs after
+all barriers. The former final D2D copy is now the real `wrapped_slice` kernel
+shown above. This is an offline GO to repin the exact inspector and runtime
+release gates for the corrected artifact. It is not permission to execute it
+and proves no runtime correctness, speed, memory saving, or promotion.
+
+The corrected compile peaked at 867,364,864 bytes physical VRAM, 22,405,120
+bytes GTT, 6,202,449,920 bytes host RAM used, 52 C junction temperature, and
+113 W sampled average power. Swap stayed exactly 20,480 bytes, the maximum
+measured sample gap was 0.089058 seconds, all limits passed, the AMDGPU journal
+remained clean, and handoff restored the exact suspended/unowned baseline of
+27,947,008 bytes VRAM and 15,966,208 bytes GTT after three samples.
 
 For the original compile-only artifacts under
 `/tmp/skyrl-w8a8-compile-1783972228`, peak observed physical VRAM, junction
@@ -177,7 +221,10 @@ temperature, and sampled average power were 867,360,768 bytes, 51 C, and 113 W.
 Swap did not grow, all monitored limits passed, no driver fault appeared, and
 the device returned to its exact suspended/unowned idle baseline. That
 historical compile evidence justified the now-consumed one-shot rung; it does
-not authorize another invocation of the same artifact.
+not authorize another invocation of the same artifact. The old masked
+8,440-byte object and its timed-out executable must never be retried. The
+corrected object has not been executed; repinning and independent review must
+precede any separately authorized guarded request.
 
 ### Stable-source T1024 executable-cache qualification
 

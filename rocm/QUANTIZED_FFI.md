@@ -119,9 +119,10 @@ The first useful model family remains all 32 MLP gate/up matrices, each exactly
 `K=2560,N=18432`. Compact W8 codes plus BF16 group-64 scales save exactly
 1,462,763,520 bytes (1.362304688 GiB) versus their BF16 kernels. This one shared
 callsite is the smallest projection family with more than 1 GiB capacity
-upside. It must retain no BF16 shadow and remains blocked on guarded gfx1100
-compile, ISA, correctness, memory, and throughput gates before NNX/checkpoint
-integration.
+upside. It must retain no BF16 shadow. The tiny full-tile case has now passed
+guarded gfx1100 compilation and an offline ISA/thunk audit, but runtime
+correctness, realized memory, throughput, backward, and model-shape gates still
+block NNX/checkpoint integration.
 
 ### Guarded gfx1100 qualification entrypoint
 
@@ -152,13 +153,16 @@ compile phase invokes no returned executable. A separately guarded
 former masked-`N=17` artifact hit the exact five-second dispatch watchdog and
 was killed/reaped without an AMDGPU fault or reset; the bracket contained five
 GPU kernels plus output readiness, so it does not prove that Pallas itself
-stalled. The corrected full-tile source has not been compiled or run. After
-fresh compilation it requalifies the exact nested gfx1100 code object before
-permitting one six-leaf input transfer, one compiled forward invocation with
-readiness, one output transfer, and a host-only comparison against the
-immutable oracle. It exposes no backward, warmup, repetition, replay, GPU
-reference, device-side error reduction, graph, model, or benchmark path, and
-it cannot promote the runtime or model path.
+stalled. The corrected full-tile source has since been freshly compiled and
+audited offline, but it has not run. Its current offline GO authorizes only
+repinning the exact nested gfx1100 object and six-thunk inventory; it does not
+release an executable. After those pins and their tests receive independent
+review, a separately authorized rung may permit one six-leaf input transfer,
+one compiled forward invocation with readiness, one output transfer, and a
+host-only comparison against the immutable oracle. The gate exposes no
+backward, warmup, repetition, replay, GPU reference, device-side error
+reduction, graph, model, or benchmark path, and it cannot promote the runtime
+or model path.
 
 The controller fixes sampled-sysfs thresholds of 2 GiB VRAM, 90 C junction,
 and 315 W `power1_average`, plus an 85 C child launch gate, 300-second child
@@ -194,10 +198,11 @@ XLA_FLAGS=--xla_gpu_enable_command_buffer= \
     --platform rocm --phase compile --allow-gpu --run-dir "$run_dir"
 ```
 
-The exact former execute capability was consumed and must not be retried. Only
-after the corrected full-tile source is committed, freshly compiled, and its
-complete thunk/ISA evidence receives an explicit offline GO may a new one-shot
-request be made with:
+The exact former masked execute capability was consumed and must not be
+retried. The corrected source is committed, freshly compiled, and has received
+an offline GO only for repinning. The inspector, probe, and controller pins
+must first be updated, tested, and independently reviewed. Only then, and only
+with separate authorization, may a new one-shot request use this command form:
 
 ```bash
 umask 077
@@ -339,10 +344,65 @@ and the failed-attempt cache
 `b1009c207c0c78bfe7a54c4fae568133034f2e6d0381367365cba10531bdec19`.
 No GPU access or executable dispatch is involved in that offline regression.
 
-The next permitted rung remains exactly one
-host-checked invocation of the same tiny forward. Only after that source and
-its fresh nested-ELF gate are independently reviewed will the ladder change one
-risk dimension at a time: signed base-only semantics;
+### Masked timeout and corrected full-tile compile
+
+The one guarded retry of the old masked object was consumed at revision
+`8eb3c7d7` in `/tmp/skyrl-w8a8-runtime-1783982504`. Its five kernels and final
+D2D slice did not complete inside the five-second bracket around the compiled
+call and output readiness. The controller killed and reaped the complete
+scope, restored the exact suspended/unowned baseline, and found no AMDGPU
+fault or reset. This cannot identify the stalled stage and supplies no
+correctness or performance result. The exact masked 8,440-byte object and this
+timed-out executable must never be retried.
+
+Exact revision `f6b26775456e5c2aa92dd621b26f3752f111ad00` subsequently
+completed the corrected compile-only rung in
+`/tmp/skyrl-w8a8-compile-1783984330`. The controller returned
+`passed_compile_diagnostic_unpromoted`, with zero returned-executable
+invocations, device transfers, or dispatches. Lowering took 1.143570072 seconds
+and compilation took 0.722381366 seconds. The 15,351-byte StableHLO has SHA-256
+`3eac9283c56d35e9df7f3fb42d7ab62fba851b74ca7f5ea09ee746f1587f1772`;
+the 22,853-byte optimized HLO has SHA-256
+`f04d417e17e5b861fae860fb027691d82d28694883e05565ca691388848a33f6`.
+Both prove one physical `[16,32]` Pallas result followed by the final
+`wrapped_slice` to logical `[3,17]`. The compiler reports 4,036 bytes of
+arguments, 102 bytes of output, 3,600 bytes of temporaries, 7,738 bytes total,
+and 1,920 bytes of generated code.
+
+The retained cache is 19,336 bytes with SHA-256
+`af70b579f0f876767bd824d9372b8b39e4887032430ef0bfba259b6af02d4d05`.
+Its decoded record sizes are `[56, 0, 1920, 0, 52909]`, and a bounded CPU-only
+wire/ELF audit found exactly six ordered custom-kernel thunks:
+
+| Order | Kernel | Grid | Threads | LDS (bytes) | ELF bytes / SHA-256 |
+|---:|---|---|---:|---:|---|
+| 0 | `input_pad_reduce_fusion` | `2x1x1` | `256x1x1` | 0 | 4,080 / `06a6035fabadbc8de4d7d201fa51ad2b9383a37faa84e4a0b51d9587fa3d8c7f` |
+| 1 | `loop_convert_fusion` | `8x1x1` | `128x1x1` | 0 | 3,944 / `8db071b2d0e93475f713c566d984a940155ed293e63adf53b62a53288fada685` |
+| 2 | `gemm_fusion_dot_general_1` | `1x1x1` | `128x1x1` | 8,192 | 7,408 / `c45a0fb7f236f7b16dbdfedb905dd116a02006c16c43d6dd687c30ccedf2eaf1` |
+| 3 | `loop_select_fusion` | `1x1x1` | `16x1x1` | 0 | 3,424 / `8e7f454a584324b303ab299d22e4a3d4ee956f29bc36c64c030256fd24068a71` |
+| 4 | `skyrl_qwen35_w8a8_lora_forward` | `1x2x1` | `128x1x1` | 1,024 | 7,160 / `87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f` |
+| 5 | `wrapped_slice` | `1x1x1` | `51x1x1` | 0 | 3,416 / `476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799` |
+
+The first four objects remain byte-identical to the masked build. The corrected
+Pallas object targets gfx1100, uses 34 SGPRs and 105 VGPRs, reports no spills,
+and contains exactly four signed IU8 WMMAs and nine barriers. Its one forward
+branch is after all barriers. The former final D2D copy is now the actual
+`wrapped_slice` kernel. This complete offline evidence gives a GO to replace
+the old exact inspector/probe/controller pins, not a GO to dispatch. It proves
+no runtime correctness, throughput, realized memory saving, backward, or
+promotion.
+
+The corrected compile peaked at 867,364,864 bytes physical VRAM, 22,405,120
+bytes GTT, 6,202,449,920 bytes host RAM used, 52 C junction temperature, and
+113 W sampled average power. Swap remained exactly 20,480 bytes, the maximum
+sample gap was 0.089058 seconds, every monitored limit passed, the whole-boot
+AMDGPU journal remained clean, and three handoff samples restored the exact
+suspended/unowned 27,947,008-byte VRAM and 15,966,208-byte GTT baseline.
+
+After the new pins, tests, and independent review, any separately authorized
+rung would remain exactly one host-checked invocation of the corrected tiny
+forward. Only after that result will the ladder change one risk dimension at a
+time: signed base-only semantics;
 `K=128`; three row superblocks; small base/fused VJPs; K-scan lengths 8/40/144;
 N-scan lengths 8/32/128/288; then the first real `K=2560,N=18432` gate/up
 rectangle. The artificial `K=9216,N=18432` rectangle is not a model shape and
@@ -489,7 +549,8 @@ The only current performance conclusion is feasibility: W8A8 and W4A4 can be
 compiled natively on this gfx1100 toolchain, the exact tiny Pallas W8A8 forward
 emits signed-IU8 WMMA, and the compact formats offer large, already-calculated
 residency savings. The guarded one-shot execute branch exists, but no Pallas W8
-executable has run. Its speed advantage remains an experiment because runtime
-correctness, input quantization, group rescaling, LoRA work, backward, and
-bounded-launch overhead have not been benchmarked against the complete BF16
-projection.
+result has completed or been validated: the old masked top-level invocation
+timed out, and the corrected object has not been executed. Its speed advantage
+remains an experiment because runtime correctness, input quantization, group
+rescaling, LoRA work, backward, and bounded-launch overhead have not been
+benchmarked against the complete BF16 projection.

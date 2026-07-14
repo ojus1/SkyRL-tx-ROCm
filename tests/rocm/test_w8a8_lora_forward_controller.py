@@ -1923,11 +1923,13 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
         "signed_neg_lo": [1, 1, 0],
         "resources": {
             "sgpr_count": 34,
-            "vgpr_count": 62,
+            "vgpr_count": 105,
             "sgpr_spill_count": 0,
             "vgpr_spill_count": 0,
             "private_segment_fixed_size": 0,
         },
+        "control_flow": copy.deepcopy(_CONTROLLER._EXPECTED_CONTROL_FLOW),
+        "tail_store": copy.deepcopy(_CONTROLLER._EXPECTED_TAIL_STORE),
     }
     isa_evidence = {
         "status": "passed_offline_isa_verification",
@@ -1941,14 +1943,33 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "expected_sha256_matched": True,
         },
         "candidate": {
-            "bytes": 8440,
+            "bytes": _CONTROLLER._EXPECTED_NESTED_ELF_BYTES,
             "sha256": _CONTROLLER._EXPECTED_NESTED_ELF_SHA256,
             "expected_sha256_matched": True,
             "written_elf": None,
         },
         "elf_inventory": {
-            "elf_count": 6,
+            "elf_count": 7,
+            "nested_elf_count": 6,
             "unique_exact_symbol_candidate_count": 1,
+            "ordered_nested_contract_matched": True,
+        },
+        "thunk_inventory": {
+            "executable_record_bytes": 52909,
+            "executable_record_sha256": _CONTROLLER._EXPECTED_EXECUTABLE_RECORD_SHA256,
+            "thunk_count": 6,
+            "all_thunks_are_exact_custom_kernels": True,
+            "sequential_wrapper_present": False,
+            "device_to_device_copy_thunk_present": False,
+            "ordered_thunks": [
+                {
+                    "kernel": kernel,
+                    "grid": grid,
+                    "threads": threads,
+                    "shared_memory_bytes": shared,
+                }
+                for kernel, grid, threads, shared in _CONTROLLER._EXPECTED_ORDERED_THUNK_LAUNCHES
+            ],
         },
         "isa": isa,
         "serialization": {"format": "synthetic-bound"},
@@ -2016,6 +2037,7 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "offline_inspector",
             "caller_bound_fresh_cache",
             "one_unique_exact_symbol_candidate",
+            "six_ordered_custom_kernel_thunks",
             "candidate_bytes_exact",
             "candidate_sha256_exact",
             "candidate_not_written_to_disk",
@@ -2023,6 +2045,7 @@ def test_runtime_evidence_audit_requires_exact_one_shot_sequence_and_counters(
             "target_exact",
             "four_static_signed_iu8_wmma",
             "registers_exact",
+            "full_tile_control_flow_exact",
             "zero_spills_and_private_segment",
         )
     }

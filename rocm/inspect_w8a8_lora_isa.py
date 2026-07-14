@@ -9,12 +9,14 @@ dependencies are not independently hash-closed.
 
 The cache's top-level 1,920-byte wrapper record contains an empty 1,904-byte
 ELF plus the 16-byte timestamp/random module identifier that OpenXLA appends
-to ROCm binaries.  The generated code objects are nested in the final
-split-proto record.  Qualification therefore pins the deterministic empty ELF
-while treating the caller-hash-bound module identifier as evidence, and
-requires one and only one nested ELF with the exact forward symbol, the fixed
-gfx1100 resource contract, and exactly four IU8 WMMA instructions with the
-expected ``neg_lo`` operand modifier.
+to ROCm binaries.  The generated code objects and six ordered custom-kernel
+thunks are nested in the final split-proto record.  Qualification therefore
+pins the deterministic empty ELF while treating the caller-hash-bound module
+identifier as evidence, and pins the complete executable record, ordered thunk
+serializations, launch dimensions, embedded gfx1100 objects, forward resource
+contract, and the full-tile kernel's barrier/branch epilogue.  The forward
+object must contain exactly four IU8 WMMA instructions with the expected
+``neg_lo`` operand modifier.
 """
 
 from __future__ import annotations
@@ -42,9 +44,9 @@ class VerificationError(RuntimeError):
 
 _SCHEMA = "skyrl.rocm.w8a8_lora_isa.v1"
 _EXPECTED_SYMBOL = "skyrl_qwen35_w8a8_lora_forward"
-_EXPECTED_HSACO_BYTES = 8_440
+_EXPECTED_HSACO_BYTES = 7_160
 _EXPECTED_HSACO_SHA256 = (
-    "606a80a508317af303966e5c2ca357d138d08828949c0dbfdcd73ccde1726389"
+    "87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f"
 )
 _EXPECTED_METADATA_BYTES = 292
 _EXPECTED_METADATA_SHA256 = (
@@ -63,6 +65,115 @@ _EXPECTED_EMPTY_WRAPPER_ELF_SHA256 = (
 )
 _EXPECTED_WRAPPER_RECORD_BYTES = 1_920
 _EXPECTED_ROCM_MODULE_IDENTIFIER_BYTES = 16
+_EXPECTED_EXECUTABLE_RECORD_BYTES = 52_909
+_EXPECTED_EXECUTABLE_RECORD_SHA256 = (
+    "35b0d10450a490910bb817529fd06e3c9f5e884b647d073f4207c33f0baff748"
+)
+_EXPECTED_GPU_EXECUTABLE_FIELD_SIGNATURE = (
+    (1, 2),
+    (2, 2),
+    (6, 2),
+    (8, 2),
+    (9, 2),
+    (10, 2),
+    (11, 2),
+    *((13, 2),) * 6,
+    (14, 2),
+)
+_EXPECTED_THUNKS = (
+    {
+        "annotation": "input_pad_reduce_fusion",
+        "kernel": "input_pad_reduce_fusion",
+        "id": 1,
+        "bytes": 4_321,
+        "sha256": "8d43b0bf40b73b8e37d5bf14bc0f417e533ea939210d2e8bdc122d245cef632b",
+        "arguments": 3,
+        "written": (0, 1, 1),
+        "grid": (2, 1, 1),
+        "threads": (256, 1, 1),
+        "shared_memory_bytes": 0,
+        "elf_bytes": 4_080,
+        "elf_sha256": "06a6035fabadbc8de4d7d201fa51ad2b9383a37faa84e4a0b51d9587fa3d8c7f",
+    },
+    {
+        "annotation": "loop_convert_fusion",
+        "kernel": "loop_convert_fusion",
+        "id": 2,
+        "bytes": 4_176,
+        "sha256": "a1758d210fb4e8b0bba3db81670d2e7b4f3330c5b9d0c3663c1c4a6c1fa9233c",
+        "arguments": 3,
+        "written": (0, 0, 1),
+        "grid": (8, 1, 1),
+        "threads": (128, 1, 1),
+        "shared_memory_bytes": 0,
+        "elf_bytes": 3_944,
+        "elf_sha256": "8db071b2d0e93475f713c566d984a940155ed293e63adf53b62a53288fada685",
+    },
+    {
+        "annotation": "gemm_fusion_dot_general.1",
+        "kernel": "gemm_fusion_dot_general_1",
+        "id": 3,
+        "bytes": 7_665,
+        "sha256": "2d60624dfa9c9eaf151d4d218e8114d7005e97cc4037102683dfb181db2b2cd1",
+        "arguments": 3,
+        "written": (0, 0, 1),
+        "grid": (1, 1, 1),
+        "threads": (128, 1, 1),
+        "shared_memory_bytes": 8_192,
+        "elf_bytes": 7_408,
+        "elf_sha256": "c45a0fb7f236f7b16dbdfedb905dd116a02006c16c43d6dd687c30ccedf2eaf1",
+    },
+    {
+        "annotation": "loop_select_fusion",
+        "kernel": "loop_select_fusion",
+        "id": 4,
+        "bytes": 3_604,
+        "sha256": "7ac3140403063e8050d1e6ac41d3b0936badc61fb37c5ccff20239adb19bec05",
+        "arguments": 2,
+        "written": (1, 1),
+        "grid": (1, 1, 1),
+        "threads": (16, 1, 1),
+        "shared_memory_bytes": 0,
+        "elf_bytes": 3_424,
+        "elf_sha256": "8e7f454a584324b303ab299d22e4a3d4ee956f29bc36c64c030256fd24068a71",
+    },
+    {
+        "annotation": "pallas_call.1",
+        "kernel": _EXPECTED_SYMBOL,
+        "id": 5,
+        "bytes": 7_606,
+        "sha256": "70cbc851866ea28d1bf542da9ea59dd2780abed6283a47f76370c3595166603e",
+        "arguments": 8,
+        "written": (0, 0, 0, 0, 0, 0, 0, 1),
+        "grid": (1, 2, 1),
+        "threads": (128, 1, 1),
+        "shared_memory_bytes": 1_024,
+        "elf_bytes": _EXPECTED_HSACO_BYTES,
+        "elf_sha256": _EXPECTED_HSACO_SHA256,
+    },
+    {
+        "annotation": "wrapped_slice",
+        "kernel": "wrapped_slice",
+        "id": 6,
+        "bytes": 3_588,
+        "sha256": "2b1c407360aadc991d88b84a053c223a6521422aa45bb014adc2b29fdb971b1c",
+        "arguments": 2,
+        "written": (0, 1),
+        "grid": (1, 1, 1),
+        "threads": (51, 1, 1),
+        "shared_memory_bytes": 0,
+        "elf_bytes": 3_416,
+        "elf_sha256": "476174a6aa35385fa65e84356f63b196540840c4ac782985b6ecf744b30c4799",
+    },
+)
+_EXPECTED_NESTED_ELFS = tuple(
+    (
+        thunk["kernel"],
+        thunk["elf_bytes"],
+        thunk["elf_sha256"],
+    )
+    for thunk in _EXPECTED_THUNKS
+)
 _RIEGELI_SIGNATURE = bytes.fromhex(
     "83af70d10d884a3f00000000000000004000000000000000"
     "91bac23c9287e1a90000000000000000e19f13c0e9b1c372"
@@ -112,7 +223,7 @@ _EXPECTED_RESOURCES = {
     "sgpr_count": 34,
     "sgpr_spill_count": 0,
     "uniform_work_group_size": 1,
-    "vgpr_count": 62,
+    "vgpr_count": 105,
     "vgpr_spill_count": 0,
     "wavefront_size": 32,
     "workgroup_processor_mode": 1,
@@ -557,6 +668,215 @@ def _extract_cache_records(
     }
 
 
+def _field_signature(
+    fields: Sequence[tuple[int, int, Any]],
+) -> tuple[tuple[int, int], ...]:
+    return tuple((field, wire) for field, wire, _ in fields)
+
+
+def _exact_ascii(value: Any, *, label: str) -> str:
+    if not isinstance(value, bytes) or not value or len(value) > _MAX_ELF_NAME_BYTES:
+        raise VerificationError(f"{label} is empty, oversized, or not bytes")
+    try:
+        decoded = value.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise VerificationError(f"{label} is not ASCII") from error
+    if any(ord(character) < 0x20 or ord(character) > 0x7E for character in decoded):
+        raise VerificationError(f"{label} contains a non-printable character")
+    return decoded
+
+
+def _decode_dim3d(
+    value: Any, *, wrapper_field: int, label: str
+) -> tuple[int, int, int]:
+    if not isinstance(value, bytes):
+        raise VerificationError(f"{label} wrapper is not bytes")
+    wrapper = _wire_fields(value, label=f"{label} wrapper", max_fields=1)
+    if _field_signature(wrapper) != ((wrapper_field, 2),):
+        raise VerificationError(f"{label} wrapper fields changed")
+    encoded = wrapper[0][2]
+    assert isinstance(encoded, bytes)
+    dimensions = _wire_fields(encoded, label=label, max_fields=3)
+    if _field_signature(dimensions) != ((1, 0), (2, 0), (3, 0)):
+        raise VerificationError(f"{label} fields changed")
+    result = tuple(item[2] for item in dimensions)
+    if len(result) != 3 or not all(
+        isinstance(item, int) and 1 <= item <= 1 << 20 for item in result
+    ):
+        raise VerificationError(f"{label} values are outside the fixed bound")
+    return result  # type: ignore[return-value]
+
+
+def _inspect_thunks(records: list[bytes]) -> dict[str, Any]:
+    """Decode and pin the complete ordered custom-kernel launch sequence."""
+    if len(records) != 5:
+        raise VerificationError("split-proto record count changed before thunk audit")
+    executable = records[4]
+    if (
+        len(executable) != _EXPECTED_EXECUTABLE_RECORD_BYTES
+        or _sha256(executable) != _EXPECTED_EXECUTABLE_RECORD_SHA256
+    ):
+        raise VerificationError(
+            "GPU executable record is not the fixed full-tile object"
+        )
+    fields = _wire_fields(executable, label="GpuExecutableProto", max_fields=32)
+    if _field_signature(fields) != _EXPECTED_GPU_EXECUTABLE_FIELD_SIGNATURE:
+        raise VerificationError("GpuExecutableProto field sequence changed")
+    encoded_thunks = [
+        value for field, wire, value in fields if (field, wire) == (13, 2)
+    ]
+    if len(encoded_thunks) != len(_EXPECTED_THUNKS) or not all(
+        isinstance(item, bytes) for item in encoded_thunks
+    ):
+        raise VerificationError("ordered thunk count or wire type changed")
+
+    inventory: list[dict[str, Any]] = []
+    for index, (encoded, expected) in enumerate(
+        zip(encoded_thunks, _EXPECTED_THUNKS, strict=True)
+    ):
+        assert isinstance(encoded, bytes)
+        label = f"ThunkProto[{index}]"
+        if len(encoded) != expected["bytes"] or _sha256(encoded) != expected["sha256"]:
+            raise VerificationError(f"{label} serialization changed")
+        thunk_fields = _wire_fields(encoded, label=label, max_fields=2)
+        if _field_signature(thunk_fields) != ((1, 2), (36, 2)):
+            raise VerificationError(f"{label} is not the exact custom-kernel thunk")
+
+        info = thunk_fields[0][2]
+        custom = thunk_fields[1][2]
+        assert isinstance(info, bytes) and isinstance(custom, bytes)
+        info_fields = _wire_fields(info, label=f"{label}.ThunkInfoProto", max_fields=2)
+        if _field_signature(info_fields) != ((1, 2), (3, 0)):
+            raise VerificationError(f"{label} info fields changed")
+        annotation = _exact_ascii(
+            info_fields[0][2], label=f"{label} profile annotation"
+        )
+        thunk_id = info_fields[1][2]
+        if annotation != expected["annotation"] or thunk_id != expected["id"]:
+            raise VerificationError(f"{label} annotation or ID changed")
+
+        custom_fields = _wire_fields(
+            custom,
+            label=f"{label}.CustomKernelThunkProto",
+            max_fields=int(expected["arguments"]) + 3,
+        )
+        expected_custom_signature = (
+            *((1, 2),) * int(expected["arguments"]),
+            (2, 2),
+            (3, 2),
+            (6, 2),
+        )
+        if _field_signature(custom_fields) != expected_custom_signature:
+            raise VerificationError(f"{label} argument or custom-kernel fields changed")
+        arguments = [value for field, _, value in custom_fields if field == 1]
+        if not all(isinstance(value, bytes) and value for value in arguments):
+            raise VerificationError(f"{label} contains an empty shaped-slice argument")
+        written = next(value for field, _, value in custom_fields if field == 2)
+        kernel = next(value for field, _, value in custom_fields if field == 3)
+        tma_metadata = next(value for field, _, value in custom_fields if field == 6)
+        if (
+            not isinstance(written, bytes)
+            or tuple(written) != expected["written"]
+            or not isinstance(kernel, bytes)
+            or tma_metadata != b""
+        ):
+            raise VerificationError(
+                f"{label} write flags, kernel, or TMA metadata changed"
+            )
+
+        kernel_fields = _wire_fields(
+            kernel, label=f"{label}.CustomKernelProto", max_fields=5
+        )
+        expected_kernel_signature = ((1, 2), (2, 2), (3, 2), (4, 2))
+        if expected["shared_memory_bytes"]:
+            expected_kernel_signature += ((6, 0),)
+        if _field_signature(kernel_fields) != expected_kernel_signature:
+            raise VerificationError(f"{label} custom-kernel fields changed")
+        by_field = {field: value for field, _, value in kernel_fields}
+        kernel_name = _exact_ascii(by_field[1], label=f"{label} kernel name")
+        shared_memory_bytes = int(by_field.get(6, 0))
+        if (
+            kernel_name != expected["kernel"]
+            or shared_memory_bytes != expected["shared_memory_bytes"]
+        ):
+            raise VerificationError(f"{label} kernel name or LDS allocation changed")
+        grid = _decode_dim3d(
+            by_field[3], wrapper_field=2, label=f"{label} block dimensions"
+        )
+        threads = _decode_dim3d(
+            by_field[4], wrapper_field=1, label=f"{label} thread dimensions"
+        )
+        if grid != expected["grid"] or threads != expected["threads"]:
+            raise VerificationError(f"{label} launch dimensions changed")
+
+        loader = by_field[2]
+        assert isinstance(loader, bytes)
+        loader_fields = _wire_fields(
+            loader, label=f"{label}.KernelLoaderSpecProto", max_fields=4
+        )
+        if _field_signature(loader_fields) != ((2, 2), (3, 0), (4, 2), (5, 2)):
+            raise VerificationError(f"{label} loader fields changed")
+        loader_by_field = {field: value for field, _, value in loader_fields}
+        if (
+            loader_by_field[3] != expected["arguments"]
+            or _exact_ascii(loader_by_field[4], label=f"{label} loader kernel name")
+            != kernel_name
+            or not isinstance(loader_by_field[5], bytes)
+            or not loader_by_field[5]
+        ):
+            raise VerificationError(f"{label} loader arity/name/packing changed")
+        cubin_wrapper = loader_by_field[2]
+        assert isinstance(cubin_wrapper, bytes)
+        cubin_fields = _wire_fields(
+            cubin_wrapper, label=f"{label}.CudaCubinProto", max_fields=1
+        )
+        if _field_signature(cubin_fields) != ((1, 2),):
+            raise VerificationError(f"{label} embedded-code fields changed")
+        elf = cubin_fields[0][2]
+        if (
+            not isinstance(elf, bytes)
+            or len(elf) != expected["elf_bytes"]
+            or _sha256(elf) != expected["elf_sha256"]
+        ):
+            raise VerificationError(f"{label} embedded gfx1100 object changed")
+        parsed_elf, elf_manifest = _parse_elf(elf, 0, source=f"{label}.embedded_elf")
+        if (
+            parsed_elf != elf
+            or elf_manifest["global_functions"] != [kernel_name]
+            or elf_manifest["global_objects"] != [f"{kernel_name}.kd"]
+        ):
+            raise VerificationError(f"{label} embedded object identity changed")
+
+        inventory.append(
+            {
+                "order": index,
+                "thunk_id": thunk_id,
+                "profile_annotation": annotation,
+                "kernel": kernel_name,
+                "bytes": len(encoded),
+                "sha256": _sha256(encoded),
+                "argument_count": len(arguments),
+                "written": list(written),
+                "arity": loader_by_field[3],
+                "grid": list(grid),
+                "threads": list(threads),
+                "shared_memory_bytes": shared_memory_bytes,
+                "elf_bytes": len(elf),
+                "elf_sha256": _sha256(elf),
+                "target": elf_manifest["target"],
+            }
+        )
+    return {
+        "executable_record_bytes": len(executable),
+        "executable_record_sha256": _sha256(executable),
+        "thunk_count": len(inventory),
+        "all_thunks_are_exact_custom_kernels": True,
+        "sequential_wrapper_present": False,
+        "device_to_device_copy_thunk_present": False,
+        "ordered_thunks": inventory,
+    }
+
+
 def _cstring(table: bytes, offset: int, *, label: str) -> str:
     if offset < 0 or offset >= len(table):
         raise VerificationError(f"{label} string offset is invalid")
@@ -605,7 +925,7 @@ def _parse_elf(
         or not 1 <= program_count <= 64
         or section_entry_size != 64
         or not 1 <= section_count <= 128
-        or section_name_index >= section_count
+        or not 1 <= section_name_index < section_count
     ):
         raise VerificationError(f"{source} ELF header/target contract changed")
     relative_limit = len(data) - offset
@@ -636,6 +956,10 @@ def _parse_elf(
         raise VerificationError(f"{source} ELF size is outside the fixed bound")
     elf = data[offset : offset + file_end]
     name_section = sections[section_name_index]
+    if name_section[1] != 3:
+        raise VerificationError(
+            f"{source} ELF section-name table is not a string table"
+        )
     name_offset, name_size = name_section[4], name_section[5]
     names = elf[name_offset : name_offset + name_size]
     section_names = [_cstring(names, item[0], label="section") for item in sections]
@@ -663,6 +987,10 @@ def _parse_elf(
             name, info, _other, shndx, _value, _size = struct.unpack_from(
                 "<IBBHQQ", elf, entry_offset
             )
+            if shndx != 0 and shndx >= len(sections):
+                raise VerificationError(
+                    f"{source} ELF symbol references an invalid or unsupported section"
+                )
             symbol_name = _cstring(string_table, name, label="symbol")
             binding, symbol_type = info >> 4, info & 0xF
             if symbol_name and binding == 1 and shndx != 0:
@@ -742,12 +1070,20 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
         raise VerificationError("nested ELF count is outside the fixed bound")
     previous_end = -1
     candidates: list[bytes] = []
+    observed_nested: list[tuple[str, int, str]] = []
     for index, offset in enumerate(offsets):
         elf, manifest = _parse_elf(nested, offset, source=f"record[4].elf[{index}]")
         if offset < previous_end:
             raise VerificationError("nested ELF magic occurs inside another ELF")
         previous_end = offset + len(elf)
         inventory.append(manifest)
+        functions = manifest["global_functions"]
+        objects = manifest["global_objects"]
+        if len(functions) != 1 or objects != [f"{functions[0]}.kd"]:
+            raise VerificationError(
+                "nested ELF function/descriptor is not paired or isolated as one kernel"
+            )
+        observed_nested.append((functions[0], len(elf), _sha256(elf)))
         defines_expected_function = _EXPECTED_SYMBOL in manifest["global_functions"]
         defines_expected_descriptor = (
             f"{_EXPECTED_SYMBOL}.kd" in manifest["global_objects"]
@@ -788,6 +1124,8 @@ def _inventory_elfs(records: list[bytes]) -> tuple[bytes, list[dict[str, Any]]]:
         raise VerificationError(
             "expected symbol does not identify one unique nested ELF"
         )
+    if tuple(observed_nested) != _EXPECTED_NESTED_ELFS:
+        raise VerificationError("ordered nested gfx1100 object inventory changed")
     candidate = candidates[0]
     if (
         len(candidate) != _EXPECTED_HSACO_BYTES
@@ -896,6 +1234,178 @@ def _inspect_tool_output(readobj: bytes, objdump: bytes) -> dict[str, Any]:
     labels = re.findall(r"^[0-9a-f]+ <([^>]+)>:$", objdump_text, re.MULTILINE)
     if labels != [_EXPECTED_SYMBOL]:
         raise VerificationError("objdump function boundary is not the exact kernel")
+    canonical_instructions: list[str] = []
+    raw_instruction_lines: list[str] = []
+    for line in objdump_text.splitlines():
+        if re.match(r"^\s*[a-z][a-z0-9_.]*\b", line) is None:
+            continue
+        canonical_instructions.append(line.split("//", 1)[0].strip())
+        raw_instruction_lines.append(line)
+    barrier_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if instruction == "s_barrier"
+    ]
+    branch_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if re.match(r"^s_(?:branch|cbranch_[a-z0-9_]+)\b", instruction)
+    ]
+    saveexec_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if instruction == "s_and_saveexec_b32 s0, vcc_lo"
+    ]
+    vcc_writer_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if re.match(r"^v_cmp_[a-z0-9_]+\s+vcc_lo,", instruction)
+    ]
+    end_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if instruction == "s_endpgm"
+    ]
+    deallocation_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if instruction == "s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)"
+    ]
+    unsupported_control_transfer_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if re.match(
+            r"^s_(?:setpc|swappc|call|rfe|trap|sethalt)(?:_[a-z0-9]+)?\b",
+            instruction,
+        )
+    ]
+    if (
+        len(barrier_indices) != 9
+        or len(branch_indices) != 1
+        or canonical_instructions[branch_indices[0]] != "s_cbranch_execz 294"
+        or len(saveexec_indices) != 1
+        or len(
+            pre_mask_vcc_writers := [
+                index for index in vcc_writer_indices if index < saveexec_indices[0]
+            ]
+        )
+        != 1
+        or canonical_instructions[pre_mask_vcc_writers[0]]
+        != "v_cmp_eq_u32_e32 vcc_lo, 0, v7"
+        or len(end_indices) != 1
+        or len(deallocation_indices) != 1
+        or max(barrier_indices) >= saveexec_indices[0]
+        or saveexec_indices[0] + 1 != branch_indices[0]
+    ):
+        raise VerificationError("full-tile barrier/EXEC/branch contract changed")
+    if unsupported_control_transfer_indices:
+        raise VerificationError("unsupported scalar control transfer is present")
+
+    predicate_index = pre_mask_vcc_writers[0]
+    saveexec_index = saveexec_indices[0]
+    vcc_references_after_predicate = [
+        index
+        for index in range(predicate_index + 1, saveexec_index)
+        if re.search(r"\bvcc(?:_lo|_hi)?\b", canonical_instructions[index])
+    ]
+    explicit_exec_references = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if re.search(r"\bexec(?:_lo|_hi)?\b", instruction)
+    ]
+    implicit_exec_writer_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if (opcode := instruction.split(None, 1)[0]).startswith("v_cmpx_")
+        or "saveexec" in opcode
+        or "wrexec" in opcode
+    ]
+    if (
+        vcc_references_after_predicate
+        or explicit_exec_references
+        or implicit_exec_writer_indices != [saveexec_index]
+    ):
+        raise VerificationError(
+            "full-tile predicate/EXEC state is explicitly modified outside the exact mask"
+        )
+
+    branch_raw = raw_instruction_lines[branch_indices[0]]
+    branch_target = re.search(
+        rf"<{re.escape(_EXPECTED_SYMBOL)}\+0x([0-9a-f]+)>", branch_raw
+    )
+    function_label = re.search(
+        rf"^([0-9a-f]+) <{re.escape(_EXPECTED_SYMBOL)}>:$",
+        objdump_text,
+        re.MULTILINE,
+    )
+    if branch_target is None or function_label is None:
+        raise VerificationError("full-tile branch target annotation changed")
+    target_address = int(function_label.group(1), 16) + int(branch_target.group(1), 16)
+    address_to_instruction: dict[int, tuple[int, str]] = {}
+    for index, (raw, canonical_instruction) in enumerate(
+        zip(raw_instruction_lines, canonical_instructions, strict=True)
+    ):
+        address = re.search(r"//\s*([0-9A-Fa-f]+):", raw)
+        if address is not None:
+            numeric_address = int(address.group(1), 16)
+            if numeric_address in address_to_instruction:
+                raise VerificationError("objdump instruction address is duplicated")
+            address_to_instruction[numeric_address] = (index, canonical_instruction)
+    branch_source = re.search(r"//\s*([0-9A-Fa-f]+):", branch_raw)
+    if branch_source is None:
+        raise VerificationError("full-tile branch source address is missing")
+    branch_source_address = int(branch_source.group(1), 16)
+    branch_immediate = int(canonical_instructions[branch_indices[0]].rsplit(" ", 1)[1])
+    if not 0 <= branch_immediate <= 0xFFFF:
+        raise VerificationError("full-tile branch immediate is outside signed16")
+    signed_branch_immediate = (
+        branch_immediate - 0x10000 if branch_immediate & 0x8000 else branch_immediate
+    )
+    computed_target_address = branch_source_address + 4 + signed_branch_immediate * 4
+    if (
+        address_to_instruction.get(branch_source_address)
+        != (
+            branch_indices[0],
+            canonical_instructions[branch_indices[0]],
+        )
+        or computed_target_address != target_address
+    ):
+        raise VerificationError("full-tile branch source/target arithmetic changed")
+    target = address_to_instruction.get(target_address)
+    if (
+        target is None
+        or target[1] != "s_nop 0"
+        or target[0] + 1 != deallocation_indices[0]
+        or target[0] + 2 != end_indices[0]
+        or branch_indices[0] >= target[0]
+    ):
+        raise VerificationError("full-tile branch does not reach the common epilogue")
+
+    without_registers = re.sub(
+        r"\b[vs]\[[^]]+\]|\b[vs][0-9]+\b", "", "\n".join(canonical_instructions)
+    )
+    literal_tail_count = len(
+        re.findall(r"(?<![A-Za-z0-9_])(?:17|0x11)(?![A-Za-z0-9_])", without_registers)
+    )
+    ds_store_b8_count = sum(
+        instruction.startswith("ds_store_b8 ") for instruction in canonical_instructions
+    )
+    global_store_indices = [
+        index
+        for index, instruction in enumerate(canonical_instructions)
+        if instruction.startswith("global_store_")
+    ]
+    global_store_count = len(global_store_indices)
+    if (
+        literal_tail_count != 0
+        or ds_store_b8_count != 0
+        or global_store_count != 8
+        or not all(
+            branch_indices[0] < index < target[0] for index in global_store_indices
+        )
+    ):
+        raise VerificationError("full-tile tail-store ISA contract changed")
+
     wmma_lines = [
         line.strip()
         for line in objdump_text.splitlines()
@@ -926,6 +1436,28 @@ def _inspect_tool_output(readobj: bytes, objdump: bytes) -> dict[str, Any]:
         "signed_neg_lo": [1, 1, 0],
         "canonical_instruction_lines": canonical,
         "canonical_instruction_sha256": _sha256(("\n".join(canonical) + "\n").encode()),
+        "control_flow": {
+            "barrier_count": len(barrier_indices),
+            "all_barriers_before_exec_mask": True,
+            "vcc_predicate": canonical_instructions[pre_mask_vcc_writers[0]],
+            "exec_mask": canonical_instructions[saveexec_indices[0]],
+            "scalar_branch_count": len(branch_indices),
+            "scalar_branches": [
+                canonical_instructions[index] for index in branch_indices
+            ],
+            "branch_direction": "forward_only",
+            "branch_target_offset_hex": f"0x{int(branch_target.group(1), 16):x}",
+            "branch_target_instruction": target[1],
+            "branch_target_is_common_deallocation_epilogue": True,
+            "barrier_after_exec_mask_count": 0,
+            "backedge_count": 0,
+            "endpgm_count": len(end_indices),
+        },
+        "tail_store": {
+            "standalone_immediate_17_or_0x11_count": literal_tail_count,
+            "ds_store_b8_count": ds_store_b8_count,
+            "global_store_count": global_store_count,
+        },
         "llvm_readobj_stdout_bytes": len(readobj),
         "llvm_readobj_stdout_sha256": _sha256(readobj),
         "llvm_objdump_stdout_bytes": len(objdump),
@@ -1081,6 +1613,7 @@ def inspect_cache(
     cache_manifest["sha256"] = observed_cache_sha256
     cache_manifest["expected_sha256_matched"] = True
     records, serialization = _extract_cache_records(decompressed, _Snappy().decompress)
+    thunk_inventory = _inspect_thunks(records)
     candidate, elf_inventory = _inventory_elfs(records)
     candidate_descriptor = _make_sealed_memfd(candidate)
     try:
@@ -1133,11 +1666,14 @@ def inspect_cache(
         "runtime_promotion": False,
         "cache": cache_manifest,
         "serialization": serialization,
+        "thunk_inventory": thunk_inventory,
         "elf_inventory": {
             "elf_count": len(elf_inventory),
+            "nested_elf_count": len(elf_inventory) - 1,
             "unique_exact_symbol_candidate_count": sum(
                 item["global_functions"] == [_EXPECTED_SYMBOL] for item in elf_inventory
             ),
+            "ordered_nested_contract_matched": True,
             "files": elf_inventory,
         },
         "candidate": {
@@ -1149,7 +1685,7 @@ def inspect_cache(
         "isa": isa,
         "toolchain": toolchain,
         "claim": {
-            "proves": "the caller-bound JAX cache contains the exact symbol-matched gfx1100 HSACO with four static IU8 WMMA instructions and exact neg_lo operand modifiers",
+            "proves": "the caller-bound JAX cache contains the exact six-thunk full-tile executable, ordered gfx1100 objects, symbol-matched forward HSACO, four static IU8 WMMAs, and barrier-safe forward-only tail epilogue",
             "does_not_prove": [
                 "Pallas provenance without paired exact HLO/custom-call evidence",
                 "kernel dispatch",

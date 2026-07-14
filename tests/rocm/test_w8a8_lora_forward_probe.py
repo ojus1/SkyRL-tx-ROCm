@@ -998,11 +998,30 @@ def _exact_fresh_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
             "expected_sha256_matched": True,
         },
         "elf_inventory": {
-            "elf_count": 6,
+            "elf_count": 7,
+            "nested_elf_count": 6,
             "unique_exact_symbol_candidate_count": 1,
+            "ordered_nested_contract_matched": True,
+        },
+        "thunk_inventory": {
+            "executable_record_bytes": 52909,
+            "executable_record_sha256": _PROBE._EXPECTED_EXECUTABLE_RECORD_SHA256,
+            "thunk_count": 6,
+            "all_thunks_are_exact_custom_kernels": True,
+            "sequential_wrapper_present": False,
+            "device_to_device_copy_thunk_present": False,
+            "ordered_thunks": [
+                {
+                    "kernel": kernel,
+                    "grid": grid,
+                    "threads": threads,
+                    "shared_memory_bytes": shared,
+                }
+                for kernel, grid, threads, shared in _PROBE._EXPECTED_ORDERED_THUNK_LAUNCHES
+            ],
         },
         "candidate": {
-            "bytes": 8440,
+            "bytes": _PROBE._EXPECTED_NESTED_ELF_BYTES,
             "sha256": _PROBE._EXPECTED_NESTED_ELF_SHA256,
             "expected_sha256_matched": True,
             "written_elf": None,
@@ -1015,11 +1034,13 @@ def _exact_fresh_isa_evidence(cache: Path, cache_sha: str) -> dict[str, object]:
             "signed_neg_lo": [1, 1, 0],
             "resources": {
                 "sgpr_count": 34,
-                "vgpr_count": 62,
+                "vgpr_count": 105,
                 "sgpr_spill_count": 0,
                 "vgpr_spill_count": 0,
                 "private_segment_fixed_size": 0,
             },
+            "control_flow": copy.deepcopy(_PROBE._EXPECTED_CONTROL_FLOW),
+            "tail_store": copy.deepcopy(_PROBE._EXPECTED_TAIL_STORE),
         },
     }
 
@@ -1098,11 +1119,22 @@ def test_fresh_isa_helper_rejects_zero_or_two_cache_candidates_without_inspectio
         (("cache", "sha256"), "0" * 64, "caller_bound_fresh_cache"),
         (("elf_inventory", "elf_count"), 5, "one_unique_exact_symbol_candidate"),
         (
+            ("elf_inventory", "ordered_nested_contract_matched"),
+            False,
+            "one_unique_exact_symbol_candidate",
+        ),
+        (
             ("elf_inventory", "unique_exact_symbol_candidate_count"),
             2,
             "one_unique_exact_symbol_candidate",
         ),
-        (("candidate", "bytes"), 8439, "candidate_bytes_exact"),
+        (("thunk_inventory", "thunk_count"), 5, "six_ordered_custom_kernel_thunks"),
+        (
+            ("thunk_inventory", "device_to_device_copy_thunk_present"),
+            True,
+            "six_ordered_custom_kernel_thunks",
+        ),
+        (("candidate", "bytes"), 7159, "candidate_bytes_exact"),
         (("candidate", "sha256"), "0" * 64, "candidate_sha256_exact"),
         (
             ("candidate", "expected_sha256_matched"),
@@ -1116,6 +1148,16 @@ def test_fresh_isa_helper_rejects_zero_or_two_cache_candidates_without_inspectio
         (("isa", "signed_neg_lo"), [0, 0, 0], "four_static_signed_iu8_wmma"),
         (("isa", "resources", "sgpr_count"), 35, "registers_exact"),
         (("isa", "resources", "vgpr_count"), 63, "registers_exact"),
+        (
+            ("isa", "control_flow", "barrier_count"),
+            8,
+            "full_tile_control_flow_exact",
+        ),
+        (
+            ("isa", "tail_store", "standalone_immediate_17_or_0x11_count"),
+            1,
+            "full_tile_control_flow_exact",
+        ),
         (
             ("isa", "resources", "sgpr_spill_count"),
             1,

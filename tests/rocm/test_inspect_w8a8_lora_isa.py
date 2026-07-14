@@ -204,6 +204,23 @@ def _bind_synthetic_wrapper(monkeypatch, records: list[bytes]) -> None:
         "_EXPECTED_EMPTY_WRAPPER_ELF_SHA256",
         hashlib.sha256(wrapper_elf).hexdigest(),
     )
+    nested = records[4]
+    offset = 0
+    expected = []
+    while True:
+        offset = nested.find(b"\x7fELF", offset)
+        if offset < 0:
+            break
+        elf, manifest = _ISA._parse_elf(nested, offset, source="synthetic")
+        expected.append(
+            (
+                manifest["global_functions"][0],
+                len(elf),
+                hashlib.sha256(elf).hexdigest(),
+            )
+        )
+        offset += len(elf)
+    monkeypatch.setattr(_ISA, "_EXPECTED_NESTED_ELFS", tuple(expected))
 
 
 def _split_proto(
@@ -239,6 +256,94 @@ def _cache_payload(split_proto: bytes, metadata: bytes = b"M" * 292) -> bytes:
     executable = b"\x0a" + _varint(len(split_proto)) + split_proto
     executable += b"\x12" + _varint(3) + b"opt"
     return b"\0\0\0\0" + _varint(len(metadata)) + metadata + executable
+
+
+def _bytes_field(number: int, value: bytes) -> bytes:
+    return _varint(number << 3 | 2) + _varint(len(value)) + value
+
+
+def _varint_field(number: int, value: int) -> bytes:
+    return _varint(number << 3) + _varint(value)
+
+
+def _dim3d_field(wrapper_field: int, dimensions: tuple[int, int, int]) -> bytes:
+    encoded = b"".join(
+        _varint_field(index, value) for index, value in enumerate(dimensions, start=1)
+    )
+    return _bytes_field(wrapper_field, encoded)
+
+
+def _synthetic_gpu_executable(
+    *,
+    grid_override: tuple[int, int, int] | None = None,
+    non_custom_thunk_index: int | None = None,
+) -> tuple[bytes, tuple[dict[str, object], ...]]:
+    thunks = []
+    expected_thunks = []
+    for index, source in enumerate(_ISA._EXPECTED_THUNKS):
+        expected = dict(source)
+        kernel_name = str(expected["kernel"])
+        annotation = str(expected["annotation"])
+        arguments = int(expected["arguments"])
+        grid = tuple(expected["grid"])
+        encoded_grid = grid_override if index == 4 and grid_override else grid
+        threads = tuple(expected["threads"])
+        elf = _elf(kernel_name)
+        loader = b"".join(
+            (
+                _bytes_field(2, _bytes_field(1, elf)),
+                _varint_field(3, arguments),
+                _bytes_field(4, kernel_name.encode()),
+                _bytes_field(5, b"packing"),
+            )
+        )
+        kernel = b"".join(
+            (
+                _bytes_field(1, kernel_name.encode()),
+                _bytes_field(2, loader),
+                _bytes_field(3, _dim3d_field(2, encoded_grid)),
+                _bytes_field(4, _dim3d_field(1, threads)),
+            )
+        )
+        shared = int(expected["shared_memory_bytes"])
+        if shared:
+            kernel += _varint_field(6, shared)
+        custom = b"".join(_bytes_field(1, b"shaped-slice") for _ in range(arguments))
+        custom += _bytes_field(2, bytes(expected["written"]))
+        custom += _bytes_field(3, kernel) + _bytes_field(6, b"")
+        info = _bytes_field(1, annotation.encode()) + _varint_field(
+            3, int(expected["id"])
+        )
+        thunk_kind = 35 if index == non_custom_thunk_index else 36
+        thunk = _bytes_field(1, info) + _bytes_field(thunk_kind, custom)
+        expected.update(
+            {
+                "bytes": len(thunk),
+                "sha256": hashlib.sha256(thunk).hexdigest(),
+                "elf_bytes": len(elf),
+                "elf_sha256": hashlib.sha256(elf).hexdigest(),
+            }
+        )
+        thunks.append(thunk)
+        expected_thunks.append(expected)
+    executable = b"".join(
+        _bytes_field(field, b"fixed") for field in (1, 2, 6, 8, 9, 10, 11)
+    )
+    executable += b"".join(_bytes_field(13, thunk) for thunk in thunks)
+    executable += _bytes_field(14, b"fixed")
+    return executable, tuple(expected_thunks)
+
+
+def _bind_synthetic_thunks(
+    monkeypatch, executable: bytes, expected: tuple[dict[str, object], ...]
+) -> None:
+    monkeypatch.setattr(_ISA, "_EXPECTED_THUNKS", expected)
+    monkeypatch.setattr(_ISA, "_EXPECTED_EXECUTABLE_RECORD_BYTES", len(executable))
+    monkeypatch.setattr(
+        _ISA,
+        "_EXPECTED_EXECUTABLE_RECORD_SHA256",
+        hashlib.sha256(executable).hexdigest(),
+    )
 
 
 def _readobj() -> bytes:
@@ -289,6 +394,28 @@ def _objdump(count: int = 4, instruction: str = "v_wmma_i32_16x16x16_iu8") -> by
         f"\t{instruction} v[1:8], v[10:13], v[14:17], v[1:8] neg_lo:[1,1,0]// {index:08X}"
         for index in range(count)
     )
+    lines.append("\tv_cmp_eq_u32_e32 vcc_lo, 0, v7                 // 000000001AC0: 0")
+    lines.extend(
+        f"\ts_barrier                                             // {0x1B00 + 4 * index:016X}: 0"
+        for index in range(9)
+    )
+    lines.extend(
+        (
+            "\ts_and_saveexec_b32 s0, vcc_lo                      // 00000000200C: 0",
+            f"\ts_cbranch_execz 294                                  // 000000002010: 0 <{_ISA._EXPECTED_SYMBOL}+0xbac>",
+        )
+    )
+    lines.extend(
+        f"\tglobal_store_b16 v[0:1], v0, off                        // {0x2400 + 4 * index:016X}: 0"
+        for index in range(8)
+    )
+    lines.extend(
+        (
+            "\ts_nop 0                                             // 0000000024AC: 0",
+            "\ts_sendmsg sendmsg(MSG_DEALLOC_VGPRS)                // 0000000024B0: 0",
+            "\ts_endpgm                                            // 0000000024B4: 0",
+        )
+    )
     return ("\n".join(lines) + "\n").encode()
 
 
@@ -329,6 +456,54 @@ def test_parse_elf_rejects_symbol_table_object_amplification() -> None:
     struct.pack_into("<Q", elf, symbol_size_offset, (_ISA._MAX_ELF_SYMBOLS + 1) * 24)
 
     with pytest.raises(_ISA.VerificationError, match="symbol count"):
+        _ISA._parse_elf(bytes(elf), 0, source="adversarial")
+
+
+def test_parse_elf_rejects_non_string_section_name_table() -> None:
+    elf = bytearray(_elf(_ISA._EXPECTED_SYMBOL))
+    section_offset = struct.unpack_from("<Q", elf, 40)[0]
+    section_name_index = struct.unpack_from("<H", elf, 62)[0]
+    struct.pack_into("<I", elf, section_offset + section_name_index * 64 + 4, 1)
+
+    with pytest.raises(_ISA.VerificationError, match="section-name table"):
+        _ISA._parse_elf(bytes(elf), 0, source="adversarial")
+
+
+def test_parse_elf_rejects_undefined_section_name_index() -> None:
+    elf = bytearray(_elf(_ISA._EXPECTED_SYMBOL))
+    section_offset = struct.unpack_from("<Q", elf, 40)[0]
+    section_name_index = struct.unpack_from("<H", elf, 62)[0]
+    source = section_offset + section_name_index * 64
+    elf[section_offset : section_offset + 64] = elf[source : source + 64]
+    struct.pack_into("<I", elf, section_offset, 0)
+    struct.pack_into("<H", elf, 62, 0)
+
+    with pytest.raises(_ISA.VerificationError, match="header/target contract"):
+        _ISA._parse_elf(bytes(elf), 0, source="adversarial")
+
+
+@pytest.mark.parametrize("section_name_index", [6, 0xFFFF])
+def test_parse_elf_rejects_out_of_range_section_name_index(
+    section_name_index: int,
+) -> None:
+    elf = bytearray(_elf(_ISA._EXPECTED_SYMBOL))
+    struct.pack_into("<H", elf, 62, section_name_index)
+
+    with pytest.raises(_ISA.VerificationError, match="header/target contract"):
+        _ISA._parse_elf(bytes(elf), 0, source="adversarial")
+
+
+@pytest.mark.parametrize("section_index", [6, 0xFF00, 0xFFF1, 0xFFF2, 0xFFFF])
+def test_parse_elf_rejects_symbol_section_index_outside_fixed_contract(
+    section_index: int,
+) -> None:
+    elf = bytearray(_elf(_ISA._EXPECTED_SYMBOL))
+    section_offset = struct.unpack_from("<Q", elf, 40)[0]
+    symbol_offset = struct.unpack_from("<Q", elf, section_offset + 2 * 64 + 24)[0]
+    first_defined_symbol_section_index = symbol_offset + 24 + 6
+    struct.pack_into("<H", elf, first_defined_symbol_section_index, section_index)
+
+    with pytest.raises(_ISA.VerificationError, match="invalid or unsupported"):
         _ISA._parse_elf(bytes(elf), 0, source="adversarial")
 
 
@@ -426,6 +601,57 @@ def test_cache_decoder_requires_exact_ifrt_metadata_and_field_order(
     reordered += b"\x12\x03opt\x0a" + _varint(len(split_proto)) + split_proto
     with pytest.raises(_ISA.VerificationError, match="exactly"):
         _ISA._extract_cache_records(reordered, _decompressor(mapping))
+
+
+def test_thunk_decoder_pins_six_ordered_custom_kernel_launches(monkeypatch) -> None:
+    executable, expected = _synthetic_gpu_executable()
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
+
+    evidence = _ISA._inspect_thunks(records)
+
+    assert evidence["thunk_count"] == 6
+    assert evidence["all_thunks_are_exact_custom_kernels"] is True
+    assert evidence["sequential_wrapper_present"] is False
+    assert evidence["device_to_device_copy_thunk_present"] is False
+    ordered = evidence["ordered_thunks"]
+    assert [item["thunk_id"] for item in ordered] == [1, 2, 3, 4, 5, 6]
+    assert ordered[4]["kernel"] == _ISA._EXPECTED_SYMBOL
+    assert ordered[4]["grid"] == [1, 2, 1]
+    assert ordered[4]["threads"] == [128, 1, 1]
+    assert ordered[4]["shared_memory_bytes"] == 1024
+    assert ordered[5]["kernel"] == "wrapped_slice"
+    assert ordered[5]["threads"] == [51, 1, 1]
+
+
+def test_thunk_decoder_rejects_changed_pallas_grid_after_exact_raw_rebind(
+    monkeypatch,
+) -> None:
+    executable, expected = _synthetic_gpu_executable(grid_override=(1, 3, 1))
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
+
+    with pytest.raises(_ISA.VerificationError, match="launch dimensions"):
+        _ISA._inspect_thunks(records)
+
+
+def test_thunk_decoder_rejects_a_seventh_thunk(monkeypatch) -> None:
+    executable, expected = _synthetic_gpu_executable()
+    executable += _bytes_field(13, _bytes_field(1, b"copy"))
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
+
+    with pytest.raises(_ISA.VerificationError, match="field sequence"):
+        _ISA._inspect_thunks(records)
+
+
+def test_thunk_decoder_rejects_non_custom_kind_with_six_thunks(monkeypatch) -> None:
+    executable, expected = _synthetic_gpu_executable(non_custom_thunk_index=2)
+    _bind_synthetic_thunks(monkeypatch, executable, expected)
+    records = [_ISA._EXPECTED_SPLIT_MANIFEST, b"", b"wrapper", b"", executable]
+
+    with pytest.raises(_ISA.VerificationError, match="not the exact custom-kernel"):
+        _ISA._inspect_thunks(records)
 
 
 def test_inventory_selects_symbol_not_position_and_classifies_empty_wrapper(
@@ -575,6 +801,7 @@ def test_inventory_rejects_nested_elf_magic_amplification(monkeypatch) -> None:
 
     monkeypatch.setattr(_ISA, "_parse_elf", counted)
     _bind_synthetic_wrapper(monkeypatch, records)
+    parsed_sources.clear()
     records[4] = b"prefix" + b"\x7fELF" * 33
 
     with pytest.raises(_ISA.VerificationError, match="nested ELF count"):
@@ -591,13 +818,126 @@ def test_llvm_output_gate_records_exact_resources_and_four_signed_iu8_wmma() -> 
     assert evidence["resources"] == _ISA._EXPECTED_RESOURCES
     assert evidence["resources"]["sgpr_spill_count"] == 0
     assert evidence["resources"]["vgpr_spill_count"] == 0
+    assert evidence["control_flow"]["all_barriers_before_exec_mask"] is True
+    assert evidence["control_flow"]["branch_direction"] == "forward_only"
+    assert evidence["control_flow"]["backedge_count"] == 0
+    assert evidence["tail_store"] == {
+        "standalone_immediate_17_or_0x11_count": 0,
+        "ds_store_b8_count": 0,
+        "global_store_count": 8,
+    }
+
+
+def test_llvm_output_gate_rejects_branch_moved_before_barriers_and_exec_mask() -> None:
+    objdump = _objdump()
+    branch = (
+        f"\ts_cbranch_execz 294                                  // "
+        f"000000002010: 0 <{_ISA._EXPECTED_SYMBOL}+0xbac>\n"
+    ).encode()
+    predicate = b"\tv_cmp_eq_u32_e32 vcc_lo, 0, v7"
+    assert objdump.count(branch) == 1
+    objdump = objdump.replace(branch, b"")
+    objdump = objdump.replace(predicate, branch + predicate, 1)
+
+    with pytest.raises(_ISA.VerificationError, match="barrier/EXEC/branch"):
+        _ISA._inspect_tool_output(_readobj(), objdump)
+
+
+def test_llvm_output_gate_recomputes_branch_target_from_source_address() -> None:
+    objdump = _objdump().replace(b"// 000000002010: 0 <", b"// 000000002014: 0 <", 1)
+
+    with pytest.raises(_ISA.VerificationError, match="source/target arithmetic"):
+        _ISA._inspect_tool_output(_readobj(), objdump)
+
+
+@pytest.mark.parametrize(
+    ("inserted_instruction", "message"),
+    [
+        (
+            b"\ts_setpc_b64 s[0:1]                                // 000000002000: 0\n",
+            "unsupported scalar control transfer",
+        ),
+        (
+            b"\ts_mov_b32 vcc_lo, 0                               // 000000002004: 0\n",
+            "predicate/EXEC state",
+        ),
+        (
+            b"\ts_mov_b32 exec_lo, 0                              // 000000002008: 0\n",
+            "predicate/EXEC state",
+        ),
+    ],
+)
+def test_llvm_output_gate_rejects_indirect_transfer_or_mask_state_clobber(
+    inserted_instruction: bytes, message: str
+) -> None:
+    saveexec = b"\ts_and_saveexec_b32 s0, vcc_lo"
+    objdump = _objdump().replace(saveexec, inserted_instruction + saveexec, 1)
+
+    with pytest.raises(_ISA.VerificationError, match=message):
+        _ISA._inspect_tool_output(_readobj(), objdump)
+
+
+@pytest.mark.parametrize(
+    "unmask",
+    [
+        b"\ts_mov_b32 exec_lo, -1                             // 000000002014: 0",
+        b"\tv_cmpx_eq_u32_e32 0, v7                           // 000000002014: 0",
+        b"\ts_or_saveexec_b32 s2, -1                          // 000000002014: 0",
+        b"\ts_wrexec_b32 s2, s3                               // 000000002014: 0",
+    ],
+)
+def test_llvm_output_gate_rejects_exec_unmask_before_guarded_stores(
+    unmask: bytes,
+) -> None:
+    branch = (
+        f"\ts_cbranch_execz 294                                  // "
+        f"000000002010: 0 <{_ISA._EXPECTED_SYMBOL}+0xbac>"
+    ).encode()
+    objdump = _objdump().replace(branch, branch + b"\n" + unmask, 1)
+
+    with pytest.raises(_ISA.VerificationError, match="predicate/EXEC state"):
+        _ISA._inspect_tool_output(_readobj(), objdump)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["store_before_branch", "literal_17", "byte_store"]
+)
+def test_llvm_output_gate_rejects_changed_full_tile_store_contract(
+    mutation: str,
+) -> None:
+    objdump = _objdump()
+    first_store = (
+        b"\tglobal_store_b16 v[0:1], v0, off                        // "
+        b"0000000000002400: 0\n"
+    )
+    if mutation == "store_before_branch":
+        saveexec = b"\ts_and_saveexec_b32 s0, vcc_lo"
+        assert objdump.count(first_store) == 1
+        objdump = objdump.replace(first_store, b"")
+        objdump = objdump.replace(saveexec, first_store + saveexec, 1)
+    elif mutation == "literal_17":
+        first_store_without_newline = first_store.rstrip(b"\n")
+        objdump = objdump.replace(
+            first_store_without_newline,
+            b"\ts_mov_b32 s1, 17                                  // "
+            b"000000002020: 0\n" + first_store_without_newline,
+            1,
+        )
+    else:
+        objdump = objdump.replace(b"\tglobal_store_b16 ", b"\tds_store_b8 ", 1)
+
+    with pytest.raises(_ISA.VerificationError, match="tail-store"):
+        _ISA._inspect_tool_output(_readobj(), objdump)
 
 
 @pytest.mark.parametrize(
     ("readobj", "objdump", "message"),
     [
         (
-            _readobj().replace(b".vgpr_count: 62", b".vgpr_count: 63"),
+            _readobj().replace(
+                f".vgpr_count: {_ISA._EXPECTED_RESOURCES['vgpr_count']}".encode(),
+                f".vgpr_count: {_ISA._EXPECTED_RESOURCES['vgpr_count'] + 1}".encode(),
+            ),
             _objdump(),
             "resource",
         ),
@@ -704,6 +1044,19 @@ def test_public_api_returns_json_serializable_evidence_without_device_access(
         decompress = staticmethod(_decompressor(mapping))
 
     monkeypatch.setattr(_ISA, "_Snappy", FakeSnappy)
+    monkeypatch.setattr(
+        _ISA,
+        "_inspect_thunks",
+        lambda _records: {
+            "executable_record_bytes": len(records[4]),
+            "executable_record_sha256": hashlib.sha256(records[4]).hexdigest(),
+            "thunk_count": 2,
+            "all_thunks_are_exact_custom_kernels": True,
+            "sequential_wrapper_present": False,
+            "device_to_device_copy_thunk_present": False,
+            "ordered_thunks": [],
+        },
+    )
 
     def run(command, **_kwargs):
         if command[0] == str(_ISA._ZSTDCAT):

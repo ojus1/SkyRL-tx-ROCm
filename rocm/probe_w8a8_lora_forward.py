@@ -65,14 +65,45 @@ _PALLAS_TARGETS = frozenset(
     }
 )
 _EXPECTED_KERNEL_NAME = "skyrl_qwen35_w8a8_lora_forward"
-_EXPECTED_NESTED_ELF_BYTES = 8_440
+_EXPECTED_NESTED_ELF_BYTES = 7_160
 _EXPECTED_NESTED_ELF_SHA256 = (
-    "606a80a508317af303966e5c2ca357d138d08828949c0dbfdcd73ccde1726389"
+    "87a2ae903547258a4b107fad17797147c417d8ca35cc600bc35d77e46323368f"
 )
 _EXPECTED_NESTED_ELF_TARGET = "amdgcn--amdhsa-amdgiz-gfx1100"
 _EXPECTED_INT8_WMMA_COUNT = 4
 _EXPECTED_SGPR_COUNT = 34
-_EXPECTED_VGPR_COUNT = 62
+_EXPECTED_VGPR_COUNT = 105
+_EXPECTED_EXECUTABLE_RECORD_SHA256 = (
+    "35b0d10450a490910bb817529fd06e3c9f5e884b647d073f4207c33f0baff748"
+)
+_EXPECTED_ORDERED_THUNK_LAUNCHES = (
+    ("input_pad_reduce_fusion", [2, 1, 1], [256, 1, 1], 0),
+    ("loop_convert_fusion", [8, 1, 1], [128, 1, 1], 0),
+    ("gemm_fusion_dot_general_1", [1, 1, 1], [128, 1, 1], 8_192),
+    ("loop_select_fusion", [1, 1, 1], [16, 1, 1], 0),
+    (_EXPECTED_KERNEL_NAME, [1, 2, 1], [128, 1, 1], 1_024),
+    ("wrapped_slice", [1, 1, 1], [51, 1, 1], 0),
+)
+_EXPECTED_CONTROL_FLOW = {
+    "barrier_count": 9,
+    "all_barriers_before_exec_mask": True,
+    "vcc_predicate": "v_cmp_eq_u32_e32 vcc_lo, 0, v7",
+    "exec_mask": "s_and_saveexec_b32 s0, vcc_lo",
+    "scalar_branch_count": 1,
+    "scalar_branches": ["s_cbranch_execz 294"],
+    "branch_direction": "forward_only",
+    "branch_target_offset_hex": "0xbac",
+    "branch_target_instruction": "s_nop 0",
+    "branch_target_is_common_deallocation_epilogue": True,
+    "barrier_after_exec_mask_count": 0,
+    "backedge_count": 0,
+    "endpgm_count": 1,
+}
+_EXPECTED_TAIL_STORE = {
+    "standalone_immediate_17_or_0x11_count": 0,
+    "ds_store_b8_count": 0,
+    "global_store_count": 8,
+}
 _MAX_RELATIVE_L2_ERROR = 0.01
 _MIN_COSINE_SIMILARITY = 0.9999
 _MAX_ABSOLUTE_ERROR = 0.25
@@ -107,7 +138,7 @@ _EXPECTED_HOST_SHA256 = {
     "expected": "964b0c1fe5f5c4cdbd60658717fee50a835006adf03011717b4914061ab4f88f",
 }
 _EXPECTED_SOURCE_SHA256 = {
-    "isa_inspector": "1a46c05700e5fbe6b5747632cfb23e872919f3b39fa77119c701836ce92cda07",
+    "isa_inspector": "9806e33a6e59f32bf9a6b1093a20629e3a868f00e6c7ffb783361589949d4548",
     "kernel": "af119fec39f53ba0dd0c500398589e0fc333a6fda752ffb464c2a578738bbded",
     "quantized_reference": "91a89055ea18b16d64bd32c2eac32a2361e52b4a56b23721b41ffeb413ccc0de",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
@@ -1861,7 +1892,21 @@ def _qualify_fresh_nested_elf(
     isa = evidence.get("isa", {})
     resources = isa.get("resources", {})
     elf_inventory = evidence.get("elf_inventory", {})
+    thunk_inventory = evidence.get("thunk_inventory", {})
+    ordered_thunks = thunk_inventory.get("ordered_thunks", [])
+    if not isinstance(ordered_thunks, list):
+        ordered_thunks = []
     candidate = evidence.get("candidate", {})
+    observed_thunk_launches = tuple(
+        (
+            item.get("kernel"),
+            item.get("grid"),
+            item.get("threads"),
+            item.get("shared_memory_bytes"),
+        )
+        for item in ordered_thunks
+        if isinstance(item, dict)
+    )
     checks = {
         "status_exact": evidence.get("status") == "passed_offline_isa_verification",
         "offline_inspector": evidence.get("offline_only") is True
@@ -1871,8 +1916,18 @@ def _qualify_fresh_nested_elf(
         == str(cache_path)
         and evidence.get("cache", {}).get("sha256") == cache_manifest["sha256"]
         and evidence.get("cache", {}).get("expected_sha256_matched") is True,
-        "one_unique_exact_symbol_candidate": elf_inventory.get("elf_count") == 6
-        and elf_inventory.get("unique_exact_symbol_candidate_count") == 1,
+        "one_unique_exact_symbol_candidate": elf_inventory.get("elf_count") == 7
+        and elf_inventory.get("nested_elf_count") == 6
+        and elf_inventory.get("unique_exact_symbol_candidate_count") == 1
+        and elf_inventory.get("ordered_nested_contract_matched") is True,
+        "six_ordered_custom_kernel_thunks": thunk_inventory.get("thunk_count") == 6
+        and thunk_inventory.get("all_thunks_are_exact_custom_kernels") is True
+        and thunk_inventory.get("sequential_wrapper_present") is False
+        and thunk_inventory.get("device_to_device_copy_thunk_present") is False
+        and thunk_inventory.get("executable_record_bytes") == 52_909
+        and thunk_inventory.get("executable_record_sha256")
+        == _EXPECTED_EXECUTABLE_RECORD_SHA256
+        and observed_thunk_launches == _EXPECTED_ORDERED_THUNK_LAUNCHES,
         "candidate_bytes_exact": candidate.get("bytes") == _EXPECTED_NESTED_ELF_BYTES,
         "candidate_sha256_exact": candidate.get("sha256") == _EXPECTED_NESTED_ELF_SHA256
         and candidate.get("expected_sha256_matched") is True,
@@ -1885,6 +1940,9 @@ def _qualify_fresh_nested_elf(
         and isa.get("signed_neg_lo") == [1, 1, 0],
         "registers_exact": resources.get("sgpr_count") == _EXPECTED_SGPR_COUNT
         and resources.get("vgpr_count") == _EXPECTED_VGPR_COUNT,
+        "full_tile_control_flow_exact": isa.get("control_flow")
+        == _EXPECTED_CONTROL_FLOW
+        and isa.get("tail_store") == _EXPECTED_TAIL_STORE,
         "zero_spills_and_private_segment": resources.get("sgpr_spill_count") == 0
         and resources.get("vgpr_spill_count") == 0
         and resources.get("private_segment_fixed_size") == 0,
