@@ -16,7 +16,10 @@ import importlib.metadata
 import json
 import math
 import os
+import re
+import select
 import shlex
+import stat
 import statistics
 import subprocess
 import sys
@@ -36,6 +39,12 @@ _RELATIVE_L2_LIMIT = 0.03
 _OUTPUT_COSINE_LIMIT = 0.9999
 _MIN_FORWARD_VJP_SPEEDUP = 1.10
 _MIN_REMATERIALIZED_STAGE_SPEEDUP = 1.15
+_FORWARD_ONCE_WATCHDOG_SECONDS = 5.0
+_FORWARD_ONCE_OUTPUT_SHAPE = (1, 64, 9216)
+_FORWARD_ONCE_SCOPE_PATTERN = (
+    r"/user\.slice/user-[0-9]+\.slice/user@[0-9]+\.service/app\.slice/"
+    r"(skyrl-bf16-forward-[0-9]+-[0-9a-f]+\.scope)"
+)
 _EXACT_PROFILE_LIMITS = {
     "--max-junction-temp-c": 90.0,
     "--max-gpu-power-watts": 400.0,
@@ -76,6 +85,22 @@ def _exact_contract() -> dict[str, Any]:
             "reference_executable_invocations": 0,
             "candidate_executable_invocations": 0,
         },
+        "forward_once": {
+            "compiled_programs": ["candidate_forward"],
+            "reference_executable_invocations": 0,
+            "candidate_forward_executable_invocations": 1,
+            "candidate_forward_and_vjp_executable_invocations": 0,
+            "watchdog_seconds": _FORWARD_ONCE_WATCHDOG_SECONDS,
+            "required_output_shape": list(_FORWARD_ONCE_OUTPUT_SHAPE),
+            "required_output_dtype": "bfloat16",
+            "requires_exact_clean_compile_evidence": True,
+            "requires_completed_compile_profile_summary": True,
+            "requires_cgroup_wide_timeout_kill": True,
+            "warmups": 0,
+            "iterations": 0,
+            "requires_finite_host_output": True,
+            "performance_qualification": False,
+        },
         "execute_gates": {
             "relative_l2_limit_exclusive": _RELATIVE_L2_LIMIT,
             "output_cosine_limit_inclusive": _OUTPUT_COSINE_LIMIT,
@@ -94,8 +119,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument(
         "--compile-only", dest="mode", action="store_const", const="compile_only"
     )
+    mode.add_argument(
+        "--forward-once", dest="mode", action="store_const", const="forward_once"
+    )
     mode.add_argument("--execute", dest="mode", action="store_const", const="execute")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--progress-output", type=Path)
+    parser.add_argument("--compile-evidence", type=Path)
+    parser.add_argument("--compile-profile-summary", type=Path)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--rows", type=int, default=64)
@@ -117,6 +148,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"refusing to overwrite existing output: {args.output}")
     if not args.output.is_absolute():
         parser.error("--output must be an absolute path")
+    if args.mode == "forward_once":
+        if args.progress_output is None:
+            parser.error("forward-once mode requires --progress-output")
+        if not args.progress_output.is_absolute():
+            parser.error("--progress-output must be an absolute path")
+        if args.progress_output.exists():
+            parser.error(
+                "refusing to overwrite existing progress output: "
+                f"{args.progress_output}"
+            )
+        if args.progress_output.resolve() == args.output.resolve():
+            parser.error("--progress-output must differ from --output")
+        if args.compile_evidence is None:
+            parser.error("forward-once mode requires --compile-evidence")
+        if not args.compile_evidence.is_absolute():
+            parser.error("--compile-evidence must be an absolute path")
+        if not args.compile_evidence.is_file():
+            parser.error("--compile-evidence must be an existing regular file")
+        if args.compile_profile_summary is None:
+            parser.error("forward-once mode requires --compile-profile-summary")
+        if not args.compile_profile_summary.is_absolute():
+            parser.error("--compile-profile-summary must be an absolute path")
+        if not args.compile_profile_summary.is_file():
+            parser.error("--compile-profile-summary must be an existing regular file")
+    elif args.progress_output is not None:
+        parser.error("--progress-output is only valid with --forward-once")
+    elif args.compile_evidence is not None:
+        parser.error("--compile-evidence is only valid with --forward-once")
+    elif args.compile_profile_summary is not None:
+        parser.error("--compile-profile-summary is only valid with --forward-once")
 
     geometry = (
         args.batch_size,
@@ -152,6 +213,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--product-features must be divisible by --block-n")
     if args.in_features % args.block_k:
         parser.error("--in-features must be divisible by --block-k")
+    if args.mode == "forward_once" and (
+        args.block_m,
+        args.block_n,
+        args.block_k,
+    ) != (16, 32, 64):
+        parser.error("forward-once mode requires exact BM16/BN32/BK64 tiles")
     if args.mode == "execute" and args.warmups < _MIN_WARMUPS:
         parser.error(f"execute mode requires --warmups of at least {_MIN_WARMUPS}")
     if args.mode == "execute" and args.iterations < _MIN_ITERATIONS:
@@ -160,6 +227,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.warmups < 0 or args.iterations < 0:
         parser.error("--warmups and --iterations cannot be negative")
+    if args.mode == "forward_once" and (args.warmups, args.iterations) != (0, 0):
+        parser.error("forward-once mode requires --warmups 0 --iterations 0")
     return args
 
 
@@ -335,6 +404,70 @@ def _require_profile_parent(repo: Path) -> dict[str, Any]:
     }
 
 
+def _require_forward_once_scope(
+    parent_pid: int,
+    *,
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> tuple[dict[str, Any], int]:
+    def exact_unified_cgroup(pid: str) -> str:
+        lines = [
+            line
+            for line in (proc_root / pid / "cgroup").read_text().splitlines()
+            if line
+        ]
+        if len(lines) != 1 or not lines[0].startswith("0::"):
+            raise RuntimeError(f"process {pid} is not in one exact unified cgroup")
+        return lines[0][3:]
+
+    cgroup = exact_unified_cgroup("self")
+    parent_cgroup = exact_unified_cgroup(str(parent_pid))
+    if parent_cgroup != cgroup:
+        raise RuntimeError("probe and profile_rocm parent are not in the same cgroup")
+    match = re.fullmatch(_FORWARD_ONCE_SCOPE_PATTERN, cgroup)
+    if match is None:
+        raise RuntimeError("forward-once probe is not in a private BF16 systemd scope")
+    uid = os.getuid()
+    expected_prefix = f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/"
+    if not cgroup.startswith(expected_prefix) or ".." in cgroup:
+        raise RuntimeError("forward-once cgroup user identity is not exact")
+
+    kill_path = cgroup_root / cgroup.removeprefix("/") / "cgroup.kill"
+    path_info = kill_path.lstat()
+    if not stat.S_ISREG(path_info.st_mode) or stat.S_ISLNK(path_info.st_mode):
+        raise RuntimeError("forward-once cgroup.kill is not an exact control file")
+    descriptor = os.open(
+        kill_path,
+        os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    try:
+        descriptor_info = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_info.st_mode) or (
+            descriptor_info.st_dev,
+            descriptor_info.st_ino,
+        ) != (path_info.st_dev, path_info.st_ino):
+            raise RuntimeError("forward-once cgroup.kill descriptor identity changed")
+        os.set_inheritable(descriptor, False)
+        if os.get_inheritable(descriptor):
+            raise RuntimeError("forward-once cgroup.kill descriptor is inheritable")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return (
+        {
+            "validated": True,
+            "scope_unit": match.group(1),
+            "cgroup": cgroup,
+            "profile_parent_same_cgroup": True,
+            "cgroup_kill_path": str(kill_path),
+            "cgroup_kill_device": descriptor_info.st_dev,
+            "cgroup_kill_inode": descriptor_info.st_ino,
+            "timeout_kill_scope": "entire_systemd_cgroup",
+        },
+        descriptor,
+    )
+
+
 def _require_exact_card_identity(
     card_root: Path = Path("/sys/class/drm/card1/device"),
 ) -> dict[str, str]:
@@ -439,11 +572,463 @@ def _performance_gate_passed(
     )
 
 
-def _private_write(path: Path, payload: dict[str, Any]) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _open_private_file_descriptor(path: Path, *, append: bool) -> int:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise RuntimeError("private output path must be an absolute file path")
+    absolute_parent = path.parent.absolute()
+    resolved_parent = path.parent.resolve(strict=True)
+    if resolved_parent != absolute_parent:
+        raise RuntimeError("private output parent must not traverse symlinks")
+    parent_info = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != os.getuid()
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+    ):
+        raise RuntimeError("private output parent must be an owner-only 0700 directory")
+    parent_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        descriptor_info = os.fstat(parent_fd)
+        if not stat.S_ISDIR(descriptor_info.st_mode) or (
+            descriptor_info.st_dev,
+            descriptor_info.st_ino,
+        ) != (parent_info.st_dev, parent_info.st_ino):
+            raise RuntimeError("private output parent descriptor identity changed")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        if append:
+            flags |= os.O_APPEND
+        descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            os.fsync(parent_fd)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def _fsync_private_parent(path: Path) -> None:
+    parent_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _write_reserved_private_output(
+    path: Path, descriptor: int, payload: dict[str, Any]
+) -> None:
+    try:
+        descriptor_info = os.fstat(descriptor)
+        path_info = path.lstat()
+        if (
+            not stat.S_ISREG(descriptor_info.st_mode)
+            or stat.S_IMODE(descriptor_info.st_mode) != 0o600
+            or descriptor_info.st_uid != os.getuid()
+            or (descriptor_info.st_dev, descriptor_info.st_ino)
+            != (path_info.st_dev, path_info.st_ino)
+        ):
+            raise RuntimeError("reserved private output descriptor identity changed")
+    except BaseException:
+        os.close(descriptor)
+        raise
     with os.fdopen(descriptor, "w", encoding="utf-8") as output:
         output.write(json.dumps(payload, allow_nan=False, sort_keys=True))
         output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    _fsync_private_parent(path)
+
+
+def _private_write(path: Path, payload: dict[str, Any]) -> None:
+    descriptor = _open_private_file_descriptor(path, append=False)
+    _write_reserved_private_output(path, descriptor, payload)
+
+
+def _open_private_progress(path: Path):
+    descriptor = _open_private_file_descriptor(path, append=True)
+    return os.fdopen(descriptor, "w", encoding="utf-8")
+
+
+def _durable_progress_record(output: Any, payload: dict[str, Any]) -> bytes:
+    line = json.dumps(payload, allow_nan=False, sort_keys=True) + "\n"
+    output.write(line)
+    output.flush()
+    os.fsync(output.fileno())
+    return line.encode("utf-8")
+
+
+_FORWARD_ONCE_WATCHDOG_PROGRAM = r"""
+import os
+import select
+import signal
+import sys
+import time
+
+probe_pid_fd = int(sys.argv[1])
+completion_fd = int(sys.argv[2])
+arm_fd = int(sys.argv[3])
+ready_fd = int(sys.argv[4])
+armed_fd = int(sys.argv[5])
+cgroup_kill_fd = int(sys.argv[6])
+timeout_seconds = float(sys.argv[7])
+os.write(ready_fd, b"R")
+os.close(ready_fd)
+armed = os.read(arm_fd, 1)
+os.close(arm_fd)
+if armed != b"A":
+    os.close(cgroup_kill_fd)
+    os.close(probe_pid_fd)
+    raise SystemExit(0)
+armed_ns = time.monotonic_ns()
+deadline_ns = armed_ns + int(timeout_seconds * 1_000_000_000)
+os.write(armed_fd, f"{armed_ns}:{deadline_ns}\n".encode("ascii"))
+os.close(armed_fd)
+remaining = max(0.0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000)
+readable, _, _ = select.select([completion_fd], [], [], remaining)
+completion = os.read(completion_fd, 1) if readable else b""
+completed_at_ns = time.monotonic_ns()
+if completion == b"C" and completed_at_ns < deadline_ns:
+    os.close(completion_fd)
+    os.close(cgroup_kill_fd)
+    os.close(probe_pid_fd)
+    raise SystemExit(0)
+os.close(completion_fd)
+try:
+    os.write(cgroup_kill_fd, b"1")
+except OSError:
+    pass
+finally:
+    os.close(cgroup_kill_fd)
+try:
+    signal.pidfd_send_signal(probe_pid_fd, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+finally:
+    os.close(probe_pid_fd)
+"""
+
+
+def _start_forward_once_watchdog(cgroup_kill_fd: int) -> dict[str, Any]:
+    if isinstance(cgroup_kill_fd, bool) or cgroup_kill_fd < 3:
+        raise RuntimeError("forward-once cgroup.kill descriptor is invalid")
+    cgroup_kill_info = os.fstat(cgroup_kill_fd)
+    if not stat.S_ISREG(cgroup_kill_info.st_mode):
+        raise RuntimeError("forward-once cgroup.kill descriptor is not a control file")
+    descriptors: list[int] = []
+    try:
+        probe_pid_fd = os.pidfd_open(os.getpid(), 0)
+        descriptors.append(probe_pid_fd)
+        completion_read, completion_write = os.pipe()
+        descriptors.extend((completion_read, completion_write))
+        arm_read, arm_write = os.pipe()
+        descriptors.extend((arm_read, arm_write))
+        ready_read, ready_write = os.pipe()
+        descriptors.extend((ready_read, ready_write))
+        armed_read, armed_write = os.pipe()
+        descriptors.extend((armed_read, armed_write))
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+        _FORWARD_ONCE_WATCHDOG_PROGRAM,
+        str(probe_pid_fd),
+        str(completion_read),
+        str(arm_read),
+        str(ready_write),
+        str(armed_write),
+        str(cgroup_kill_fd),
+        str(_FORWARD_ONCE_WATCHDOG_SECONDS),
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            close_fds=True,
+            pass_fds=(
+                probe_pid_fd,
+                completion_read,
+                arm_read,
+                ready_write,
+                armed_write,
+                cgroup_kill_fd,
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+
+    os.close(probe_pid_fd)
+    os.close(completion_read)
+    os.close(arm_read)
+    os.close(ready_write)
+    os.close(armed_write)
+    try:
+        readable, _, _ = select.select([ready_read], [], [], 5.0)
+        ready = os.read(ready_read, 1) if readable else b""
+    finally:
+        os.close(ready_read)
+    if ready != b"R":
+        os.close(armed_read)
+        os.close(arm_write)
+        os.close(completion_write)
+        process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
+        raise RuntimeError("the external forward-once watchdog did not become ready")
+    return {
+        "process": process,
+        "armed_read": armed_read,
+        "arm_write": arm_write,
+        "completion_write": completion_write,
+        "arm_sent": False,
+        "armed": False,
+        "settled": False,
+        "timeout_seconds": _FORWARD_ONCE_WATCHDOG_SECONDS,
+        "cgroup_wide_timeout_kill": True,
+        "cgroup_kill_device": cgroup_kill_info.st_dev,
+        "cgroup_kill_inode": cgroup_kill_info.st_ino,
+        "armed_monotonic_ns": None,
+        "deadline_monotonic_ns": None,
+    }
+
+
+def _arm_forward_once_watchdog(watchdog: dict[str, Any]) -> None:
+    if watchdog["arm_sent"] or watchdog["settled"]:
+        raise RuntimeError("forward-once watchdog cannot be armed in its current state")
+    os.write(watchdog["arm_write"], b"A")
+    watchdog["arm_sent"] = True
+    os.close(watchdog["arm_write"])
+    watchdog["arm_write"] = None
+    try:
+        readable, _, _ = select.select([watchdog["armed_read"]], [], [], 1.0)
+        armed = os.read(watchdog["armed_read"], 128) if readable else b""
+    finally:
+        os.close(watchdog["armed_read"])
+        watchdog["armed_read"] = None
+    try:
+        armed_text = armed.decode("ascii")
+        armed_raw, deadline_raw = armed_text.removesuffix("\n").split(":", 1)
+        armed_monotonic_ns = int(armed_raw)
+        deadline_monotonic_ns = int(deadline_raw)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("the external forward-once watchdog did not arm") from error
+    received_monotonic_ns = time.monotonic_ns()
+    expected_duration_ns = int(watchdog["timeout_seconds"] * 1_000_000_000)
+    if (
+        armed_monotonic_ns <= 0
+        or deadline_monotonic_ns - armed_monotonic_ns != expected_duration_ns
+        or not armed_monotonic_ns <= received_monotonic_ns < deadline_monotonic_ns
+    ):
+        raise RuntimeError("the external forward-once watchdog did not arm")
+    watchdog["armed"] = True
+    watchdog["armed_monotonic_ns"] = armed_monotonic_ns
+    watchdog["deadline_monotonic_ns"] = deadline_monotonic_ns
+    watchdog["armed_ack_received_monotonic_ns"] = received_monotonic_ns
+
+
+def _settle_forward_once_watchdog(
+    watchdog: dict[str, Any], *, invocation_completed: bool
+) -> None:
+    if watchdog["settled"]:
+        return
+    if watchdog["arm_write"] is not None:
+        os.close(watchdog["arm_write"])
+        watchdog["arm_write"] = None
+    if watchdog["armed_read"] is not None:
+        os.close(watchdog["armed_read"])
+        watchdog["armed_read"] = None
+    completion_write = watchdog["completion_write"]
+    try:
+        if invocation_completed:
+            if not watchdog["arm_sent"]:
+                raise RuntimeError("cannot complete a watchdog that was not armed")
+            os.write(completion_write, b"C")
+    finally:
+        os.close(completion_write)
+        watchdog["completion_write"] = None
+    process = watchdog["process"]
+    try:
+        return_code = process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.wait(timeout=1.0)
+        watchdog["settled"] = True
+        raise RuntimeError("the external forward-once watchdog did not exit") from error
+    watchdog["settled"] = True
+    if return_code != 0:
+        raise RuntimeError(
+            f"the external forward-once watchdog exited with status {return_code}"
+        )
+
+
+def _run_forward_once_workload(
+    *,
+    executable: Any,
+    arguments: tuple[Any, ...],
+    progress_output: Path,
+    binding: dict[str, Any],
+    cgroup_kill_fd: int,
+) -> dict[str, Any]:
+    counts = {
+        "reference_forward": 0,
+        "candidate_forward": 0,
+        "reference_forward_and_vjp": 0,
+        "candidate_forward_and_vjp": 0,
+    }
+    completion_counts = dict(counts)
+    progress_digest = hashlib.sha256()
+    progress_byte_count = 0
+    progress_record_count = 0
+
+    def progress_record(event: str, **fields: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "event": event,
+            "mode": "forward_once",
+            "probe_pid": os.getpid(),
+            "wall_time_ns": time.time_ns(),
+            "monotonic_time_ns": time.monotonic_ns(),
+            "binding": binding,
+            "invocation_attempt_counts": dict(counts),
+            "invocation_completion_counts": dict(completion_counts),
+            **fields,
+        }
+
+    def write_progress(output: Any, payload: dict[str, Any]) -> None:
+        nonlocal progress_byte_count, progress_record_count
+        encoded = _durable_progress_record(output, payload)
+        progress_digest.update(encoded)
+        progress_byte_count += len(encoded)
+        progress_record_count += 1
+
+    with _open_private_progress(progress_output) as progress:
+        watchdog = _start_forward_once_watchdog(cgroup_kill_fd)
+        try:
+            write_progress(
+                progress,
+                progress_record(
+                    "compiled_input_ready",
+                    compiled_programs=["candidate_forward"],
+                    concrete_device_inputs_ready=True,
+                    watchdog_seconds=_FORWARD_ONCE_WATCHDOG_SECONDS,
+                ),
+            )
+            _arm_forward_once_watchdog(watchdog)
+            counts["candidate_forward"] += 1
+            write_progress(
+                progress,
+                progress_record(
+                    "dispatch_started",
+                    watchdog_seconds=_FORWARD_ONCE_WATCHDOG_SECONDS,
+                    watchdog_armed_monotonic_ns=watchdog["armed_monotonic_ns"],
+                    watchdog_deadline_monotonic_ns=watchdog["deadline_monotonic_ns"],
+                    watchdog_armed_ack_received_monotonic_ns=watchdog[
+                        "armed_ack_received_monotonic_ns"
+                    ],
+                ),
+            )
+        except BaseException:
+            _settle_forward_once_watchdog(watchdog, invocation_completed=False)
+            raise
+
+        invocation_completed = False
+        try:
+            device_output = _block_tree(executable(*arguments))
+            device_shape = tuple(getattr(device_output, "shape", ()))
+            device_dtype = str(getattr(device_output, "dtype", ""))
+            if device_shape != _FORWARD_ONCE_OUTPUT_SHAPE:
+                raise RuntimeError(
+                    "forward-once output shape is not exact: "
+                    f"{device_shape} != {_FORWARD_ONCE_OUTPUT_SHAPE}"
+                )
+            if device_dtype != "bfloat16":
+                raise RuntimeError(
+                    "forward-once output dtype is not exact: "
+                    f"{device_dtype!r} != 'bfloat16'"
+                )
+            host_output = np.asarray(device_output, dtype=np.float32)
+            if host_output.shape != _FORWARD_ONCE_OUTPUT_SHAPE:
+                raise RuntimeError("forward-once host transfer changed output shape")
+            invocation_completed = True
+        finally:
+            _settle_forward_once_watchdog(
+                watchdog, invocation_completed=invocation_completed
+            )
+
+        finite = bool(np.all(np.isfinite(host_output)))
+        completion_counts["candidate_forward"] += 1
+        host_manifest = {
+            "shape": list(host_output.shape),
+            "device_dtype": device_dtype,
+            "host_dtype": str(host_output.dtype),
+            "element_count": int(host_output.size),
+            "finite": finite,
+        }
+        write_progress(
+            progress,
+            progress_record("dispatch_completed", host_output=host_manifest),
+        )
+        progress_info = os.fstat(progress.fileno())
+        if (
+            not stat.S_ISREG(progress_info.st_mode)
+            or stat.S_IMODE(progress_info.st_mode) != 0o600
+            or progress_info.st_uid != os.getuid()
+            or progress_info.st_size != progress_byte_count
+            or progress_record_count != 3
+        ):
+            raise RuntimeError("forward-once progress evidence is not exact")
+    _fsync_private_parent(progress_output)
+    return {
+        "invocation_counts": counts,
+        "compile_only_zero_candidate_reference_executable_invocations": False,
+        "warmup_orders": [],
+        "measurement_orders": [],
+        "host_output": host_manifest,
+        "invocation_completion_counts": completion_counts,
+        "progress": {
+            "path": str(progress_output),
+            "protocol": "durable_fsync_jsonl_v1",
+            "record_count": progress_record_count,
+            "bytes": progress_byte_count,
+            "sha256": progress_digest.hexdigest(),
+            "mode": "0600",
+            "directory_fsynced": True,
+        },
+        "watchdog": {
+            "external_process": True,
+            "timeout_action": "cgroup.kill_then_pidfd_SIGKILL_fallback",
+            "cgroup_wide_timeout_kill": watchdog["cgroup_wide_timeout_kill"],
+            "timeout_seconds": _FORWARD_ONCE_WATCHDOG_SECONDS,
+            "armed_monotonic_ns": watchdog["armed_monotonic_ns"],
+            "deadline_monotonic_ns": watchdog["deadline_monotonic_ns"],
+            "armed_ack_received_monotonic_ns": watchdog[
+                "armed_ack_received_monotonic_ns"
+            ],
+            "dispatch_completed": True,
+        },
+    }
 
 
 def _package_versions() -> dict[str, str | None]:
@@ -478,6 +1063,304 @@ def _git_manifest(repo: Path) -> dict[str, Any]:
     }
 
 
+def _json_exact(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _json_exact(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _json_exact(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        )
+    return bool(actual == expected)
+
+
+def _read_strict_private_json(
+    path: Path, *, maximum_bytes: int = 1 << 20
+) -> tuple[Any, dict[str, Any]]:
+    resolved = path.resolve(strict=True)
+    if resolved != path.absolute():
+        raise RuntimeError("private JSON path must not traverse symlinks")
+    parent_info = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != os.getuid()
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+    ):
+        raise RuntimeError("private JSON parent must be an owner-only 0700 directory")
+    path_info = path.lstat()
+    if (
+        not stat.S_ISREG(path_info.st_mode)
+        or stat.S_ISLNK(path_info.st_mode)
+        or path_info.st_uid != os.getuid()
+        or stat.S_IMODE(path_info.st_mode) != 0o600
+        or path_info.st_size > maximum_bytes
+    ):
+        raise RuntimeError(
+            "private JSON must be a bounded owner-only 0600 regular file"
+        )
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (
+            path_info.st_dev,
+            path_info.st_ino,
+        ) or before.st_size != path_info.st_size:
+            raise RuntimeError("private JSON descriptor identity changed")
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) > maximum_bytes
+            or len(raw) != before.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            raise RuntimeError("private JSON changed while it was read")
+    finally:
+        os.close(descriptor)
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    try:
+        payload = json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("private JSON is not strict JSON") from error
+    return payload, {
+        "path": str(path),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "mode": "0600",
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mtime_ns": before.st_mtime_ns,
+    }
+
+
+def _validate_compile_evidence(
+    path: Path,
+    *,
+    expected_contract: dict[str, Any],
+    expected_geometry: dict[str, Any],
+    expected_source: dict[str, Any],
+    expected_git: dict[str, Any],
+    expected_device: dict[str, Any],
+    expected_packages: dict[str, Any],
+) -> dict[str, Any]:
+    evidence, file_manifest = _read_strict_private_json(path)
+    if not isinstance(evidence, dict):
+        raise RuntimeError("compile evidence root is not an object")
+    if (
+        type(evidence.get("schema_version")) is not int
+        or evidence["schema_version"] != 1
+    ):
+        raise RuntimeError("compile evidence schema is not exact")
+    if evidence.get("mode") != "compile_only" or evidence.get("passed") is not True:
+        raise RuntimeError("compile evidence is not a passing compile-only result")
+    if not _json_exact(evidence.get("contract"), expected_contract):
+        raise RuntimeError("compile evidence contract does not match this probe")
+    if not _json_exact(evidence.get("geometry"), expected_geometry):
+        raise RuntimeError("compile evidence geometry/tiles are not exact")
+    if not _json_exact(evidence.get("device"), expected_device):
+        raise RuntimeError("compile evidence device/platform is not exact")
+    compilation = evidence.get("compilation")
+    expected_programs = {
+        "reference_forward_and_vjp",
+        "candidate_forward_and_vjp",
+        "reference_forward",
+        "candidate_forward",
+    }
+    if not isinstance(compilation, dict) or set(compilation) != expected_programs:
+        raise RuntimeError("compile evidence program set is not exact")
+    if any(
+        not isinstance(manifest, dict)
+        or type(manifest.get("lower_calls")) is not int
+        or manifest["lower_calls"] != 1
+        or type(manifest.get("compile_calls")) is not int
+        or manifest["compile_calls"] != 1
+        for manifest in compilation.values()
+    ):
+        raise RuntimeError("compile evidence does not prove one compile per program")
+    invocation = evidence.get("invocation_contract")
+    if (
+        not isinstance(invocation, dict)
+        or invocation.get(
+            "compile_only_zero_candidate_reference_executable_invocations"
+        )
+        is not True
+    ):
+        raise RuntimeError("compile evidence does not prove zero executable calls")
+    if (
+        type(invocation.get("total_executable_invocations")) is not int
+        or invocation["total_executable_invocations"] != 0
+    ):
+        raise RuntimeError("compile evidence records executable invocations")
+    zero_counts = {
+        "reference_forward": 0,
+        "candidate_forward": 0,
+        "reference_forward_and_vjp": 0,
+        "candidate_forward_and_vjp": 0,
+    }
+    if not _json_exact(
+        invocation.get("per_program_executable_invocations"), zero_counts
+    ) or not _json_exact(
+        invocation.get("per_program_executable_completions"), zero_counts
+    ):
+        raise RuntimeError("compile evidence per-program zero counts are not exact")
+    for name in (
+        "reference_executable_invocations",
+        "candidate_executable_invocations",
+    ):
+        if type(invocation.get(name)) is not int or invocation[name] != 0:
+            raise RuntimeError("compile evidence aggregate zero counts are not exact")
+    source = evidence.get("source")
+    if not isinstance(source, dict):
+        raise RuntimeError("compile evidence source manifest is missing")
+    for name, expected in expected_source.items():
+        if not _json_exact(source.get(name), expected):
+            raise RuntimeError(f"compile evidence {name} source does not match")
+    if (
+        not _json_exact(source.get("git"), expected_git)
+        or expected_git.get("clean") is not True
+    ):
+        raise RuntimeError("compile evidence Git state is not this exact clean tree")
+    if not _json_exact(source.get("packages"), expected_packages):
+        raise RuntimeError("compile evidence package versions are not exact")
+    preflight = evidence.get("preflight")
+    if not isinstance(preflight, dict):
+        raise RuntimeError("compile evidence preflight is missing")
+    environment = preflight.get("environment")
+    hardware = preflight.get("hardware")
+    profiler_parent = preflight.get("profiler_parent")
+    if (
+        not isinstance(environment, dict)
+        or environment.get("XLA_FLAGS_effective") != _DISABLE_COMMAND_BUFFERS
+        or environment.get("command_buffers_enabled") is not False
+        or environment.get("graph_capture_enabled") is not False
+    ):
+        raise RuntimeError("compile evidence did not disable capture exactly")
+    if (
+        not isinstance(hardware, dict)
+        or hardware.get("amdgpu_boot_clean") is not True
+        or hardware.get("kfd_unowned") is not True
+        or hardware.get("connected_amd_connectors") != []
+    ):
+        raise RuntimeError("compile evidence hardware preflight is not clean")
+    if (
+        not isinstance(profiler_parent, dict)
+        or profiler_parent.get("validated") is not True
+        or not _json_exact(profiler_parent.get("limits"), _EXACT_PROFILE_LIMITS)
+    ):
+        raise RuntimeError("compile evidence profiler limits are not exact")
+    if not _json_exact(
+        evidence.get("postflight"),
+        {"amdgpu_boot_clean": True, "fatal_amdgpu_events": []},
+    ):
+        raise RuntimeError("compile evidence AMDGPU postflight is not clean")
+    return {
+        **file_manifest,
+        "commit": expected_git["commit"],
+        "programs": sorted(expected_programs),
+        "zero_executable_invocations": True,
+        "clean_preflight_and_postflight": True,
+    }
+
+
+def _validate_compile_profile_summary(
+    path: Path,
+    *,
+    evidence_path: Path,
+    evidence_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        path.parent != evidence_path.parent
+        or path.name != "telemetry.jsonl.summary.json"
+    ):
+        raise RuntimeError("compile profile summary is not the exact evidence sibling")
+    summary, file_manifest = _read_strict_private_json(path)
+    if not isinstance(summary, dict):
+        raise RuntimeError("compile profile summary root is not an object")
+    if file_manifest["mtime_ns"] < evidence_manifest["mtime_ns"]:
+        raise RuntimeError("compile profile summary predates child compile evidence")
+    if (
+        summary.get("record_type") != "summary"
+        or summary.get("status") != "completed"
+        or type(summary.get("returncode")) is not int
+        or summary["returncode"] != 0
+        or summary.get("received_signal") is not None
+        or summary.get("kernel_log_available") is not True
+    ):
+        raise RuntimeError("compile profile did not complete cleanly")
+    for name in ("baseline_samples", "measured_samples", "samples"):
+        if type(summary.get(name)) is not int or summary[name] <= 0:
+            raise RuntimeError("compile profile sensor sample coverage is invalid")
+    if (
+        summary["samples"]
+        != summary["baseline_samples"] + summary["measured_samples"] + 1
+    ):
+        raise RuntimeError("compile profile sample accounting is not exact")
+    if summary.get("safety_violation") is not None:
+        raise RuntimeError("compile profile records a safety violation")
+    if summary.get("kernel_driver_errors") not in (None, []):
+        raise RuntimeError("compile profile records kernel driver errors")
+    metrics = summary.get("metrics")
+    limits = {
+        "gpu_junction_temp_c": _EXACT_PROFILE_LIMITS["--max-junction-temp-c"],
+        "gpu_power_watts": _EXACT_PROFILE_LIMITS["--max-gpu-power-watts"],
+        "vram_used_bytes": int(_EXACT_PROFILE_LIMITS["--max-vram-gib"] * 1024**3),
+        "host_swap_used_bytes": int(_EXACT_PROFILE_LIMITS["--max-swap-gib"] * 1024**3),
+    }
+    observed_maxima: dict[str, float] = {}
+    if not isinstance(metrics, dict):
+        raise RuntimeError("compile profile metrics are missing")
+    for name, limit in limits.items():
+        manifest = metrics.get(name)
+        maximum = manifest.get("measured_max") if isinstance(manifest, dict) else None
+        if (
+            isinstance(maximum, bool)
+            or not isinstance(maximum, (int, float))
+            or not math.isfinite(float(maximum))
+            or float(maximum) < 0
+            or float(maximum) > float(limit)
+        ):
+            raise RuntimeError(f"compile profile {name} maximum is unsafe or missing")
+        observed_maxima[name] = float(maximum)
+    return {
+        **file_manifest,
+        "status": "completed",
+        "returncode": 0,
+        "sensor_samples": summary["samples"],
+        "observed_maxima": observed_maxima,
+        "limits": limits,
+        "safety_violation": None,
+        "kernel_driver_errors": None,
+    }
+
+
 def _compile_callable(
     jax: Any, callable_: Any, arguments: tuple[Any, ...]
 ) -> tuple[Any, float, float]:
@@ -488,6 +1371,26 @@ def _compile_callable(
     executable = lowered.compile()
     compile_seconds = time.perf_counter() - compile_started
     return executable, lower_seconds, compile_seconds
+
+
+def _compilation_plan(
+    *,
+    mode: str,
+    reference_step: Any,
+    candidate_step: Any,
+    reference_forward: Any,
+    candidate_forward: Any,
+    step_arguments: tuple[Any, ...],
+    forward_arguments: tuple[Any, ...],
+) -> dict[str, tuple[Any, tuple[Any, ...]]]:
+    if mode == "forward_once":
+        return {"candidate_forward": (candidate_forward, forward_arguments)}
+    return {
+        "reference_forward_and_vjp": (reference_step, step_arguments),
+        "candidate_forward_and_vjp": (candidate_step, step_arguments),
+        "reference_forward": (reference_forward, forward_arguments),
+        "candidate_forward": (candidate_forward, forward_arguments),
+    }
 
 
 def _alternating_order(iteration: int) -> tuple[str, str]:
@@ -572,7 +1475,34 @@ def _run_compiled_workload(
     }
 
 
-def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
+def _run(
+    args: argparse.Namespace,
+    preflight: dict[str, Any],
+    *,
+    forward_once_cgroup_kill_fd: int | None = None,
+) -> dict[str, Any]:
+    probe_path = Path(__file__).resolve(strict=True)
+    repo = probe_path.parent.parent
+    expected_source_path = (
+        repo / "skyrl" / "tx" / "kernels" / "rocm" / "bf16_rms_gate_up_lora_swiglu.py"
+    ).resolve(strict=True)
+    profiler_path = (repo / "rocm" / "profile_rocm.py").resolve(strict=True)
+    source_preimport = {
+        "kernel": {
+            "path": str(expected_source_path),
+            "sha256": hashlib.sha256(expected_source_path.read_bytes()).hexdigest(),
+        },
+        "probe": {
+            "path": str(probe_path),
+            "sha256": hashlib.sha256(probe_path.read_bytes()).hexdigest(),
+        },
+        "profiler": {
+            "path": str(profiler_path),
+            "sha256": hashlib.sha256(profiler_path.read_bytes()).hexdigest(),
+        },
+    }
+    git_preimport = _git_manifest(repo)
+
     import jax
     import jax.numpy as jnp
     from jax.extend import backend as jax_backend
@@ -580,6 +1510,29 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
     kernel_module = importlib.import_module(
         "skyrl.tx.kernels.rocm.bf16_rms_gate_up_lora_swiglu"
     )
+    source_path = Path(kernel_module.__file__).resolve(strict=True)
+    if source_path != expected_source_path:
+        raise RuntimeError(
+            f"imported kernel source {source_path} is not exact repo source "
+            f"{expected_source_path}"
+        )
+    source_preflight = {
+        "kernel": {
+            "path": str(source_path),
+            "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        },
+        "probe": {
+            "path": str(probe_path),
+            "sha256": hashlib.sha256(probe_path.read_bytes()).hexdigest(),
+        },
+        "profiler": {
+            "path": str(profiler_path),
+            "sha256": hashlib.sha256(profiler_path.read_bytes()).hexdigest(),
+        },
+    }
+    git_preflight = _git_manifest(repo)
+    if source_preflight != source_preimport or git_preflight != git_preimport:
+        raise RuntimeError("source/Git state changed across JAX/kernel import")
     candidate_operation = kernel_module.bf16_rms_gate_up_lora_swiglu
 
     platform_version = jax_backend.get_backend().platform_version
@@ -594,6 +1547,51 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(
             "the exact gate requires Radeon RX 7900 XTX/gfx1100, got "
             f"{devices[0].device_kind!r}"
+        )
+    device_manifest = {
+        "backend": jax.default_backend(),
+        "device_kind": devices[0].device_kind,
+        "architecture": "gfx1100",
+        "platform_version": platform_version,
+    }
+    packages_preflight = _package_versions()
+
+    geometry_manifest = {
+        "batch_size": args.batch_size,
+        "sequence_length": args.sequence_length,
+        "rows": args.rows,
+        "in_features": args.in_features,
+        "physical_gate_up_features": args.physical_features,
+        "product_features": args.product_features,
+        "rank": args.rank,
+        "dtype": "bfloat16",
+        "eps": args.eps,
+        "block_m": args.block_m,
+        "pair_block_n": args.block_n,
+        "block_k": args.block_k,
+    }
+    compile_evidence: dict[str, Any] | None = None
+    compile_profile_summary: dict[str, Any] | None = None
+    if args.mode == "forward_once":
+        if git_preflight.get("clean") is not True:
+            raise RuntimeError("forward-once dispatch requires an exact clean Git tree")
+        if args.compile_evidence is None:
+            raise RuntimeError("forward-once compile evidence is missing")
+        if args.compile_profile_summary is None:
+            raise RuntimeError("forward-once compile profile summary is missing")
+        compile_evidence = _validate_compile_evidence(
+            args.compile_evidence,
+            expected_contract=_exact_contract(),
+            expected_geometry=geometry_manifest,
+            expected_source=source_preflight,
+            expected_git=git_preflight,
+            expected_device=device_manifest,
+            expected_packages=packages_preflight,
+        )
+        compile_profile_summary = _validate_compile_profile_summary(
+            args.compile_profile_summary,
+            evidence_path=args.compile_evidence,
+            evidence_manifest=compile_evidence,
         )
 
     def reference_forward(x, rms_delta, weight, a, b, scale):
@@ -664,14 +1662,15 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
     )
 
     concrete_arguments: tuple[Any, ...] | None = None
-    if args.mode == "execute":
+    concrete_forward_arguments: tuple[Any, ...] | None = None
+    if args.mode in ("forward_once", "execute"):
         rng = np.random.default_rng(20260714)
 
         def device_bf16(shape: tuple[int, ...], scale: float = 1.0):
             host = rng.standard_normal(shape, dtype=np.float32) * scale
             return jax.device_put(jnp.asarray(host, dtype=jnp.bfloat16), devices[0])
 
-        concrete_arguments = (
+        concrete_forward_arguments = (
             device_bf16(
                 (args.batch_size, args.sequence_length, args.in_features), 0.02
             ),
@@ -683,21 +1682,41 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
             device_bf16((args.in_features, args.rank), 0.01),
             device_bf16((args.rank, args.physical_features), 0.01),
             jax.device_put(jnp.asarray(2.0, dtype=jnp.bfloat16), devices[0]),
-            device_bf16(
-                (args.batch_size, args.sequence_length, args.product_features), 0.02
-            ),
         )
-    compile_arguments = (
-        concrete_arguments if concrete_arguments is not None else signature_arguments
-    )
-    compile_forward_arguments = compile_arguments[:-1]
+        if args.mode == "execute":
+            concrete_arguments = (
+                *concrete_forward_arguments,
+                device_bf16(
+                    (args.batch_size, args.sequence_length, args.product_features),
+                    0.02,
+                ),
+            )
 
-    callables = {
-        "reference_forward_and_vjp": (reference_step, compile_arguments),
-        "candidate_forward_and_vjp": (candidate_step, compile_arguments),
-        "reference_forward": (reference_forward, compile_forward_arguments),
-        "candidate_forward": (candidate_forward, compile_forward_arguments),
-    }
+    if args.mode == "forward_once" and concrete_forward_arguments is None:
+        raise RuntimeError("forward-once mode requires concrete device arguments")
+    if args.mode == "forward_once":
+        compile_arguments = signature_arguments
+        compile_forward_arguments = concrete_forward_arguments
+    else:
+        compile_arguments = (
+            concrete_arguments
+            if concrete_arguments is not None
+            else signature_arguments
+        )
+        compile_forward_arguments = (
+            concrete_forward_arguments
+            if concrete_forward_arguments is not None
+            else compile_arguments[:-1]
+        )
+    callables = _compilation_plan(
+        mode=args.mode,
+        reference_step=reference_step,
+        candidate_step=candidate_step,
+        reference_forward=reference_forward,
+        candidate_forward=candidate_forward,
+        step_arguments=compile_arguments,
+        forward_arguments=compile_forward_arguments,
+    )
     executables: dict[str, Any] = {}
     compilation: dict[str, Any] = {}
     for name, (callable_, callable_arguments) in callables.items():
@@ -712,16 +1731,58 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
             "compile_seconds": compile_seconds,
         }
 
-    workload = _run_compiled_workload(
-        mode=args.mode,
-        warmups=args.warmups,
-        iterations=args.iterations,
-        executables=executables,
-        step_arguments=concrete_arguments,
-        forward_arguments=(
-            concrete_arguments[:-1] if concrete_arguments is not None else None
-        ),
-    )
+    forward_once_binding = {
+        "contract": _exact_contract(),
+        "geometry": geometry_manifest,
+        "preflight": preflight,
+        "source": source_preflight,
+        "git": git_preflight,
+        "compile_evidence": compile_evidence,
+        "compile_profile_summary": compile_profile_summary,
+    }
+
+    if args.mode == "forward_once":
+        if (
+            args.progress_output is None
+            or concrete_forward_arguments is None
+            or forward_once_cgroup_kill_fd is None
+        ):
+            raise RuntimeError("forward-once mode is missing its required arguments")
+        workload = _run_forward_once_workload(
+            executable=executables["candidate_forward"],
+            arguments=concrete_forward_arguments,
+            progress_output=args.progress_output,
+            binding=forward_once_binding,
+            cgroup_kill_fd=forward_once_cgroup_kill_fd,
+        )
+    else:
+        workload = _run_compiled_workload(
+            mode=args.mode,
+            warmups=args.warmups,
+            iterations=args.iterations,
+            executables=executables,
+            step_arguments=concrete_arguments,
+            forward_arguments=concrete_forward_arguments,
+        )
+    source_postflight = {
+        "kernel": {
+            "path": str(source_path),
+            "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        },
+        "probe": {
+            "path": str(probe_path),
+            "sha256": hashlib.sha256(probe_path.read_bytes()).hexdigest(),
+        },
+        "profiler": {
+            "path": str(profiler_path),
+            "sha256": hashlib.sha256(profiler_path.read_bytes()).hexdigest(),
+        },
+    }
+    git_postflight = _git_manifest(repo)
+    if args.mode == "forward_once" and (
+        source_postflight != source_preflight or git_postflight != git_preflight
+    ):
+        raise RuntimeError("forward-once source/Git state changed across dispatch")
     numerics: dict[str, Any]
     determinism: dict[str, Any]
     measurement: dict[str, Any]
@@ -747,6 +1808,57 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
             manifest["lower_calls"] == 1 and manifest["compile_calls"] == 1
             for manifest in compilation.values()
         ) and not any(workload["invocation_counts"].values())
+    elif args.mode == "forward_once":
+        finite_host_output = workload["host_output"]["finite"]
+        numerics = {
+            "executed": True,
+            "reference_compared": False,
+            "passed": None,
+            "finite_host_output": finite_host_output,
+            "host_output": workload["host_output"],
+        }
+        determinism = {"executed": False, "passed": None}
+        measurement = {
+            "executed": False,
+            "performance_measured": False,
+            "warmups": 0,
+            "iterations": 0,
+            "single_candidate_forward_safety_dispatch": True,
+        }
+        performance_gate = {
+            "executed": False,
+            "passed": None,
+            "reason": "forward-once is not a performance qualification",
+        }
+        passed = bool(
+            finite_host_output
+            and workload["host_output"]
+            == {
+                "shape": list(_FORWARD_ONCE_OUTPUT_SHAPE),
+                "device_dtype": "bfloat16",
+                "host_dtype": "float32",
+                "element_count": math.prod(_FORWARD_ONCE_OUTPUT_SHAPE),
+                "finite": True,
+            }
+            and set(compilation) == {"candidate_forward"}
+            and compilation["candidate_forward"]["lower_calls"] == 1
+            and compilation["candidate_forward"]["compile_calls"] == 1
+            and workload["invocation_counts"]
+            == {
+                "reference_forward": 0,
+                "candidate_forward": 1,
+                "reference_forward_and_vjp": 0,
+                "candidate_forward_and_vjp": 0,
+            }
+            and workload["invocation_completion_counts"]
+            == workload["invocation_counts"]
+            and workload["progress"]["record_count"] == 3
+            and workload["watchdog"]["dispatch_completed"] is True
+            and workload["watchdog"]["cgroup_wide_timeout_kill"] is True
+            and compile_evidence is not None
+            and compile_profile_summary is not None
+            and preflight.get("forward_once_scope", {}).get("validated") is True
+        )
     else:
         errors = _error_manifest(workload["actual"], workload["expected"])
         numerics_passed = _numerics_gate_passed(errors)
@@ -820,17 +1932,6 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
         recommendation = bool(numerics_passed and deterministic and performance_passed)
         passed = recommendation
 
-    probe_path = Path(__file__).resolve(strict=True)
-    repo = probe_path.parent.parent
-    source_path = Path(kernel_module.__file__).resolve(strict=True)
-    expected_source_path = (
-        repo / "skyrl" / "tx" / "kernels" / "rocm" / "bf16_rms_gate_up_lora_swiglu.py"
-    ).resolve(strict=True)
-    if source_path != expected_source_path:
-        raise RuntimeError(
-            f"imported kernel source {source_path} is not exact repo source {expected_source_path}"
-        )
-    profiler_path = (repo / "rocm" / "profile_rocm.py").resolve(strict=True)
     invocation_counts = workload["invocation_counts"]
     reference_invocations = (
         invocation_counts["reference_forward"]
@@ -840,7 +1941,7 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
         invocation_counts["candidate_forward"]
         + invocation_counts["candidate_forward_and_vjp"]
     )
-    return {
+    payload = {
         "schema_version": 1,
         "mode": args.mode,
         "qualification_scope": "isolated_stage_only",
@@ -849,28 +1950,13 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
         "passed": bool(passed),
         "contract": _exact_contract(),
         "preflight": preflight,
-        "device": {
-            "backend": jax.default_backend(),
-            "device_kind": devices[0].device_kind,
-            "architecture": "gfx1100",
-            "platform_version": platform_version,
-        },
-        "geometry": {
-            "batch_size": args.batch_size,
-            "sequence_length": args.sequence_length,
-            "rows": args.rows,
-            "in_features": args.in_features,
-            "physical_gate_up_features": args.physical_features,
-            "product_features": args.product_features,
-            "rank": args.rank,
-            "dtype": "bfloat16",
-            "eps": args.eps,
-            "block_m": args.block_m,
-            "pair_block_n": args.block_n,
-            "block_k": args.block_k,
-        },
+        "device": device_manifest,
+        "geometry": geometry_manifest,
         "invocation_contract": {
             "per_program_executable_invocations": invocation_counts,
+            "per_program_executable_completions": workload.get(
+                "invocation_completion_counts", invocation_counts
+            ),
             "reference_executable_invocations": reference_invocations,
             "candidate_executable_invocations": candidate_invocations,
             "total_executable_invocations": reference_invocations
@@ -885,22 +1971,22 @@ def _run(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
         "numerics": numerics,
         "determinism": determinism,
         "source": {
-            "kernel": {
-                "path": str(source_path),
-                "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
-            },
-            "probe": {
-                "path": str(probe_path),
-                "sha256": hashlib.sha256(probe_path.read_bytes()).hexdigest(),
-            },
-            "profiler": {
-                "path": str(profiler_path),
-                "sha256": hashlib.sha256(profiler_path.read_bytes()).hexdigest(),
-            },
-            "git": _git_manifest(repo),
-            "packages": _package_versions(),
+            **source_postflight,
+            "git": git_postflight,
+            "packages": packages_preflight,
         },
     }
+    if args.mode == "forward_once":
+        payload["forward_once"] = {
+            "compile_evidence": compile_evidence,
+            "compile_profile_summary": compile_profile_summary,
+            "progress": workload["progress"],
+            "watchdog": workload["watchdog"],
+            "invocation_attempt_counts": workload["invocation_counts"],
+            "invocation_completion_counts": workload["invocation_completion_counts"],
+            "source_and_git_unchanged_across_dispatch": True,
+        }
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -932,25 +2018,36 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(
             f"exact benchmark requires {expected_executable}, got {sys.executable}"
         )
-    profiler_parent = _require_profile_parent(repo)
-    card_identity = _require_exact_card_identity()
-    environment = _configure_environment()
+    output_descriptor: int | None = _open_private_file_descriptor(
+        args.output, append=False
+    )
     try:
-        safety_module = importlib.import_module("rocm.amdgpu_safety")
-    except ModuleNotFoundError:
-        safety_module = importlib.import_module("amdgpu_safety")
-    safety_path = Path(safety_module.__file__).resolve(strict=True)
-    expected_safety_path = (repo / "rocm" / "amdgpu_safety.py").resolve(strict=True)
-    if safety_path != expected_safety_path:
-        raise RuntimeError(
-            f"imported safety source {safety_path} is not exact repo source {expected_safety_path}"
-        )
-
-    with safety_module.guarded_qwen35_rocm_process() as hardware_preflight:
+        profiler_parent = _require_profile_parent(repo)
+        forward_once_scope: dict[str, Any] | None = None
+        forward_once_cgroup_kill_fd: int | None = None
         try:
-            payload = _run(
-                args,
-                {
+            if args.mode == "forward_once":
+                forward_once_scope, forward_once_cgroup_kill_fd = (
+                    _require_forward_once_scope(profiler_parent["parent_pid"])
+                )
+            card_identity = _require_exact_card_identity()
+            environment = _configure_environment()
+            try:
+                safety_module = importlib.import_module("rocm.amdgpu_safety")
+            except ModuleNotFoundError:
+                safety_module = importlib.import_module("amdgpu_safety")
+            safety_path = Path(safety_module.__file__).resolve(strict=True)
+            expected_safety_path = (repo / "rocm" / "amdgpu_safety.py").resolve(
+                strict=True
+            )
+            if safety_path != expected_safety_path:
+                raise RuntimeError(
+                    f"imported safety source {safety_path} is not exact repo source "
+                    f"{expected_safety_path}"
+                )
+
+            with safety_module.guarded_qwen35_rocm_process() as hardware_preflight:
+                preflight = {
                     "environment": environment,
                     "hardware": hardware_preflight,
                     "profiler_parent": profiler_parent,
@@ -959,12 +2056,27 @@ def main(argv: list[str] | None = None) -> int:
                         "path": str(safety_path),
                         "sha256": hashlib.sha256(safety_path.read_bytes()).hexdigest(),
                     },
-                },
-            )
+                }
+                if forward_once_scope is not None:
+                    preflight["forward_once_scope"] = forward_once_scope
+                try:
+                    payload = _run(
+                        args,
+                        preflight,
+                        forward_once_cgroup_kill_fd=forward_once_cgroup_kill_fd,
+                    )
+                finally:
+                    postflight = safety_module.require_clean_amdgpu_boot()
+                payload["postflight"] = postflight
         finally:
-            postflight = safety_module.require_clean_amdgpu_boot()
-        payload["postflight"] = postflight
-    _private_write(args.output, payload)
+            if forward_once_cgroup_kill_fd is not None:
+                os.close(forward_once_cgroup_kill_fd)
+        descriptor = output_descriptor
+        output_descriptor = None
+        _write_reserved_private_output(args.output, descriptor, payload)
+    finally:
+        if output_descriptor is not None:
+            os.close(output_descriptor)
     print(json.dumps(payload, allow_nan=False, sort_keys=True))
     return 0 if payload["passed"] else 1
 
