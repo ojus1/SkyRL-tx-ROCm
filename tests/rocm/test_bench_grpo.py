@@ -237,6 +237,9 @@ class _FakeServiceClient:
 
     async def create_lora_training_client_async(self, **kwargs):
         assert kwargs["base_model"] == _BENCH.MODEL
+        assert kwargs["train_mlp"] is True
+        assert kwargs["train_attn"] is True
+        assert kwargs["train_unembed"] is False
         return self.training_client
 
 

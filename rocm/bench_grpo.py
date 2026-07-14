@@ -357,6 +357,9 @@ async def _run(args: argparse.Namespace, output) -> None:
         base_model=MODEL,
         rank=args.lora_rank,
         seed=args.seed,
+        train_mlp=True,
+        train_attn=True,
+        train_unembed=False,
         user_metadata={"suite": "fixed_rollout_grpo_learner", "run_id": args.run_id},
     )
     adam = tinker.AdamParams(
