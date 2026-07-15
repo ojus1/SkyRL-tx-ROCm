@@ -142,14 +142,124 @@ def _run_mocked_profiler(
     signal_on_measured: int | None = None,
     sample_error: BaseException | None = None,
     kernel_errors_for_call=None,
+    signal_on_kernel_check_call: tuple[int, int] | None = None,
     explicit_termination=None,
     target_liveness=None,
+    before_pre_spawn_check=None,
+    signal_before_pre_spawn: int | None = None,
+    incomplete_containment: bool = False,
+    launch_attestation_failure: bool = False,
+    inherited_fds: tuple[int, ...] = (),
 ):
     output = tmp_path / "telemetry.jsonl"
-    original_terminate = profile_rocm._terminate
     termination = {"called": False, "was_alive": False}
     signal_handlers = {}
     signal_delivered = False
+
+    class FakeWrappedProcessSupervisor:
+        def __init__(self, command_values):
+            self.pid = os.getpid() + 10_000
+            source = command_values[-1]
+            if "SystemExit(7)" in source:
+                self._observed_returncode = 7
+            elif source.strip() == "pass":
+                self._observed_returncode = 0
+            else:
+                self._observed_returncode = None
+            self._report = None
+
+        def observe_returncode(self):
+            return self._observed_returncode
+
+        def contain(self, timeout_seconds):
+            assert timeout_seconds == 0.2
+            if self._report is None:
+                termination["called"] = True
+                termination["was_alive"] = self._observed_returncode is None
+                reaped_returncode = -9 if self._observed_returncode is None else self._observed_returncode
+                self._report = profile_rocm.ContainmentReport(
+                    pid=self.pid,
+                    observed_returncode=self._observed_returncode,
+                    reaped_returncode=reaped_returncode,
+                    cgroup_path="/mock/skyrl-profile",
+                    cgroup_kill_writes=1,
+                    process_group_term_sent=False,
+                    cgroup_empty=True,
+                    leader_reaped=True,
+                    terminal=not incomplete_containment,
+                    issues=(),
+                )
+            return self._report
+
+    class FakeChildProcessRuntime:
+        def __init__(self, *, cgroup_prefix):
+            assert cgroup_prefix == "skyrl-profile"
+            self.supervisors = []
+
+        def start(self):
+            return self
+
+        def launch(self, command_values, *, pass_fds, pre_spawn_check):
+            assert command_values == [sys.executable, "-c", command]
+            assert pass_fds == inherited_fds
+            if before_pre_spawn_check is not None:
+                before_pre_spawn_check()
+            if signal_before_pre_spawn is not None:
+                signal_handlers[signal_before_pre_spawn](signal_before_pre_spawn, None)
+            try:
+                pre_spawn_check()
+            except BaseException as error:
+                empty_scope_report = profile_rocm.ContainmentReport(
+                    pid=-1,
+                    observed_returncode=None,
+                    reaped_returncode=None,
+                    cgroup_path="/mock/skyrl-profile",
+                    cgroup_kill_writes=1,
+                    process_group_term_sent=False,
+                    cgroup_empty=True,
+                    leader_reaped=True,
+                    terminal=True,
+                    issues=(),
+                )
+                raise profile_rocm.ProcessSupervisionError(
+                    "wrapped process launch attestation failed",
+                    containment=empty_scope_report,
+                ) from error
+            if launch_attestation_failure:
+                failed_report = profile_rocm.ContainmentReport(
+                    pid=len(self.supervisors) + os.getpid() + 20_000,
+                    observed_returncode=None,
+                    reaped_returncode=-9,
+                    cgroup_path="/mock/skyrl-profile-failed-launch",
+                    cgroup_kill_writes=1,
+                    process_group_term_sent=False,
+                    cgroup_empty=True,
+                    leader_reaped=True,
+                    terminal=True,
+                    issues=(
+                        profile_rocm.SupervisionIssue(
+                            phase="launch_emergency",
+                            operation="close_pidfd",
+                            error_type="OSError",
+                            message="synthetic terminal cleanup evidence failure",
+                        ),
+                    ),
+                )
+                raise profile_rocm.ProcessSupervisionError(
+                    "synthetic launch attestation failure",
+                    containment=failed_report,
+                )
+            supervisor = FakeWrappedProcessSupervisor(command_values)
+            self.supervisors.append(supervisor)
+            return supervisor
+
+        def restore(self, *, timeout_seconds):
+            reports = tuple(supervisor.contain(timeout_seconds) for supervisor in self.supervisors)
+            return profile_rocm.RuntimeReport(
+                containment=reports,
+                sigchld_restored=True,
+                issues=(),
+            )
 
     def sample(_device, _hwmon, _targets, _create_times, start, phase):
         nonlocal signal_delivered
@@ -158,6 +268,7 @@ def _run_mocked_profiler(
         if phase == "measured" and signal_on_measured is not None and not signal_delivered:
             signal_delivered = True
             signal_handlers[signal_on_measured](signal_on_measured, None)
+            assert termination["called"] is False
         return {
             "record_type": "sample",
             "phase": phase,
@@ -172,11 +283,6 @@ def _run_mocked_profiler(
             "processes": {},
         }
 
-    def terminate(process, grace_seconds):
-        termination["called"] = True
-        termination["was_alive"] = process.poll() is None
-        return original_terminate(process, grace_seconds)
-
     monkeypatch.setattr(
         profile_rocm,
         "_find_gpu",
@@ -188,6 +294,12 @@ def _run_mocked_profiler(
     def kernel_driver_errors_since(_start):
         nonlocal kernel_check_count
         kernel_check_count += 1
+        if (
+            signal_on_kernel_check_call is not None
+            and kernel_check_count == signal_on_kernel_check_call[0]
+        ):
+            signum = signal_on_kernel_check_call[1]
+            signal_handlers[signum](signum, None)
         if kernel_errors_for_call is None:
             return []
         return kernel_errors_for_call(kernel_check_count)
@@ -197,7 +309,7 @@ def _run_mocked_profiler(
         "_kernel_driver_errors_since",
         kernel_driver_errors_since,
     )
-    monkeypatch.setattr(profile_rocm, "_terminate", terminate)
+    monkeypatch.setattr(profile_rocm, "ChildProcessRuntime", FakeChildProcessRuntime)
     if target_liveness is not None:
         monkeypatch.setattr(
             profile_rocm,
@@ -248,6 +360,8 @@ def _run_mocked_profiler(
         arguments.extend(("--duration", str(duration)))
     if timeout_seconds is not None:
         arguments.extend(("--timeout", str(timeout_seconds)))
+    for descriptor in inherited_fds:
+        arguments.extend(("--pass-fd", str(descriptor)))
     if command is not None:
         arguments.extend(("--", sys.executable, "-c", command))
     monkeypatch.setattr(sys, "argv", arguments)
@@ -560,6 +674,23 @@ def test_abort_option_terminates_included_target_for_safety_limit(monkeypatch, t
     assert explicit_termination == {"calls": 1, "pids": [os.getpid()]}
 
 
+def test_signal_during_final_journal_query_matches_summary_and_exit(monkeypatch, tmp_path):
+    returncode, _records, summary, termination = _run_mocked_profiler(
+        monkeypatch,
+        tmp_path,
+        power_for_phase=lambda _phase: 100.0,
+        command="pass",
+        signal_on_kernel_check_call=(2, profile_rocm.signal.SIGTERM),
+    )
+
+    assert returncode == 128 + profile_rocm.signal.SIGTERM
+    assert termination == {"called": True, "was_alive": False}
+    assert summary["status"] == "signal"
+    assert summary["received_signal"] == profile_rocm.signal.SIGTERM
+    assert isinstance(summary["final_signal_cutoff_monotonic_ns"], int)
+    assert summary["pending_final_signals_at_cutoff"] == []
+
+
 def test_abort_option_terminates_included_target_for_driver_error(monkeypatch, tmp_path):
     explicit_termination = {}
     returncode, _records, summary, _termination = _run_mocked_profiler(
@@ -633,6 +764,190 @@ def test_power_breach_is_manifested_terminates_command_and_returns_125(monkeypat
         "limit_kind": "maximum",
     }
     assert termination == {"called": True, "was_alive": True}
+
+
+def test_wrapped_command_records_terminal_private_cgroup_proof(monkeypatch, tmp_path):
+    returncode, records, summary, termination = _run_mocked_profiler(
+        monkeypatch,
+        tmp_path,
+        power_for_phase=lambda _phase: 100.0,
+        command="pass",
+    )
+
+    assert returncode == 0
+    assert records[0]["wrapped_process_supervision"] == "pidfd_waitid_private_cgroup_v2"
+    assert termination == {"called": True, "was_alive": False}
+    containment = summary["wrapped_process_containment"]
+    assert containment["cgroup_kill_writes"] == 1
+    assert containment["process_group_term_sent"] is False
+    assert containment["cgroup_empty"] is True
+    assert containment["leader_reaped"] is True
+    assert containment["terminal"] is True
+    assert summary["wrapped_process_runtime"]["sigchld_restored"] is True
+
+
+def test_wrapped_command_preserves_validated_pass_fds(monkeypatch, tmp_path):
+    read_fd, write_fd = os.pipe()
+    try:
+        returncode, records, summary, _termination = _run_mocked_profiler(
+            monkeypatch,
+            tmp_path,
+            power_for_phase=lambda _phase: 100.0,
+            command="pass",
+            inherited_fds=(read_fd,),
+        )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert returncode == 0
+    assert records[0]["passed_file_descriptor_count"] == 1
+    assert summary["status"] == "completed"
+
+
+def test_final_pre_spawn_gate_rejects_preflight_older_than_50ms(monkeypatch, tmp_path):
+    returncode, _records, summary, termination = _run_mocked_profiler(
+        monkeypatch,
+        tmp_path,
+        power_for_phase=lambda _phase: 100.0,
+        command="pass",
+        before_pre_spawn_check=lambda: time.sleep(0.06),
+    )
+
+    assert returncode == 125
+    assert termination == {"called": False, "was_alive": False}
+    assert summary["status"] == "safety_limit"
+    assert summary["safety_violation"]["reason"] == "preflight_launch_deadline"
+    assert summary["safety_violation"]["value"] > 0.05
+    assert "command" not in summary["processes"]
+
+
+def test_final_pre_spawn_gate_preserves_signal_exit_without_launch(monkeypatch, tmp_path):
+    returncode, _records, summary, termination = _run_mocked_profiler(
+        monkeypatch,
+        tmp_path,
+        power_for_phase=lambda _phase: 100.0,
+        command="pass",
+        signal_before_pre_spawn=profile_rocm.signal.SIGTERM,
+    )
+
+    assert returncode == 128 + profile_rocm.signal.SIGTERM
+    assert termination == {"called": False, "was_alive": False}
+    assert summary["status"] == "signal"
+    assert summary["received_signal"] == profile_rocm.signal.SIGTERM
+    assert summary["wrapped_process_containment"]["terminal"] is True
+    assert "command" not in summary["processes"]
+
+
+def test_incomplete_wrapped_containment_fails_closed(monkeypatch, tmp_path):
+    with pytest.raises(profile_rocm.ProcessSupervisionError, match="runtime restoration failed"):
+        _run_mocked_profiler(
+            monkeypatch,
+            tmp_path,
+            power_for_phase=lambda _phase: 100.0,
+            command="pass",
+            incomplete_containment=True,
+        )
+
+    summary = json.loads((tmp_path / "telemetry.jsonl.summary.json").read_text())
+    assert summary["status"] == "error"
+    assert summary["error_type"] == "ProcessSupervisionError"
+    assert summary["wrapped_process_containment"]["terminal"] is False
+    assert summary["wrapped_process_runtime"]["containment"][0]["terminal"] is False
+
+
+def test_terminal_non_ok_launch_failure_remains_in_summary(monkeypatch, tmp_path):
+    with pytest.raises(
+        profile_rocm.ProcessSupervisionError,
+        match="synthetic launch attestation failure",
+    ):
+        _run_mocked_profiler(
+            monkeypatch,
+            tmp_path,
+            power_for_phase=lambda _phase: 100.0,
+            command="pass",
+            launch_attestation_failure=True,
+        )
+
+    summary = json.loads((tmp_path / "telemetry.jsonl.summary.json").read_text())
+    assert summary["status"] == "error"
+    assert summary["wrapped_process_runtime"] == {
+        "containment": [],
+        "issues": [],
+        "sigchld_restored": True,
+    }
+    containment = summary["wrapped_process_containment"]
+    assert containment["terminal"] is True
+    assert containment["issues"] == [
+        {
+            "error_type": "OSError",
+            "message": "synthetic terminal cleanup evidence failure",
+            "operation": "close_pidfd",
+            "phase": "launch_emergency",
+        }
+    ]
+
+
+@pytest.mark.skipif(
+    os.environ.get("SKYRL_RUN_REAL_CGROUP_TESTS") != "1",
+    reason="requires an explicitly enabled delegated cgroup-v2 CPU smoke test",
+)
+def test_real_profile_runtime_contains_and_reaps_direct_child(monkeypatch, tmp_path):
+    output = tmp_path / "real-supervision.jsonl"
+
+    def sample(_device, _hwmon, _targets, _create_times, start, phase):
+        return {
+            "record_type": "sample",
+            "phase": phase,
+            "elapsed_seconds": time.monotonic() - start,
+            "gpu_power_watts": 100.0,
+            "gpu_junction_temp_c": 50.0,
+            "vram_used_bytes": 0,
+            "gtt_used_bytes": 0,
+            "host_memory_used_bytes": 0,
+            "host_memory_available_bytes": 64 * 1024**3,
+            "host_swap_used_bytes": 0,
+            "processes": {},
+        }
+
+    monkeypatch.setattr(
+        profile_rocm,
+        "_find_gpu",
+        lambda _card: (Path("/mock/device"), None, {"card": "mock"}),
+    )
+    monkeypatch.setattr(profile_rocm, "_sample", sample)
+    monkeypatch.setattr(profile_rocm, "_kernel_driver_errors_since", lambda _start: [])
+    monkeypatch.setattr(profile_rocm.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(_PROFILER),
+            "--output",
+            str(output),
+            "--interval",
+            "0.01",
+            "--terminate-grace-seconds",
+            "1",
+            "--sensor-grace-seconds",
+            "0",
+            "--max-junction-temp-c",
+            "90",
+            "--max-gpu-power-watts",
+            "400",
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+    )
+
+    assert profile_rocm.main() == 0
+    summary = json.loads(output.with_suffix(output.suffix + ".summary.json").read_text())
+    assert summary["status"] == "completed"
+    assert summary["wrapped_process_containment"]["cgroup_kill_writes"] == 1
+    assert summary["wrapped_process_containment"]["terminal"] is True
+    assert summary["wrapped_process_runtime"]["sigchld_restored"] is True
 
 
 def test_exact_power_limit_does_not_stop_completed_command(monkeypatch, tmp_path):

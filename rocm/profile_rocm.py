@@ -27,6 +27,7 @@ import psutil
 _SENSITIVE_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH", "COOKIE")
 _SENSITIVE_ARGUMENT_FLAGS = ("--header", "--proxy-header", "--user", "--proxy-user", "-u")
 _GIB = 1024**3
+_PREFLIGHT_LAUNCH_DEADLINE_NS = 50_000_000
 _INCLUDED_SAFETY_STOP_STATUSES = frozenset({"safety_limit", "driver_error"})
 _INCLUDED_ABORT_STOP_STATUSES = frozenset(
     {
@@ -42,6 +43,36 @@ try:
     from rocm.amdgpu_safety import AMDGPU_FATAL_PATTERN as _AMDGPU_FATAL_PATTERN
 except ModuleNotFoundError:
     from amdgpu_safety import AMDGPU_FATAL_PATTERN as _AMDGPU_FATAL_PATTERN
+try:
+    from rocm.process_supervision import (
+        ChildProcessRuntime,
+        ContainmentReport,
+        ProcessSupervisionError,
+        RuntimeReport,
+        SupervisionIssue,
+        WrappedProcessSupervisor,
+    )
+except ModuleNotFoundError:
+    from process_supervision import (  # type: ignore[no-redef]
+        ChildProcessRuntime,
+        ContainmentReport,
+        ProcessSupervisionError,
+        RuntimeReport,
+        SupervisionIssue,
+        WrappedProcessSupervisor,
+    )
+
+
+class _PreSpawnSafetyDeadline(RuntimeError):
+    """The hardware preflight no longer authorizes a command launch."""
+
+    def __init__(self, age_ns: int) -> None:
+        self.age_ns = age_ns
+        super().__init__("hardware preflight exceeded the 50 ms launch deadline")
+
+
+class _PreSpawnSignal(RuntimeError):
+    """A handled signal revoked launch authority at the final launch gate."""
 
 
 def _redact_argument(value: str) -> str:
@@ -587,91 +618,12 @@ def _parse_pid_spec(value: str) -> tuple[str, int]:
     return label, pid
 
 
-def _process_group_exists(process_group_id: int) -> bool:
-    try:
-        os.killpg(process_group_id, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
 def _pid_matches_create_time(pid: int, expected_create_time: float) -> bool:
     try:
         process = psutil.Process(pid)
         return process.create_time() == expected_create_time and process.status() != psutil.STATUS_ZOMBIE
     except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
         return False
-
-
-def _process_descendants(pid: int) -> list[psutil.Process]:
-    """Snapshot descendants so children that leave the process group are not leaked."""
-    try:
-        return psutil.Process(pid).children(recursive=True)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
-        return []
-
-
-def _live_processes(processes: list[psutil.Process]) -> list[psutil.Process]:
-    live: list[psutil.Process] = []
-    for process in processes:
-        try:
-            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
-                live.append(process)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
-            continue
-    return live
-
-
-def _terminate(process: subprocess.Popen, grace_seconds: float) -> int:
-    """Reap the leader and terminate its process group plus escaped descendants."""
-    leader_returncode = process.poll()
-    descendants = _process_descendants(process.pid)
-    if _process_group_exists(process.pid):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    # A worker may create a new session/process group. Signal every descendant
-    # captured before terminating the leader so such workers cannot outlive a
-    # timeout or safety stop.
-    for descendant in reversed(descendants):
-        try:
-            descendant.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        process.poll()  # Reap the leader so it does not remain as a zombie.
-        if not _process_group_exists(process.pid) and not _live_processes(descendants):
-            break
-        time.sleep(0.05)
-
-    if _process_group_exists(process.pid):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    survivors = _live_processes(descendants)
-    for descendant in survivors:
-        try:
-            descendant.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    if survivors:
-        psutil.wait_procs(survivors, timeout=min(grace_seconds, 1.0))
-
-    if leader_returncode is None:
-        try:
-            return process.wait(timeout=min(grace_seconds, 1.0))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return process.wait()
-    # Ensure the already-exited leader is reaped while preserving its status.
-    process.wait()
-    return leader_returncode
 
 
 def _terminate_process_trees(
@@ -741,6 +693,65 @@ def _included_termination_required(
     )
 
 
+def _profile_exit_code(
+    status: str,
+    received_signal: int | None,
+    returncode: int | None,
+) -> int:
+    if status == "safety_limit":
+        return 125
+    if status == "driver_error":
+        return 126
+    if status == "timeout":
+        return 124
+    if received_signal is not None:
+        return 128 + received_signal
+    if returncode is None:
+        return 0
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _runtime_report_error(report: RuntimeReport) -> ProcessSupervisionError:
+    issues = list(report.issues)
+    for containment in report.containment:
+        issues.extend(containment.issues)
+        if not containment.ok and not containment.issues:
+            issues.append(
+                SupervisionIssue(
+                    phase="runtime",
+                    operation="incomplete_containment",
+                    error_type="InvariantError",
+                    message=f"wrapped PID {containment.pid} was not terminally contained and reaped",
+                )
+            )
+    return ProcessSupervisionError(
+        "wrapped process runtime restoration failed",
+        issues=issues,
+    )
+
+
+def _merge_operation_error(
+    operation_error: BaseException | None,
+    supervision_errors: list[BaseException],
+) -> BaseException | None:
+    if not supervision_errors:
+        return operation_error
+    supervision_error: BaseException
+    if len(supervision_errors) == 1:
+        supervision_error = supervision_errors[0]
+    else:
+        supervision_error = BaseExceptionGroup(
+            "multiple wrapped-process supervision failures",
+            supervision_errors,
+        )
+    if operation_error is None:
+        return supervision_error
+    return BaseExceptionGroup(
+        "profiling operation and wrapped-process supervision both failed",
+        [operation_error, supervision_error],
+    )
+
+
 @contextmanager
 def _guard_included_processes_during_setup(
     pids: list[int],
@@ -763,7 +774,7 @@ def _guard_included_processes_during_setup(
         raise
 
 
-def main() -> int:
+def main(*, keep_final_signals_blocked: bool = False) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=0.25)
@@ -887,7 +898,10 @@ def main() -> int:
         explicit_pid_create_times,
         terminate_on_abort=args.terminate_included_on_abort,
     ):
-        process: subprocess.Popen | None = None
+        process: WrappedProcessSupervisor | None = None
+        process_runtime: ChildProcessRuntime | None = None
+        containment_report: ContainmentReport | None = None
+        runtime_report: RuntimeReport | None = None
         samples: list[dict[str, Any]] = []
         targets = dict(explicit_targets)
         target_create_times = {label: explicit_pid_create_times[pid] for label, pid in explicit_targets.items()}
@@ -903,6 +917,11 @@ def main() -> int:
         kernel_log_start = time.time()
         start = time.monotonic()
         measured_start: float | None = None
+        preflight_deadline_ns: int | None = None
+        previous_final_signal_mask: set[signal.Signals] | None = None
+        final_signal_cutoff_monotonic_ns: int | None = None
+        pending_final_signals: tuple[int, ...] = ()
+        frozen_exit_code: int | None = None
         safety_limits = {
             "max_junction_temp_c": args.max_junction_temp_c,
             "max_gpu_power_watts": args.max_gpu_power_watts,
@@ -917,11 +936,6 @@ def main() -> int:
             nonlocal received_signal, stop_requested
             received_signal = signum
             stop_requested = True
-            if process is not None and process.poll() is None:
-                try:
-                    os.killpg(process.pid, signum)
-                except ProcessLookupError:
-                    pass
 
         error: BaseException | None = None
         device, hwmon, gpu_identity = _find_gpu(args.card)
@@ -972,6 +986,7 @@ def main() -> int:
             ),
             "command_recorded": args.record_command,
             "passed_file_descriptor_count": len(pass_fds),
+            "wrapped_process_supervision": "pidfd_waitid_private_cgroup_v2" if args.command else None,
         }
         output_descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -1005,6 +1020,8 @@ def main() -> int:
             )
 
         try:
+            if args.command:
+                process_runtime = ChildProcessRuntime(cgroup_prefix="skyrl-profile").start()
             next_sample = time.monotonic()
             baseline_end = next_sample + args.baseline_seconds
             while time.monotonic() < baseline_end and not stop_requested:
@@ -1019,14 +1036,58 @@ def main() -> int:
                 time.sleep(max(0.01, min(args.interval / 4, next_sample - time.monotonic())))
 
             if not stop_requested:
+                preflight_deadline_ns = time.monotonic_ns() + _PREFLIGHT_LAUNCH_DEADLINE_NS
                 safety_violation = record("preflight")
                 if safety_violation is not None:
                     status = "safety_limit"
                     stop_requested = True
 
             if args.command and not stop_requested:
-                process = subprocess.Popen(args.command, start_new_session=True, pass_fds=pass_fds)
-                targets["command"] = process.pid
+                if process_runtime is None or preflight_deadline_ns is None:
+                    raise RuntimeError("wrapped process runtime was not prepared")
+
+                def final_pre_spawn_check() -> None:
+                    # This callback is deliberately side-effect-free: it only
+                    # reads already-owned state and the monotonic clock. The
+                    # runtime invokes it after launch setup and immediately
+                    # before Popen grants execution authority.
+                    if stop_requested:
+                        raise _PreSpawnSignal("a handled signal revoked wrapped-command launch")
+                    now_ns = time.monotonic_ns()
+                    if now_ns > preflight_deadline_ns:
+                        raise _PreSpawnSafetyDeadline(
+                            now_ns - (preflight_deadline_ns - _PREFLIGHT_LAUNCH_DEADLINE_NS)
+                        )
+
+                try:
+                    process = process_runtime.launch(
+                        args.command,
+                        pass_fds=pass_fds,
+                        pre_spawn_check=final_pre_spawn_check,
+                    )
+                except ProcessSupervisionError as launch_error:
+                    launch_cause = launch_error.__cause__
+                    containment_report = launch_error.containment
+                    launch_rejection_contained = (
+                        containment_report is not None and containment_report.ok
+                    )
+                    if isinstance(launch_cause, _PreSpawnSignal) and launch_rejection_contained:
+                        status = "signal"
+                        stop_requested = True
+                    elif isinstance(launch_cause, _PreSpawnSafetyDeadline) and launch_rejection_contained:
+                        safety_violation = {
+                            "metric": "preflight_launch_age_seconds",
+                            "value": launch_cause.age_ns / 1_000_000_000,
+                            "limit": _PREFLIGHT_LAUNCH_DEADLINE_NS / 1_000_000_000,
+                            "limit_kind": "maximum",
+                            "reason": "preflight_launch_deadline",
+                        }
+                        status = "safety_limit"
+                        stop_requested = True
+                    else:
+                        raise
+                if process is not None:
+                    targets["command"] = process.pid
 
             measured_start = time.monotonic()
             next_sample = measured_start
@@ -1050,10 +1111,12 @@ def main() -> int:
                         break
                     next_kernel_check = now + 1.0
 
-                if process is not None and process.poll() is not None:
-                    status = "completed" if process.returncode == 0 else "command_failed"
-                    returncode = process.returncode
-                    break
+                if process is not None:
+                    observed_returncode = process.observe_returncode()
+                    if observed_returncode is not None:
+                        status = "completed" if observed_returncode == 0 else "command_failed"
+                        returncode = observed_returncode
+                        break
                 if args.timeout is not None and now - measured_start >= args.timeout:
                     status = "timeout"
                     stop_requested = True
@@ -1073,8 +1136,42 @@ def main() -> int:
             error = caught
             status = "error"
         finally:
+            supervision_errors: list[BaseException] = []
             if process is not None:
-                returncode = _terminate(process, args.terminate_grace_seconds)
+                try:
+                    # Default containment writes cgroup.kill immediately. The
+                    # legacy grace value only bounds empty/reap/cleanup proof.
+                    containment_report = process.contain(args.terminate_grace_seconds)
+                    if containment_report.reaped_returncode is not None:
+                        returncode = containment_report.reaped_returncode
+                    elif containment_report.observed_returncode is not None:
+                        returncode = containment_report.observed_returncode
+                except BaseException as containment_error:
+                    supervision_errors.append(containment_error)
+            if process_runtime is not None:
+                try:
+                    runtime_report = process_runtime.restore(
+                        timeout_seconds=args.terminate_grace_seconds
+                    )
+                    if not runtime_report.ok:
+                        supervision_errors.append(_runtime_report_error(runtime_report))
+                except BaseException as restoration_error:
+                    supervision_errors.append(restoration_error)
+            error = _merge_operation_error(error, supervision_errors)
+            if error is not None:
+                status = "error"
+            try:
+                previous_final_signal_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGINT, signal.SIGTERM},
+                )
+            except BaseException as signal_mask_error:
+                combined_error = _merge_operation_error(
+                    error,
+                    [signal_mask_error],
+                )
+                assert combined_error is not None
+                raise combined_error
             if received_signal is not None and status not in {
                 "safety_limit",
                 "driver_error",
@@ -1109,6 +1206,22 @@ def main() -> int:
                 if unobserved_sensor is not None:
                     safety_violation = unobserved_sensor
                     status = "safety_limit"
+            final_signal_cutoff_monotonic_ns = time.monotonic_ns()
+            pending = signal.sigpending()
+            pending_final_signals = tuple(
+                int(signum)
+                for signum in (signal.SIGINT, signal.SIGTERM)
+                if signum in pending
+            )
+            if received_signal is None and pending_final_signals:
+                received_signal = pending_final_signals[0]
+            if received_signal is not None and status not in {
+                "safety_limit",
+                "driver_error",
+                "timeout",
+                "error",
+            }:
+                status = "signal"
             if (
                 _included_termination_required(
                     status,
@@ -1138,23 +1251,33 @@ def main() -> int:
             if error is not None:
                 summary["error_type"] = type(error).__name__
                 summary["error"] = str(error)
-            _write_private_text(summary_path, _json_dumps(summary, indent=2, sort_keys=True) + "\n")
-            print(_json_dumps(summary, indent=2, sort_keys=True))
+            if containment_report is not None:
+                summary["wrapped_process_containment"] = containment_report.as_dict()
+            if runtime_report is not None:
+                summary["wrapped_process_runtime"] = runtime_report.as_dict()
+            summary["final_signal_cutoff_monotonic_ns"] = final_signal_cutoff_monotonic_ns
+            summary["pending_final_signals_at_cutoff"] = list(pending_final_signals)
+            frozen_exit_code = _profile_exit_code(
+                status,
+                received_signal,
+                returncode,
+            )
+            summary_text = _json_dumps(summary, indent=2, sort_keys=True)
+            if not keep_final_signals_blocked:
+                assert previous_final_signal_mask is not None
+                signal.pthread_sigmask(
+                    signal.SIG_SETMASK,
+                    previous_final_signal_mask,
+                )
+            _write_private_text(summary_path, summary_text + "\n")
+            print(summary_text)
 
     if error is not None:
         raise error
-    if status == "safety_limit":
-        return 125
-    if status == "driver_error":
-        return 126
-    if status == "timeout":
-        return 124
-    if received_signal is not None:
-        return 128 + received_signal
-    if returncode is None:
-        return 0
-    return 128 - returncode if returncode < 0 else returncode
+    if frozen_exit_code is None:
+        raise RuntimeError("profile finalization did not freeze an exit code")
+    return frozen_exit_code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(keep_final_signals_blocked=True))

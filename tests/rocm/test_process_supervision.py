@@ -1088,10 +1088,11 @@ if first == 0:
     os.setsid()
     leaf = os.fork()
     if leaf == 0:
-        with open(path + '.leaf', 'w') as stream:
+        with open(path + '.leaf.tmp', 'w') as stream:
             stream.write(str(os.getpid()))
             stream.flush()
             os.fsync(stream.fileno())
+        os.replace(path + '.leaf.tmp', path + '.leaf')
         time.sleep(30)
         os._exit(0)
     os._exit(0)
