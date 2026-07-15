@@ -55,7 +55,9 @@ JAX's platform version and uses portable XLA attention for ROCm.
 Forward/backward, the optimizer step, and checkpoint saves are verified. A
 post-checkpoint generation probe on JAX 0.10.2 hit
 `HSA_STATUS_ERROR_INVALID_PACKET_FORMAT` while loading a LoRA sampler on
-`gfx1100`. Local sampling on this exact combination remains unverified.
+`gfx1100`. That original `Qwen/Qwen3-0.6B` post-checkpoint sampling path remains
+unverified; the separate guarded Qwen3.5-4B sampling path below has since
+completed.
 
 ## Qwen3.5-4B training experiments
 
@@ -291,8 +293,10 @@ compatibility, and executable-byte continuity. It does not seed normal
 `PjitFunction` first-call dispatch, invoke a training executable, establish
 request latency or throughput, prove numerical execution, or prove HSA runtime
 stability. Prewarm and engine attestation therefore remain default-off pending
-repeatability and first-call execution qualification. The API waits for an exact
-launch-ID/PID/start-tick/boot/source/lock-bound engine row published only after
+explicit selection. Later guarded gates below establish an exact-hit engine
+transition and context-64 first-call training execution, but do not turn this
+cache proof into steady-state throughput or graph-replay evidence. The API
+waits for an exact launch-ID/PID/start-tick/boot/source/lock-bound engine row published only after
 backend construction and any required cache proof. Health revalidates that row,
 a one-second watchdog heartbeat, the isolated API-spawned process group, and all
 three live process identities. Shutdown signals the complete group immediately
@@ -927,6 +931,21 @@ The rollouts, old log-probabilities, rewards, and advantages are deterministic
 synthetic inputs. This isolates learner execution; it is not rollout-quality,
 reward, KL, or policy-improvement evidence.
 
+A separate guarded `bench_grpo_e2e.py --one-iteration-gate` run has completed
+one cold context-64 policy iteration with real model sampling, two independently
+seeded 16-token completions, grading, one Adam update, a post-update sampler
+snapshot, adapter cleanup, and same-seal server revalidation. This verifies the
+short end-to-end execution and lifecycle path, not steady-state throughput or
+policy quality. The integrated contiguous T64 MLP fusion was active for that
+gate, but a later identical-data performance screen found 137.315 fused versus
+137.477 unfused median learner tokens/s and only about 1.65 MiB less peak VRAM.
+Two fused attempts also stopped on isolated samples above the 400 W ceiling,
+and one partial deterministic retry showed material scalar-trajectory drift.
+No formal scalar-trajectory relative-L2 threshold was defined for that screen;
+the speed, memory, and safety results alone reject promotion. The fusion
+therefore remains default-off and is not performance-promoted. Exact evidence
+and SHA-256 bindings are in [`RESULTS.md`](RESULTS.md).
+
 Use the telemetry wrapper for every GPU experiment. It writes private JSONL
 and summary files, watches fatal AMDGPU journal events once per second, and
 terminates wrapped/deliberately included process trees on configured limits:
@@ -999,9 +1018,14 @@ stage prototypes have separate promotion records:
 [`QUERY_BOUNDED_GQA.md`](QUERY_BOUNDED_GQA.md), and
 [`TIED_LOGPROB_PROTOTYPE.md`](TIED_LOGPROB_PROTOTYPE.md).
 
-All of those implementations remain default-off. The split tied-logprob path
-has explicit Qwen3.5 model wiring but no GPU qualification; GDN and the other
-megakernel prototypes remain unwired. The quantized LoRA implementation in
+All of those implementations remain default-off. The contiguous T64 MLP route
+has explicit model wiring and one cold real-sampler iteration, but its fixed
+end-to-end promotion screen failed; the split tied-logprob path has explicit
+Qwen3.5 model wiring but no GPU qualification; GDN and the other megakernel
+prototypes remain unwired. The separate down-LoRA/residual route retains an
+opt-in model hook and historical one-iteration evidence from revision
+`7ba31d4c`, but the current launcher disables it and it has no current-HEAD
+fixed A/B qualification. The quantized LoRA implementation in
 `skyrl/tx/kernels/quantized_lora.py` is a CPU semantic oracle only; it is not
 selected by model code and is not a GPU performance path. The native gfx1100
 IU8/IU4 compile proof and production FFI requirements are in

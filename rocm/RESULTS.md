@@ -858,11 +858,11 @@ separate candidate from reference residency, so this run makes no comparative
 memory-saving claim. Explicit saved backward state is 2,360,832 B, which is a
 logical state inventory rather than a measured allocation delta.
 
-This clears isolated speed and numerical promotion for opt-in model
-integration. It does **not** authorize default enablement: a second independent
-numerics process, integrated route proof, and paired end-to-end T64 learner run
-are still required. The older strided candidate remains a historical no-go;
-its result must not be used to reject this different contiguous schedule.
+This cleared isolated speed and numerical promotion for opt-in model
+integration. Subsequent model integration and end-to-end results below
+supersede the then-pending qualification language. The older strided candidate
+remains a historical no-go; its result must not be used to reject this
+different contiguous schedule.
 
 Private evidence directories are
 `/tmp/skyrl-bf16-contiguous-compile.rJ1qDQ7A`,
@@ -880,14 +880,165 @@ profile summary
 and CPU attestation
 `784225620db7dce86a733aa88886154629b94544783cf24cf390a31c799285c3`.
 
+### Integrated route and real-sampler GRPO gate
+
+Revisions `3db2efb61cc42bc14bd95a7268b1654bc72ce401` through
+`c46f37ee2c3c5b5ce501d21c4a49e848f404d5ba` added an exact-shape,
+default-off model route, startup/cache attestation, and guarded engine
+lifecycle. A compile-only full-model prewarm recorded an all-32-layer static
+route-predicate attestation; its returned model executable was not invoked in
+that proof. Two independent fresh-process numerical reruns reproduced the
+isolated result and passed the 3% relative-L2 and `0.9999` output-cosine gates.
+
+The static route evidence is
+`/tmp/skyrl-qwen35-runs/fused-route-16ad2162-1784062514/prewarm.jsonl`,
+SHA-256
+`324b397d9dbbe6224a461d0ef376e8b2314b911d5a1c2c3e2fd1ae768718d867`.
+The independent numerical results are
+`/tmp/skyrl-bf16-contiguous-numerics-16ad2162.b6zDsBY6/result.json` and
+`/tmp/skyrl-bf16-contiguous-numerics-16ad2162.nBRGhgQE/result.json`, with
+SHA-256 values
+`69c804345bc3f2cfbcf6120b9f36172f9171e966e44e04ab6ad90f9fba724884`
+and `138fe84ecb54909929ae43afc86928da76f4d9437657510ead39c2a3ce79bea5`.
+
+One cold real-sampler GRPO policy iteration then completed on the integrated
+fused route at learner context 64. It sampled two independent 16-token
+completions from a 49-token prompt, graded them to advantages `[+0.5,-0.5]`,
+performed one Adam update, took a post-update sampler snapshot, unloaded the
+adapter, and passed same-seal server revalidation. The measured importance
+ratio mean/minimum/maximum were `1.00243/0.95421/1.08126`; the gradient norm was
+`2.6875`. The cold iteration took `175.390 s`, of which the cold learner update
+took `131.352 s`; this is execution/lifecycle evidence, not a steady-state
+throughput result.
+
+The command profiler returned zero and recorded peaks of 77 C, 336 W, and
+18,104,074,240 B physical VRAM, with no fatal driver event. The older outer
+supervisor labelled the otherwise complete run `failed` because it treated the
+operator-authorized graceful server exit code 143 as an error. The corrected
+supervisor subsequently accepted an observed authorized 143 while still
+rejecting synthetic, forced, or unauthorized exits in the fixed-workload
+baseline below.
+
+Private evidence is in
+`/tmp/skyrl-qwen35-e2e-fused-c46f37ee.20260714T223515Z.OT2od4`.
+The benchmark, telemetry, and telemetry-summary SHA-256 bindings are
+`fdce75ce56c0e1449be9796f2b1da418f79f7d8a40265db8235c45abf695e354`,
+`3319d3e24df634006052555742545e532623b3aaec15593a1c57066fc05b5d29`,
+and `dfc88836a57f6c141b4106c8597ad5e2cc2cf2ad04871d6643019cdd902271cc`.
+
+### Fixed-workload end-to-end promotion screen
+
+The corrected supervisor and an independently reviewed fixed-data wrapper next
+ran the unfused arm for one cold step, one warmup, and 32 measured deterministic
+GRPO learner steps. It used `B1/T64`, group size 2, 16 completion tokens,
+rank-8 LoRA, and Adam with identical inputs and seeds for the candidate arm.
+The fully qualified baseline passed lifecycle, source/model/cache attestation,
+finite-metric, cleanup, KFD/render-node, port, and current-boot journal gates:
+
+| Baseline result | Measured value |
+|---|---:|
+| Median learner step | 0.931064 s |
+| Median learner throughput | 137.477 tokens/s |
+| Aggregate learner throughput | 133.001 tokens/s |
+| Peak physical VRAM | 18,066,444,288 B |
+| Peak junction / sampled power | 79 C / 332 W |
+
+Two separately launched fused-arm screens stopped fail-closed on their sole
+sample above the user-authorized 400 W ceiling. The first completed only the
+cold and warmup steps before a 401 W sample. The retry completed 14 measured
+steps before a 549 W sample. Both events occurred after the next
+learner/optimizer step began. The retry showed a sampled ramp from 145 through
+256 and 277 W before 549 W; the first attempt instead jumped from 143 to 401 W
+between samples. Neither caused a driver fault or reset, and both process trees
+were terminated and returned KFD, render-node ownership, the API port, and the
+runtime directory to a clean state. The exact 549 W magnitude may be sensor
+noise, but it is not sufficiently corroborated to waive the safety gate or
+reinstate either run.
+
+The 14-step retry is incomplete and therefore cannot formally promote the
+candidate. It is nevertheless decisive against the material-gain gates:
+
+| Comparison | Fused result | Relative to full baseline | Promotion gate |
+|---|---:|---:|---:|
+| Median learner throughput | 137.315 tokens/s | 0.9988x | at least 1.15x |
+| Aggregate learner throughput | 131.823 tokens/s | 0.9911x | at least 1.15x |
+| Peak physical VRAM | 18,064,715,776 B | 1.65 MiB lower | at least 1 GiB lower |
+
+The ratio of the candidate and baseline first-14 medians was only `1.00065x`,
+while the median of the 14 paired per-step throughput ratios was `1.00259x`.
+Even the candidate's best observed step, `139.689` tokens/s, was well below the
+required `158.099` tokens/s. Across the same 14 deterministic steps in the one
+longer retry, scalar trajectories also diverged from the baseline: policy loss
+relative L2 was 19.62%, target-logprob 5.23%, importance-ratio mean 3.85%, and
+gradient norm 60.13%. These trajectory comparisons are diagnostic and are not
+substitutes for the already-passed operation-tensor test; no formal scalar
+trajectory relative-L2 threshold was predeclared for this screen.
+
+The fixed benchmark processes two B1 microbatches per learner step. The
+measured isolated rematerialized boundary therefore predicts about 24.6 ms
+saved over 32 layers and both microbatches, inside a roughly 0.93 s learner
+step. Even deleting the entire 95.2 ms reference boundary would cap its
+theoretical end-to-end uplift near `1.114x`. Launch-configuration tuning of
+this operation therefore cannot satisfy the 15% gate. The integrated Pallas
+route remains default-off and is rejected for performance promotion; further
+work should be selected from measured whole-step kernel attribution rather
+than repeat this A/B screen.
+
+The qualified baseline is
+`/tmp/skyrl-qwen35-fixed-grpo-arm0-c46f37ee2c3c-20260714t231956z-7221061830539.AjIJ2iAg`;
+its benchmark, telemetry, and wrapper-evidence SHA-256 bindings are
+`15e774a689749b5cf174928b4bb4bd1c748f9e56db30495161e486ad2acb623c`,
+`0ed58e9b2036f712abb47f9205a4af07156cdb6d1cdbb151a4f02cf8a2b75aae`,
+and `3d114f7bed2be3cbdbf59d5a49d505ebe2ed0e4e0eec90acf0aa48c2c625ef91`.
+The 14-step candidate is
+`/tmp/skyrl-qwen35-fixed-grpo-arm1-c46f37ee2c3c-20260714t233718z-213071977216090.gUHxRjpC`;
+its partial benchmark and telemetry bindings are
+`2ac782b295a8b128d88331d6f0747e1ea724cb25736baee1e67f786cd923e6a3`
+and `2a778ef0064cf4fb8fb61eed6fedce8a35b7b51f1c546fe1f76d8b7771d4e17f`.
+The cold/warm-only candidate is
+`/tmp/skyrl-qwen35-fixed-grpo-arm1-c46f37ee2c3c-20260714t232909z-9743114938517.eW4lWyRj`;
+its partial benchmark and telemetry bindings are
+`baf553513ef930a61dd3d88fb86429d7375791b2de946ca62326ae7fc8b0db0c`
+and `73c69ee30298e2d98df4d50981319f1d05e8cd9c34e1d50aca2c9464c6b5d75b`.
+
+### Historical down-LoRA/residual integrated gate
+
+Revision `7ba31d4c55fb72906d29237c659390f48c9b5e37` also wired a separate
+default-off BF16 down-projection + LoRA + residual Pallas operation. With that
+route and the then-configured Pallas attention path enabled, one guarded
+context-64 real-sampler policy iteration completed sampling, one update,
+cleanup, and same-seal revalidation. A preceding synthetic fixed-rollout run
+completed five measured steps at 135.337 median learner tokens/s, but it had no
+matched same-revision unfused control and therefore made no speed or memory
+promotion claim.
+
+Revision `4032458298f83e5aabae110f77531702a9f9beb1` then restored the
+launcher's down-fusion setting to false and explicitly classified the route as
+unpromoted. Current HEAD retains the implementation and opt-in model hook, but
+the later fixed 32-step A/B protocol has not revalidated it. Historical
+evidence is
+`/tmp/skyrl-qwen35-qualification-fused-t64-7ba31d4c-1784035921`;
+the fixed-rollout benchmark SHA-256 is
+`2c04ae269703c8d9593d6b95996bb6a995d6970b633d8f0db8d6289fd00ad2d5`.
+The real-sampler benchmark, telemetry, and telemetry-summary SHA-256 values are
+`a03eb2aada3659eb9f0b95a356d6fd9065f4dc9f2fd06d04068cd2aafd20067f`,
+`7e930d472dc74cb3a560fe9d3e43f627cd454020e2abefcb20e92a32b0ff25d1`,
+and `f7693f05eb1939e037d52d649bbe41c0e0c7af8d2a27695d667f823b7385dc88`.
+
 ## Validation frontier
 
 The post-fix full-model SFT validation frontier is currently context 1,024. A
-fixed-rollout GRPO learner control is verified at context 64; real sampling,
-fixed-real-rollout replay, KL/reward comparison, and end-to-end GRPO remain
-unverified. The contiguous T64 MLP-up operation is isolated-speed/numerics
-qualified but not yet end-to-end qualified. Contexts above 1,024, quantized
-model execution, and all other fused-kernel model execution remain unverified.
+fixed-rollout GRPO learner control and a cold real-sampler, one-policy-iteration
+GRPO gate are verified at context 64. Fixed-real-rollout replay, paired
+KL/reward comparison, multi-iteration real GRPO, and steady-state sampler plus
+learner throughput remain unverified. The contiguous T64 MLP-up operation has
+passed isolated numerics/speed, all-layer static routing, and one cold integrated
+iteration, but its fixed-workload end-to-end screen failed the material speed,
+memory, and safety gates; the one partial multi-update trajectory also raises a
+separate numerical concern. It remains default-off and is not promoted. The
+down-LoRA/residual route has historical one-iteration evidence but no
+current-HEAD fixed A/B qualification. Contexts above 1,024, quantized model
+execution, and all other fused-kernel model execution remain unverified.
 The isolated Pallas numerical blocker is
 cleared through 2,048 tokens: the user-authorized outer gradient gate requires
 strictly below 3% (`<3%`), and the forward-output gate remains strictly below

@@ -49,11 +49,24 @@ bounded work estimate and an independently measured duration.
 - Exact default-off T64 contiguous RMS/gate-up/LoRA/SwiGLU boundary:
   `skyrl/tx/kernels/rocm/bf16_rms_gate_up_lora_swiglu_contiguous.py`. Its
   two bounded Pallas stages and explicit LoRA-only VJP are isolated-numerics
-  and isolated-speed qualified; model end-to-end qualification is pending.
+  and isolated-speed qualified, all-layer routing and one cold real-sampler
+  policy iteration passed, but its fixed-workload end-to-end speed/memory
+  promotion screen failed. It remains a default-off diagnostic.
+- Exact default-off T64 down-projection/LoRA/residual boundary:
+  `skyrl/tx/kernels/rocm/bf16_lora_residual.py`. It has historical
+  one-iteration execution evidence from revision `7ba31d4c`, but the launcher
+  was restored to the unfused route in `40324582` and no current-HEAD fixed A/B
+  qualification exists.
 - Full QKV, gate, attention, and O projection:
   `skyrl/tx/models/qwen3_5.py:296-377`, `Qwen3_5Attention`.
 - Chunked FP32 GDN: `skyrl/tx/models/qwen3_5.py:101-255`,
   `chunk_gated_delta_rule`.
+- Exact default-off S512 GDN typed-FFI stages:
+  `skyrl/tx/kernels/rocm/gdn_prepare_ffi.py` and
+  `skyrl/tx/kernels/rocm/gdn_execute_ffi.py`. Separate one-shot GPU gates
+  qualify prepare and execute forward correctness; composition, replay,
+  reverse mode, and model wiring remain pending. `gdn_reverse_ffi.py` fixes the
+  reverse ABI but has no qualified native implementation.
 - GDN projections and output: `skyrl/tx/models/qwen3_5.py:380-595`,
   `Qwen3_5GatedDeltaNet`.
 - Fused gate/up and down projections: `skyrl/tx/models/qwen3_5.py:598-639`,
@@ -413,6 +426,31 @@ only as a bounded diagnostic after that structural fix; the production route
 remains a HIP/typed-FFI dense epilogue with an exact custom VJP. The existing
 smoke telemetry is dominated by JAX BFC preallocation and therefore establishes
 no allocator or model-capacity saving.
+
+The exact contiguous successor implemented that structural VJP fix and reached
+`1.2993x` forward, `1.3827x` forward-plus-VJP, and `1.3487x` rematerialized-stage
+speed in its isolated 32-cycle benchmark. It also passed independent numerics,
+all-32-layer static route attestation, and one cold real-sampler policy
+iteration. A later fixed
+GRPO screen, however, measured only `0.9988x` median learner throughput and a
+1.65 MiB peak-VRAM reduction before the candidate was stopped by the 400 W
+safety gate. Its one 14-step deterministic retry also showed material scalar
+trajectory drift, although no formal scalar-trajectory relative-L2 gate was
+predeclared. The operation accounts for too little of the full learner step:
+the fixed benchmark has two B1 microbatches, and even eliminating its complete
+95.2 ms reference boundary would yield only about `1.114x` end-to-end. Keep
+this Pallas successor default-off; do not spend additional GPU budget on
+launch-only tuning unless a new profile materially changes that bound.
+
+The next version of this boundary would need a native HIP/typed-FFI backward
+that owns the frozen-weight transpose and LoRA/RMS pullbacks, and avoids saving
+the 18,432-wide fused tensor. That is a power/traffic experiment, not a plausible
+standalone 15% end-to-end optimization. Select the next independent fusion
+from a guarded whole-step kernel trace. Structurally stronger candidates are
+the 24-layer GDN superblock/output boundaries, the tied vocabulary head,
+native GQA, and the existing default-off down-LoRA/residual route. Gated
+attention plus O-LoRA plus residual affects only the eight full-attention
+layers and must not be assumed to cover more wall time without a trace.
 
 Do not fuse the down projection into this stage. It reduces over all 9,216
 product features; recomputing gate/up for each down-output tile would multiply
@@ -975,13 +1013,17 @@ an unsafe compute dispatch acceptable. GPU experiments must remain serialized.
    only if true mixed-adapter batches become important.
 2. Complete and qualify the watchdog-bounded native-GQA Pallas custom VJP.
 3. Split-vocabulary tied linear-logprob Pallas prototype.
-4. Integrate and end-to-end qualify the completed contiguous T64
-   RMS/gate-up+SwiGLU successor. Its exact backward no longer recomputes the
-   dense forward and its isolated full benchmark passes the speed gates; keep
-   the older strided implementation as a historical no-go.
-5. Minimal typed HIP/FFI reference handler and CPU fallback.
-6. Production BF16 dense epilogues, including input RMS and exact LoRA VJPs.
-7. Production GDN preparation/state kernels.
+4. Collect guarded whole-step kernel attribution, then select among the
+   24-layer GDN, tied-head, native-GQA, down-LoRA/residual, and eight-layer
+   attention-epilogue boundaries. Retain the completed contiguous T64
+   RMS/gate-up+SwiGLU route only as a default-off diagnostic: its end-to-end
+   promotion screen failed despite isolated gains.
+5. Compose the separately qualified S512 GDN prepare/execute FFI stages,
+   implement the declared reverse boundary, then qualify one fixed-data GDN
+   layer before model wiring.
+6. Production BF16 dense epilogues and exact LoRA VJPs, including a bounded
+   native backward experiment for the contiguous MLP boundary.
+7. Extend qualified GDN superblocks to tails/S1024 and model integration.
 8. Larger loss chunks and final-RMS fusion.
 9. W8A16 frozen projections with the tied matrix initially BF16; measure the
    3.2 GiB residency opportunity before changing more numerics.
