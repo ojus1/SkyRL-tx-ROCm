@@ -16,6 +16,7 @@ import pytest
 _REPO = Path(__file__).parents[2]
 _PROBE_PATH = _REPO / "rocm" / "probe_gdn_composed_s512_ffi.py"
 _PROFILE_PATH = _REPO / "rocm" / "profile_rocm.py"
+_SUPERVISOR_PATH = _REPO / "rocm" / "process_supervision.py"
 _SPEC = importlib.util.spec_from_file_location("gdn_composed_s512_probe_test", _PROBE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _PROBE = importlib.util.module_from_spec(_SPEC)
@@ -250,6 +251,54 @@ def test_runtime_wrapper_imports_bind_canonical_packages_loader_and_sources() ->
     ].resolve()
     for source_name, digest in proof["final_source_sha256"].items():
         assert digest == _PROBE._EXPECTED_SOURCE_SHA256[source_name]
+
+
+def test_profile_supervision_sources_are_exact_and_watcher_is_outer_only() -> None:
+    files = _PROBE._source_files()
+    assert files["profile_rocm"].resolve() == _PROFILE_PATH.resolve()
+    assert files["process_supervision"].resolve() == _SUPERVISOR_PATH.resolve()
+    assert "watch_rocm_safety" not in files
+    assert "watch_rocm_safety" not in _PROBE._EXPECTED_SOURCE_SHA256
+    assert _PROBE._EXPECTED_SOURCE_SHA256["profile_rocm"] == (
+        "a991401c0f54921456685fbbc47a12d50616ae0921238044837908ce49ff4551"
+    )
+    assert _PROBE._EXPECTED_SOURCE_SHA256["process_supervision"] == (
+        "05f9d84313db2dc6e2262e53e65f42f044ade2cb596d5310c289427e9cd7e3cf"
+    )
+
+    bound = _PROBE._assert_bound_sources()
+    assert bound["process_supervision"] == _PROBE._EXPECTED_SOURCE_SHA256[
+        "process_supervision"
+    ]
+    proof = _PROBE._assert_profile_supervision_sources()
+    assert proof == {
+        "passed": True,
+        "all_profile_supervision_sources_exact": True,
+        "final_source_sha256": {
+            name: _PROBE._EXPECTED_SOURCE_SHA256[name]
+            for name in _PROBE._PROFILE_SUPERVISION_SOURCES
+        },
+    }
+
+
+@pytest.mark.parametrize("dependency_state", ["missing", "mutated"])
+def test_bound_supervisor_dependency_rejects_missing_or_mutated_source(
+    dependency_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    replacement = tmp_path / "process_supervision.py"
+    if dependency_state == "mutated":
+        replacement.write_bytes(_SUPERVISOR_PATH.read_bytes() + b"\n# mutation\n")
+    files = dict(_PROBE._source_files())
+    files["process_supervision"] = replacement
+    monkeypatch.setattr(_PROBE, "_source_files", lambda: files)
+
+    expected = "unavailable" if dependency_state == "missing" else "hash mismatch"
+    with pytest.raises(RuntimeError, match=f"dependency source {expected}"):
+        _PROBE._assert_bound_sources()
+    with pytest.raises(RuntimeError, match=f"dependency source {expected}"):
+        _PROBE._assert_profile_supervision_sources()
 
 
 def test_loaded_wrapper_identity_rejects_fabricated_file_origin(

@@ -113,12 +113,15 @@ _EXPECTED_SOURCE_SHA256 = {
     "execute_oracle": "cca11be2212603d74d52ce936910283805c1fa5e73c6bfbc5c79a98e529949c2",
     "sealed_loader": "66b868b7909a2279d5ddca0e1582f8563e8097723e970d09fce733aef2ba425a",
     "safety": "7ad79b9b9b54089add72dff65ea18505a794c51f0c4bafe231fbd3b745f23ba6",
-    "profile_rocm": "3dde5139a95ba9698b298a638af07125dcf4fb7a1a91a55c2b5ea4762f89db8f",
+    "profile_rocm": "a991401c0f54921456685fbbc47a12d50616ae0921238044837908ce49ff4551",
+    "process_supervision": "05f9d84313db2dc6e2262e53e65f42f044ade2cb596d5310c289427e9cd7e3cf",
     "package_skyrl": "667d4a15b970b851e20d17510224670c14646cfb6d5a1e388ca6b9cc6da8bf41",
     "package_tx": "a7abb3e76d66df1f4472bb7a02b032ef31b959ca937fd351637b4e9b4a8fa95a",
     "package_kernels": "40abe638c7726fe5680b7c88321042016a0f695d86acfbef52337421e7257c1a",
     "package_rocm": "6d12a789cf1108538a04fbacd0b38a15dbcb8255cd0ca0fadf5a76c4191a4cfd",
 }
+
+_PROFILE_SUPERVISION_SOURCES = ("profile_rocm", "process_supervision")
 
 _BOUND_RUNTIME_MODULES = {
     "skyrl": "package_skyrl",
@@ -182,6 +185,7 @@ def _source_files() -> dict[str, Path]:
         "sealed_loader": rocm / "gdn_ffi_smoke.py",
         "safety": repo / "rocm" / "amdgpu_safety.py",
         "profile_rocm": repo / "rocm" / "profile_rocm.py",
+        "process_supervision": repo / "rocm" / "process_supervision.py",
         "package_skyrl": repo / "skyrl" / "__init__.py",
         "package_tx": repo / "skyrl" / "tx" / "__init__.py",
         "package_kernels": kernels / "__init__.py",
@@ -195,10 +199,38 @@ def _source_hashes() -> dict[str, str]:
 
 def _assert_bound_sources() -> dict[str, Any]:
     files = _source_files()
-    observed = {name: _file_sha256(files[name]) for name in _EXPECTED_SOURCE_SHA256}
+    try:
+        observed = {
+            name: _file_sha256(files[name]) for name in _EXPECTED_SOURCE_SHA256
+        }
+    except (KeyError, OSError) as error:
+        raise RuntimeError("composed GDN dependency source unavailable") from error
     if observed != _EXPECTED_SOURCE_SHA256:
         raise RuntimeError("composed GDN dependency source hash mismatch")
     return {"passed": True, "all_executable_dependencies_exact": True, **observed}
+
+
+def _assert_profile_supervision_sources() -> dict[str, Any]:
+    """Rehash the executable profile/supervisor pair after argv validation."""
+
+    files = _source_files()
+    try:
+        observed = {
+            name: _file_sha256(files[name]) for name in _PROFILE_SUPERVISION_SOURCES
+        }
+    except (KeyError, OSError) as error:
+        raise RuntimeError("profile supervision dependency source unavailable") from error
+    expected = {
+        name: _EXPECTED_SOURCE_SHA256[name]
+        for name in _PROFILE_SUPERVISION_SOURCES
+    }
+    if observed != expected:
+        raise RuntimeError("profile supervision dependency source hash mismatch")
+    return {
+        "passed": True,
+        "all_profile_supervision_sources_exact": True,
+        "final_source_sha256": observed,
+    }
 
 
 def _exact_source_spec(module_name: str, source_name: str) -> dict[str, Any]:
@@ -1326,9 +1358,13 @@ def _execute(args: argparse.Namespace, output: TextIO) -> int:
             parent_cwd,
             _source_files()["profile_rocm"].resolve(),
         )
-        if _file_sha256(_source_files()["profile_rocm"]) != _EXPECTED_SOURCE_SHA256["profile_rocm"]:
-            raise RuntimeError("profile_rocm source mismatch")
+        profile_sources = _assert_profile_supervision_sources()
         profile["profile_source_exact"] = True
+        profile["process_supervision_source_exact"] = True
+        profile["all_profile_supervision_sources_exact"] = profile_sources[
+            "all_profile_supervision_sources_exact"
+        ]
+        profile["final_source_sha256"] = profile_sources["final_source_sha256"]
         stage = "library_preflight"
         prepare_manifest = _validate_library(args.prepare_library, args.prepare_library_sha256, _PREPARE_BASENAME, _PREPARE_SIZE)
         execute_manifest = _validate_library(args.execute_library, args.execute_library_sha256, _EXECUTE_BASENAME, _EXECUTE_SIZE)
