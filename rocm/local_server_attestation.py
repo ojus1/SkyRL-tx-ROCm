@@ -80,6 +80,7 @@ _REQUIRED_RUNTIME_ENVIRONMENT = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "ROCR_VISIBLE_DEVICES": "0",
 }
+_ROCPROF_ATTACH_ENV = "ROCP_TOOL_ATTACH"
 _GROWTH_ENVIRONMENT = {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
 _PREALLOCATE_ENVIRONMENT = {
     "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
@@ -99,6 +100,9 @@ _ACCELERATOR_ENVIRONMENT_PREFIXES = (
     "JAX_",
     "PJRT_",
     "RCCL_",
+    "ROCP_",
+    "ROCPROF_",
+    "ROCPROFILER_",
     "ROCM_",
     "ROCR_",
     "XLA_",
@@ -658,7 +662,7 @@ def _read_process(
 
 def _require_runtime_environment(
     process: _ProcessSnapshot, *, abstract_model_load: bool, label: str
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     environment = dict(process.accelerator_environment)
     memory_environment = (
         _PREALLOCATE_ENVIRONMENT if abstract_model_load else _GROWTH_ENVIRONMENT
@@ -669,6 +673,16 @@ def _require_runtime_environment(
         *memory_environment,
         *_VARIABLE_RUNTIME_ENVIRONMENT_NAMES,
     }
+    rocprof_attach_value = environment.get(_ROCPROF_ATTACH_ENV)
+    if rocprof_attach_value is None:
+        rocprof_attach_enabled = False
+    elif rocprof_attach_value == "1":
+        rocprof_attach_enabled = True
+        expected_names.add(_ROCPROF_ATTACH_ENV)
+    else:
+        raise LocalServerAttestationError(
+            f"{label} {_ROCPROF_ATTACH_ENV} must be exactly '1' or absent"
+        )
     if environment.keys() != expected_names:
         unexpected = sorted(environment.keys() - expected_names)
         missing = sorted(expected_names - environment.keys())
@@ -705,7 +719,7 @@ def _require_runtime_environment(
         raise LocalServerAttestationError(
             f"{label} JAX compilation cache is not canonical and private"
         )
-    return pallas_attention, cache_directory
+    return pallas_attention, cache_directory, rocprof_attach_enabled
 
 
 def _require_python_payload(
@@ -1484,6 +1498,7 @@ _PASSED_SOURCE_SHARED_FIELDS = frozenset(
         "jax_enable_pgle",
         "jax_compilation_cache_expect_pgle",
         "pallas_attention",
+        "rocprof_attach_enabled",
         "startup_cache_attestation",
         "dont_write_bytecode",
     }
@@ -1626,6 +1641,7 @@ def _validate_source_handoff(
         or api_shared["jax_enable_pgle"] != "false"
         or api_shared["jax_compilation_cache_expect_pgle"] != "false"
         or api_shared["pallas_attention"] not in {"0", "1"}
+        or type(api_shared["rocprof_attach_enabled"]) is not bool
         or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", api_shared["git_head"]) is None
         or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", api_shared["git_tree"]) is None
         or re.fullmatch(r"[0-9a-f]{64}", api_shared["uv_sha256"]) is None
@@ -2575,23 +2591,29 @@ def _collect_contract(
     unique_processes = {
         process.pid: process for process in (outer, api, engine_launcher, engine)
     }
-    environment_contracts: set[tuple[str, str]] = set()
+    environment_contracts: set[tuple[str, str, bool]] = set()
     for process in unique_processes.values():
-        pallas_attention, cache_directory = _require_runtime_environment(
-            process,
-            abstract_model_load=backend_config["abstract_model_load"],
-            label=f"process PID {process.pid}",
+        pallas_attention, cache_directory, rocprof_attach_enabled = (
+            _require_runtime_environment(
+                process,
+                abstract_model_load=backend_config["abstract_model_load"],
+                label=f"process PID {process.pid}",
+            )
         )
-        environment_contracts.add((pallas_attention, cache_directory))
+        environment_contracts.add(
+            (pallas_attention, cache_directory, rocprof_attach_enabled)
+        )
         if process.working_directory != str(source_root):
             raise LocalServerAttestationError(
                 f"process PID {process.pid} is not running from the source snapshot"
             )
     if len(environment_contracts) != 1:
         raise LocalServerAttestationError(
-            "server roles do not share one Pallas/cache environment"
+            "server roles do not share one Pallas/cache/profiler environment"
         )
-    pallas_attention, cache_directory = next(iter(environment_contracts))
+    pallas_attention, cache_directory, rocprof_attach_enabled = next(
+        iter(environment_contracts)
+    )
     expected_memory_mode = (
         "preallocate85" if backend_config["abstract_model_load"] else "growth"
     )
@@ -2601,6 +2623,7 @@ def _collect_contract(
         or source_shared["uv_sha256"] != outer.executable_sha256
         or source_shared["memory_mode"] != expected_memory_mode
         or source_shared["pallas_attention"] != pallas_attention
+        or source_shared["rocprof_attach_enabled"] is not rocprof_attach_enabled
         or source_shared["jax_compilation_cache"] != cache_directory
     ):
         raise LocalServerAttestationError(
@@ -2844,6 +2867,7 @@ def _collect_contract(
         "cache_evidence_sha256": _sha256_bytes(cache_evidence_json.encode("ascii")),
         "source_status": source_status,
         "pallas_attention": pallas_attention,
+        "rocprof_attach_enabled": rocprof_attach_enabled,
         "xla_flags": EXPECTED_XLA_FLAGS,
     }
     public = {
@@ -2889,6 +2913,7 @@ def _collect_contract(
             "JAX_ENABLE_PGLE": "false",
             "JAX_COMPILATION_CACHE_EXPECT_PGLE": "false",
             "SKYRL_ROCM_PALLAS_ATTENTION": pallas_attention,
+            "rocprof_attach_enabled": rocprof_attach_enabled,
             "memory_mode": expected_memory_mode,
             "memory_environment": (
                 _PREALLOCATE_ENVIRONMENT

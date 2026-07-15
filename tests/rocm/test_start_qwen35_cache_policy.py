@@ -257,6 +257,56 @@ def test_runtime_t64_cache_attestation_public_mode_is_exact(value: str) -> None:
 
 
 @pytest.mark.parametrize("value", ["", "true", "2", "01"])
+def test_rocprof_attach_public_mode_is_exact(value: str) -> None:
+    result = _run_launcher_policy_only(SKYRL_QWEN35_ROCPROF_ATTACH=value)
+
+    assert result.returncode == 2
+    assert "SKYRL_QWEN35_ROCPROF_ATTACH" in result.stderr
+    assert "must be exactly 0 or 1" in result.stderr
+
+
+def test_launcher_rejects_inherited_rocprof_attach_implementation_variable() -> None:
+    result = _run_launcher_policy_only(ROCP_TOOL_ATTACH="1")
+
+    assert result.returncode == 2
+    assert "launcher-owned profiler attachment variable: ROCP_TOOL_ATTACH" in (
+        result.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ROCPROF_OUTPUT_PATH", "/tmp/unattested"),
+        ("ROCPROFILER_REGISTER_ENABLED", "0"),
+    ],
+)
+def test_launcher_rejects_inherited_rocprofiler_implementation_variable(
+    name: str, value: str
+) -> None:
+    result = _run_launcher_policy_only(**{name: value})
+
+    assert result.returncode == 2
+    assert f"inherited profiler implementation variable: {name}" in result.stderr
+
+
+def test_rocprof_attach_reaches_only_the_final_verified_runtime_environment() -> None:
+    source = _source()
+
+    assert 'rocprof_attach="${SKYRL_QWEN35_ROCPROF_ATTACH-0}"' in source
+    assert source.count("verified_runtime_environment+=(ROCP_TOOL_ATTACH=1)") == 1
+    attach = source.index("verified_runtime_environment+=(ROCP_TOOL_ATTACH=1)")
+    final_exec = source.index("exec /usr/bin/env -i", attach)
+    input_unset = source.index("unset SKYRL_QWEN35_ROCPROF_ATTACH")
+    assert input_unset < attach < final_exec
+    assert source.index('"${verified_runtime_environment[@]}"', final_exec) > final_exec
+    assert source.index('export "${verified_runtime_environment[@]}"', final_exec) > (
+        final_exec
+    )
+    assert source.count("ROCP_TOOL_ATTACH=1") == 1
+
+
+@pytest.mark.parametrize("value", ["", "true", "2", "01"])
 def test_contiguous_fused_mlp_public_mode_is_exact(value: str) -> None:
     result = _run_launcher_policy_only(
         SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS=value

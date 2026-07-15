@@ -180,6 +180,7 @@ def test_runtime_source_claim_binds_full_tree_cwd_and_graph_free_cache_policy(
         "jax_enable_pgle": "false",
         "jax_compilation_cache_expect_pgle": "false",
         "pallas_attention": "1",
+        "rocprof_attach_enabled": False,
         "startup_cache_attestation": {"status": "not_required"},
         "dont_write_bytecode": True,
     }
@@ -192,6 +193,67 @@ def test_generic_runtime_without_claims_remains_unchanged() -> None:
         package_file=Path("not-used"),
         environment={},
     ) == {"status": "not_required", "role": "api"}
+
+
+def test_runtime_source_accepts_exact_rocprof_attach_mode(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    fixture["environment"][runtime_source._ROCPROF_ATTACH_ENV] = "1"
+
+    result = runtime_source.validate_runtime_source(
+        role="api",
+        module_file=fixture["module"],
+        package_file=fixture["package"],
+        environment=fixture["environment"],
+        cwd=fixture["source_root"],
+        dont_write_bytecode=True,
+    )
+
+    assert result["rocprof_attach_enabled"] is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "2"])
+def test_runtime_source_rejects_nonexact_rocprof_attach_mode(
+    tmp_path: Path, value: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    fixture["environment"][runtime_source._ROCPROF_ATTACH_ENV] = value
+
+    with pytest.raises(runtime_source.RuntimeSourceError, match="ROCP_TOOL_ATTACH"):
+        runtime_source.validate_runtime_source(
+            role="api",
+            module_file=fixture["module"],
+            package_file=fixture["package"],
+            environment=fixture["environment"],
+            cwd=fixture["source_root"],
+            dont_write_bytecode=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ROCPROF_OUTPUT_PATH", "/tmp/unattested"),
+        ("ROCPROFILER_REGISTER_ENABLED", "0"),
+    ],
+)
+def test_runtime_source_rejects_rocprofiler_implementation_environment(
+    tmp_path: Path, name: str, value: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    fixture["environment"][name] = value
+
+    with pytest.raises(
+        runtime_source.RuntimeSourceError,
+        match="unexpected_accelerator_environment",
+    ):
+        runtime_source.validate_runtime_source(
+            role="api",
+            module_file=fixture["module"],
+            package_file=fixture["package"],
+            environment=fixture["environment"],
+            cwd=fixture["source_root"],
+            dont_write_bytecode=True,
+        )
 
 
 def _cache_claim_environment() -> dict[str, str]:

@@ -286,6 +286,7 @@ class _ServerFixture:
         preallocate: str | None = "false",
         memory_environment: dict[str, str] | None = None,
         pallas_attention: str | None = "0",
+        rocprof_attach: str | None = None,
         extra_environment: dict[str, str] | None = None,
         remove_environment: tuple[str, ...] = (),
         duplicate: bool = False,
@@ -297,6 +298,7 @@ class _ServerFixture:
         else:
             role = "api"
         source_memory_mode = "growth"
+        source_rocprof_attach_enabled = False
         startup_cache = {"status": "not_required"}
         if self.database_path.exists():
             with closing(sqlite3.connect(self.database_path)) as connection:
@@ -306,6 +308,7 @@ class _ServerFixture:
             if row is not None:
                 source_record = json.loads(row[0])
                 source_memory_mode = source_record["memory_mode"]
+                source_rocprof_attach_enabled = source_record["rocprof_attach_enabled"]
                 startup_cache = source_record["startup_cache_attestation"]
         venv_bin = self.repo_root / ".venv/bin"
         environment = {
@@ -375,6 +378,10 @@ class _ServerFixture:
             environment.pop("SKYRL_ROCM_PALLAS_ATTENTION", None)
         else:
             environment["SKYRL_ROCM_PALLAS_ATTENTION"] = pallas_attention
+        if source_rocprof_attach_enabled:
+            environment[_ATTEST._ROCPROF_ATTACH_ENV] = "1"
+        if rocprof_attach is not None:
+            environment[_ATTEST._ROCPROF_ATTACH_ENV] = rocprof_attach
         environment.update(extra_environment or {})
         for name in remove_environment:
             environment.pop(name, None)
@@ -419,6 +426,7 @@ class _ServerFixture:
         *,
         memory_mode: str | None = None,
         pallas_attention: str | None = None,
+        rocprof_attach_enabled: bool | None = None,
     ) -> None:
         with closing(sqlite3.connect(self.database_path)) as connection:
             row = connection.execute(
@@ -432,6 +440,8 @@ class _ServerFixture:
                     source["memory_mode"] = memory_mode
                 if pallas_attention is not None:
                     source["pallas_attention"] = pallas_attention
+                if rocprof_attach_enabled is not None:
+                    source["rocprof_attach_enabled"] = rocprof_attach_enabled
             connection.execute(
                 "UPDATE engine_launches SET api_source_attestation = ?, "
                 "engine_source_attestation = ?",
@@ -511,6 +521,7 @@ def _create_database(fixture: _ServerFixture) -> None:
         "jax_enable_pgle": "false",
         "jax_compilation_cache_expect_pgle": "false",
         "pallas_attention": "0",
+        "rocprof_attach_enabled": False,
         "startup_cache_attestation": {"status": "not_required"},
         "dont_write_bytecode": True,
     }
@@ -873,6 +884,7 @@ def test_attestation_and_revalidation_bind_exact_wrapper_process_tree(tmp_path):
     assert record["environment"]["JAX_PLATFORMS"] == "rocm"
     assert record["environment"]["ROCR_VISIBLE_DEVICES"] == "0"
     assert record["environment"]["SKYRL_ROCM_PALLAS_ATTENTION"] == "0"
+    assert record["environment"]["rocprof_attach_enabled"] is False
     assert record["environment"]["memory_mode"] == "growth"
     assert record["environment"]["memory_environment"] == {
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
@@ -1216,11 +1228,100 @@ def test_pallas_mode_is_public_and_changes_same_server_contract(tmp_path):
         )
 
 
+def test_rocprof_attach_mode_is_public_attested_and_revalidated(tmp_path):
+    fixture = _make_fixture(tmp_path)
+    seal_off, _ = _attest_fixture(fixture)
+    fixture.update_source_claim(rocprof_attach_enabled=True)
+    for pid in {
+        fixture.outer_pid,
+        fixture.api_pid,
+        fixture.engine_launcher_pid,
+        fixture.engine_pid,
+    }:
+        fixture.write_environment(pid)
+
+    seal_on, health = _attest_fixture(fixture)
+
+    assert seal_off.contract_sha256 != seal_on.contract_sha256
+    assert seal_on.as_record()["environment"]["rocprof_attach_enabled"] is True
+    _ATTEST.revalidate_local_server(
+        seal_on,
+        proc_root=fixture.proc_root,
+        health_probe=health,
+        expected_uid=fixture.uid,
+    )
+
+
+def test_attestation_rejects_mixed_role_rocprof_attach_mode(tmp_path):
+    fixture = _make_fixture(tmp_path)
+    fixture.update_source_claim(rocprof_attach_enabled=True)
+    for pid in {
+        fixture.outer_pid,
+        fixture.api_pid,
+        fixture.engine_launcher_pid,
+        fixture.engine_pid,
+    }:
+        fixture.write_environment(pid)
+    fixture.write_environment(
+        fixture.engine_pid,
+        remove_environment=(_ATTEST._ROCPROF_ATTACH_ENV,),
+    )
+
+    with pytest.raises(
+        _ATTEST.LocalServerAttestationError, match="source|profiler|roles"
+    ):
+        _attest_fixture(fixture)
+
+
+def test_attestation_rejects_unclaimed_rocprof_attach_mode(tmp_path):
+    fixture = _make_fixture(tmp_path)
+    for pid in {
+        fixture.outer_pid,
+        fixture.api_pid,
+        fixture.engine_launcher_pid,
+        fixture.engine_pid,
+    }:
+        fixture.write_environment(pid, rocprof_attach="1")
+
+    with pytest.raises(_ATTEST.LocalServerAttestationError, match="source"):
+        _attest_fixture(fixture)
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "2"])
+def test_attestation_rejects_nonexact_rocprof_attach_mode(tmp_path, value):
+    fixture = _make_fixture(tmp_path)
+    fixture.write_environment(fixture.engine_pid, rocprof_attach=value)
+
+    with pytest.raises(_ATTEST.LocalServerAttestationError, match="ROCP_TOOL_ATTACH"):
+        _attest_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ROCPROF_OUTPUT_PATH", "/tmp/unattested"),
+        ("ROCPROFILER_REGISTER_ENABLED", "0"),
+    ],
+)
+def test_attestation_rejects_rocprofiler_implementation_environment(
+    tmp_path, name, value
+):
+    fixture = _make_fixture(tmp_path)
+    fixture.write_environment(
+        fixture.engine_pid,
+        extra_environment={name: value},
+    )
+
+    with pytest.raises(_ATTEST.LocalServerAttestationError, match="environment"):
+        _attest_fixture(fixture)
+
+
 @pytest.mark.parametrize(
     "extra_environment",
     [
         {"JAX_DISABLE_JIT": "1"},
         {"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25"},
+        {"ROCP_OUTPUT_PATH": "/tmp/unattested"},
         {"PYTHONPATH": "/tmp/injected"},
         {"LD_PRELOAD": "/tmp/injected.so"},
     ],

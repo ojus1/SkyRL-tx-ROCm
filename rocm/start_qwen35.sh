@@ -24,10 +24,20 @@ for internal_claim_name in \
   fi
 done
 while IFS= read -r exported_name; do
-  if [[ "$exported_name" == BASH_FUNC_*%% ]]; then
-    echo "refusing inherited exported Bash function: $exported_name" >&2
-    exit 2
-  fi
+  case "$exported_name" in
+    BASH_FUNC_*%%)
+      echo "refusing inherited exported Bash function: $exported_name" >&2
+      exit 2
+      ;;
+    ROCP_TOOL_ATTACH)
+      echo "refusing inherited launcher-owned profiler attachment variable: ROCP_TOOL_ATTACH" >&2
+      exit 2
+      ;;
+    ROCP_*|ROCPROF_*|ROCPROFILER_*)
+      echo "refusing inherited profiler implementation variable: $exported_name" >&2
+      exit 2
+      ;;
+  esac
 done < <(compgen -e)
 
 launcher_invocation="${BASH_SOURCE[0]}"
@@ -57,6 +67,7 @@ run_id="$1"
 model_repo="Qwen/Qwen3.5-4B"
 model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 memory_mode="${SKYRL_QWEN35_MEMORY_MODE:-growth}"
+rocprof_attach="${SKYRL_QWEN35_ROCPROF_ATTACH-0}"
 prewarm_buckets="${SKYRL_QWEN35_PREWARM_BUCKETS:-}"
 prewarm_optimizer="${SKYRL_QWEN35_PREWARM_OPTIMIZER-0}"
 prewarm_only="${SKYRL_QWEN35_PREWARM_ONLY-0}"
@@ -68,6 +79,13 @@ engine_start_gate_enabled=0
 bf16_rms_gate_up_lora_swiglu_contiguous="${SKYRL_QWEN35_BF16_RMS_GATE_UP_LORA_SWIGLU_CONTIGUOUS-0}"
 runtime_cache_attestation_environment=()
 
+case "$rocprof_attach" in
+  0|1) ;;
+  *)
+    echo "SKYRL_QWEN35_ROCPROF_ATTACH must be exactly 0 or 1." >&2
+    exit 2
+    ;;
+esac
 case "$prewarm_optimizer" in
   0|1) ;;
   *)
@@ -1618,6 +1636,7 @@ if [[ "${engine_t64_cache_attest:-0}" == "1" ]]; then
   )
 fi
 unset SKYRL_QWEN35_ENGINE_T64_CACHE_ATTEST
+unset SKYRL_QWEN35_ROCPROF_ATTACH
 
 unset SKYRL_QWEN35_GIT_HEAD
 unset SKYRL_QWEN35_GIT_TREE
@@ -1667,6 +1686,9 @@ if ((engine_start_gate_enabled != 0)); then
   fi
 fi
 
+if [[ "$rocprof_attach" == "1" ]]; then
+  verified_runtime_environment+=(ROCP_TOOL_ATTACH=1)
+fi
 trap - EXIT INT TERM
 if [[ -n "$prewarm_buckets" ]]; then
   cd -- "$source_snapshot"
@@ -1702,6 +1724,9 @@ if [[ -n "$prewarm_buckets" ]]; then
     --checkpoints-base "$run_dir/checkpoints" \
     --engine-startup-timeout-sec 3600 \
     --database-url "sqlite:///$run_dir/tinker.db"
+fi
+if ((${#verified_runtime_environment[@]} > 0)); then
+  export "${verified_runtime_environment[@]}"
 fi
 exec "$uv_executable" run --active --no-sync -m skyrl.tinker.api \
   --base-model "$model_path" \

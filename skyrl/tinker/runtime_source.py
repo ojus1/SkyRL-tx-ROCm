@@ -28,6 +28,7 @@ _PREWARM_AUDIT_PATH_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_PATH"
 _PREWARM_AUDIT_SHA256_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_AUDIT_SHA256"
 _PREWARM_HANDOFF_PATH_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_PATH"
 _PREWARM_HANDOFF_SHA256_ENV = "SKYRL_QWEN35_RUNTIME_PREWARM_HANDOFF_SHA256"
+_ROCPROF_ATTACH_ENV = "ROCP_TOOL_ATTACH"
 _CACHE_ATTESTATION_ENVIRONMENT = (
     _T64_CACHE_ATTEST_ENV,
     _PREWARM_AUDIT_PATH_ENV,
@@ -80,6 +81,9 @@ _ACCELERATOR_ENVIRONMENT_PREFIXES = (
     "JAX_",
     "PJRT_",
     "RCCL_",
+    "ROCP_",
+    "ROCPROF_",
+    "ROCPROFILER_",
     "ROCM_",
     "ROCR_",
     "XLA_",
@@ -511,11 +515,20 @@ def validate_runtime_source(
         **_REQUIRED_ENVIRONMENT,
         **_MEMORY_MODE_ENVIRONMENT[memory_mode],
     }
+    rocprof_attach_value = observed.get(_ROCPROF_ATTACH_ENV)
+    rocprof_attach_enabled = rocprof_attach_value == "1"
+    if rocprof_attach_enabled:
+        expected_environment[_ROCPROF_ATTACH_ENV] = "1"
     mismatches = {
         name: {"expected": expected, "observed": observed.get(name)}
         for name, expected in expected_environment.items()
         if observed.get(name) != expected
     }
+    if rocprof_attach_value is not None and not rocprof_attach_enabled:
+        mismatches[_ROCPROF_ATTACH_ENV] = {
+            "expected": "1 or absent",
+            "observed": rocprof_attach_value,
+        }
     if not bytecode_disabled:
         mismatches["sys.flags.dont_write_bytecode"] = {
             "expected": True,
@@ -524,6 +537,7 @@ def validate_runtime_source(
     allowed_accelerator_names = {
         *expected_environment,
         "JAX_COMPILATION_CACHE_DIR",
+        _ROCPROF_ATTACH_ENV,
     }
     unexpected_accelerator_names = sorted(
         name
@@ -708,6 +722,7 @@ def validate_runtime_source(
             "JAX_COMPILATION_CACHE_EXPECT_PGLE"
         ],
         "pallas_attention": attention_backend,
+        "rocprof_attach_enabled": rocprof_attach_enabled,
         "startup_cache_attestation": startup_cache_attestation,
         "dont_write_bytecode": True,
     }
